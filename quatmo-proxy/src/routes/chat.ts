@@ -488,7 +488,10 @@ function normalizeUpstreamBody(
   return upstreamBody;
 }
 
-function extractToolCalls(completionText: string, nativeToolCalls?: any[]): any[] {
+function extractToolCalls(
+  completionText: string,
+  nativeToolCalls?: any[],
+): any[] {
   const list: any[] = [];
   if (Array.isArray(nativeToolCalls) && nativeToolCalls.length > 0) {
     for (const tc of nativeToolCalls) {
@@ -529,7 +532,9 @@ async function logStudentInteraction(
   const currentAiOption = examContext.aiOption || "chatbot";
 
   // Clean CLASSIFIER_RESULT prefix from completionText
-  const cleanCompletion = completionText.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trim();
+  const cleanCompletion = completionText
+    .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+    .trim();
 
   // Extract classification from completionText if present (as fallback or override)
   let finalLabel = classifierLabel;
@@ -544,7 +549,10 @@ async function logStudentInteraction(
         finalConfidence = parsed.confidence ?? 0;
       }
     } catch (e) {
-      console.error("[Logger] Failed to parse CLASSIFIER_RESULT from completionText:", e);
+      console.error(
+        "[Logger] Failed to parse CLASSIFIER_RESULT from completionText:",
+        e,
+      );
     }
   }
 
@@ -572,7 +580,9 @@ async function logStudentInteraction(
     if (typeof msg.content === "string") {
       return {
         ...msg,
-        content: msg.content.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trimStart()
+        content: msg.content
+          .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+          .trimStart(),
       };
     }
     return msg;
@@ -586,7 +596,9 @@ async function logStudentInteraction(
   const userMessages = body.messages.filter((m: any) => m.role === "user");
   const currentUserMsg =
     userMessages.length > 0
-      ? userMessages[userMessages.length - 1].content.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trimStart()
+      ? userMessages[userMessages.length - 1].content
+          .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+          .trimStart()
       : "";
 
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
@@ -618,7 +630,11 @@ async function logStudentInteraction(
       lastEntry.output = cleanCompletion;
       lastEntry.history = cleanHistory;
       lastEntry.lastUpdated = new Date().toISOString();
-      if (finalLabel && finalLabel !== "none" && (!lastEntry.classification || lastEntry.classification.label === "none")) {
+      if (
+        finalLabel &&
+        finalLabel !== "none" &&
+        (!lastEntry.classification || lastEntry.classification.label === "none")
+      ) {
         lastEntry.classification = {
           label: finalLabel,
           confidence: finalConfidence,
@@ -681,6 +697,33 @@ chatRouter.post(
     const examContext = c.get("examContext" as any) as any;
     const sessionKey = c.get("sessionKey" as any) as any;
     const body = await c.req.json();
+
+    // Prevent LLM tool-calling confusion: explicitly inject system instruction that todowrite
+    // is only a checklist tracker and does not perform file modifications on disk.
+    if (body.messages && Array.isArray(body.messages)) {
+      let hasSystem = false;
+      const warningText = "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
+      
+      for (const msg of body.messages) {
+        if (msg.role === "system") {
+          hasSystem = true;
+          if (typeof msg.content === "string") {
+            msg.content += warningText;
+          } else if (Array.isArray(msg.content)) {
+            msg.content.push({
+              type: "text",
+              text: warningText
+            });
+          }
+        }
+      }
+      if (!hasSystem) {
+        body.messages.unshift({
+          role: "system",
+          content: "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool."
+        });
+      }
+    }
 
     if (authMode === "exam") {
       const liveExam = exams.get(examContext.examCode);
@@ -941,7 +984,9 @@ chatRouter.post(
         classifierLabel,
         classifierConfidence,
         responseData.choices?.[0]?.message?.tool_calls,
-      ).catch((err) => console.error("[Logger] Non-stream logging error:", err));
+      ).catch((err) =>
+        console.error("[Logger] Non-stream logging error:", err),
+      );
 
       return c.json(responseData);
     }
@@ -1036,8 +1081,11 @@ chatRouter.post(
               } else {
                 if (tc.id) streamToolCalls[idx].id = tc.id;
                 if (tc.type) streamToolCalls[idx].type = tc.type;
-                if (tc.function?.name) streamToolCalls[idx].function.name += tc.function.name;
-                if (tc.function?.arguments) streamToolCalls[idx].function.arguments += tc.function.arguments;
+                if (tc.function?.name)
+                  streamToolCalls[idx].function.name += tc.function.name;
+                if (tc.function?.arguments)
+                  streamToolCalls[idx].function.arguments +=
+                    tc.function.arguments;
               }
             }
           }
@@ -1183,8 +1231,11 @@ chatRouter.post(
                   } else {
                     if (tc.id) streamToolCalls[idx].id = tc.id;
                     if (tc.type) streamToolCalls[idx].type = tc.type;
-                    if (tc.function?.name) streamToolCalls[idx].function.name += tc.function.name;
-                    if (tc.function?.arguments) streamToolCalls[idx].function.arguments += tc.function.arguments;
+                    if (tc.function?.name)
+                      streamToolCalls[idx].function.name += tc.function.name;
+                    if (tc.function?.arguments)
+                      streamToolCalls[idx].function.arguments +=
+                        tc.function.arguments;
                   }
                 }
               }

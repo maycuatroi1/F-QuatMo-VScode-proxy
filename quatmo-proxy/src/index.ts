@@ -12,7 +12,10 @@ dotenv.config();
 const app = new Hono();
 
 // Global Logger (only enabled in dev or if explicitly requested to maximize CCU)
-if (process.env.ENABLE_LOGS === "true" || process.env.NODE_ENV !== "production") {
+if (
+  process.env.ENABLE_LOGS === "true" ||
+  process.env.NODE_ENV !== "production"
+) {
   app.use("*", logger());
 }
 
