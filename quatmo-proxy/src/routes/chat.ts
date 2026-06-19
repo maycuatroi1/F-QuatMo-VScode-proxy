@@ -4,9 +4,12 @@ import { authMiddleware, type UserSession } from "../middleware/auth";
 import { rateLimitMiddleware } from "../middleware/rateLimit";
 import { countMessagesTokens, countTokens } from "../services/token";
 import { redis } from "../services/redis";
+import { unifiedAuthMiddleware } from "../middleware/authUnified";
+import { exams } from "../services/examStore";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
 import path from "path";
+import fs from "fs";
 
 dotenv.config();
 
@@ -219,7 +222,7 @@ async function classifyPrompt(prompt: string): Promise<any> {
         method: "POST",
         headers,
         body: JSON.stringify({ prompt: truncatedPrompt }),
-        signal: AbortSignal.timeout(60000), // Tự động huỷ sau 60 giây để không block request chính
+        signal: AbortSignal.timeout(30000), // Tự động huỷ sau 3 giây để không block request chính under load
       });
 
       if (response.ok) {
@@ -410,10 +413,8 @@ function getUpstreamConfig(
     lowerModel.includes("whiterabbitneo") ||
     lowerModel.includes("foundation-sec")
   ) {
-    // Preserve original model name – do NOT replace with configuredCustomModel
-    // unless the request already exactly matches it (to avoid sending "gemma-4" when user wants "qwen3-coder")
-    const actualModel =
-      lowerModel === configuredCustomModelLower ? configuredCustomModel : model;
+    // Map all custom model variations to the configured custom model name running on the upstream server
+    const actualModel = configuredCustomModel;
     return {
       url: customUrl,
       key: customKey,
@@ -487,14 +488,224 @@ function normalizeUpstreamBody(
   return upstreamBody;
 }
 
+function extractToolCalls(completionText: string, nativeToolCalls?: any[]): any[] {
+  const list: any[] = [];
+  if (Array.isArray(nativeToolCalls) && nativeToolCalls.length > 0) {
+    for (const tc of nativeToolCalls) {
+      list.push({
+        name: tc.function?.name || tc.name,
+        arguments: tc.function?.arguments || tc.arguments,
+      });
+    }
+  }
+  if (completionText.includes("<function=")) {
+    const parsed = parseXmlToolCall(completionText);
+    if (parsed) {
+      list.push({
+        name: parsed.name,
+        arguments: parsed.arguments,
+      });
+    }
+  }
+  return list;
+}
+
+async function logStudentInteraction(
+  authMode: string | undefined,
+  examContext: any,
+  body: any,
+  completionText: string,
+  inputTokens: number,
+  outputTokens: number,
+  totalConsumed: number,
+  classifierLabel: string,
+  classifierConfidence: number,
+  nativeToolCalls?: any[],
+) {
+  if (authMode !== "exam" || !examContext) return;
+
+  const examCode = examContext.examCode.toUpperCase();
+  const studentId = examContext.studentId.toUpperCase();
+  const currentAiOption = examContext.aiOption || "chatbot";
+
+  // Clean CLASSIFIER_RESULT prefix from completionText
+  const cleanCompletion = completionText.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trim();
+
+  // Extract classification from completionText if present (as fallback or override)
+  let finalLabel = classifierLabel;
+  let finalConfidence = classifierConfidence;
+
+  const match = completionText.match(/__CLASSIFIER_RESULT__:(\{.*?\})/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed && parsed.label) {
+        finalLabel = parsed.label;
+        finalConfidence = parsed.confidence ?? 0;
+      }
+    } catch (e) {
+      console.error("[Logger] Failed to parse CLASSIFIER_RESULT from completionText:", e);
+    }
+  }
+
+  // If still none, check history for assistant classification result
+  if (finalLabel === "none" || finalLabel === "") {
+    for (const msg of body.messages) {
+      if (msg.role === "assistant" && typeof msg.content === "string") {
+        const m = msg.content.match(/__CLASSIFIER_RESULT__:(\{.*?\})/);
+        if (m) {
+          try {
+            const parsed = JSON.parse(m[1]);
+            if (parsed && parsed.label) {
+              finalLabel = parsed.label;
+              finalConfidence = parsed.confidence ?? 0;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+    }
+  }
+
+  // Clean CLASSIFIER_RESULT from body.messages for cleaner history
+  const cleanHistory = body.messages.map((msg: any) => {
+    if (typeof msg.content === "string") {
+      return {
+        ...msg,
+        content: msg.content.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trimStart()
+      };
+    }
+    return msg;
+  });
+
+  const lastMsg =
+    body.messages && body.messages.length > 0
+      ? body.messages[body.messages.length - 1]
+      : null;
+
+  const userMessages = body.messages.filter((m: any) => m.role === "user");
+  const currentUserMsg =
+    userMessages.length > 0
+      ? userMessages[userMessages.length - 1].content.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "").trimStart()
+      : "";
+
+  const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
+  const logDir = path.resolve(process.cwd(), "logs", "exams", examCode);
+  const logFilePath = path.resolve(logDir, `${studentId}.json`);
+
+  try {
+    await fs.promises.mkdir(logDir, { recursive: true });
+
+    let logs: any[] = [];
+    if (fs.existsSync(logFilePath)) {
+      try {
+        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+        logs = JSON.parse(fileContent);
+      } catch (e) {
+        // file empty or invalid
+      }
+    }
+
+    const lastEntry = logs.length > 0 ? logs[logs.length - 1] : null;
+    const isContinuation =
+      lastEntry &&
+      lastEntry.prompt === currentUserMsg &&
+      lastMsg?.role !== "user" &&
+      Date.now() - new Date(lastEntry.timestamp).getTime() < 300000;
+
+    if (isContinuation && lastEntry) {
+      lastEntry.tokensConsumedTotal += totalConsumed;
+      lastEntry.output = cleanCompletion;
+      lastEntry.history = cleanHistory;
+      lastEntry.lastUpdated = new Date().toISOString();
+      if (finalLabel && finalLabel !== "none" && (!lastEntry.classification || lastEntry.classification.label === "none")) {
+        lastEntry.classification = {
+          label: finalLabel,
+          confidence: finalConfidence,
+        };
+      }
+      if (toolCalls.length > 0 || lastEntry.agentLoops.length > 0) {
+        lastEntry.agentLoops.push({
+          step: lastEntry.agentLoops.length + 1,
+          promptTokens: inputTokens,
+          completionTokens: outputTokens,
+          toolCalls,
+        });
+      }
+    } else {
+      const newEntry: any = {
+        timestamp: new Date().toISOString(),
+        prompt: currentUserMsg,
+        classification: {
+          label: finalLabel || "none",
+          confidence: finalConfidence || 0,
+        },
+        aiOption: currentAiOption,
+        tokenLimit: examContext.defaultTokenBudget,
+        tokensConsumedTotal: totalConsumed,
+        output: cleanCompletion,
+        agentLoops: [],
+        history: cleanHistory,
+      };
+
+      if (toolCalls.length > 0) {
+        newEntry.agentLoops.push({
+          step: 1,
+          promptTokens: inputTokens,
+          completionTokens: outputTokens,
+          toolCalls,
+        });
+      }
+
+      logs.push(newEntry);
+    }
+
+    await fs.promises.writeFile(
+      logFilePath,
+      JSON.stringify(logs, null, 2),
+      "utf-8",
+    );
+  } catch (err) {
+    console.error("[Logger] Failed to write student log:", err);
+  }
+}
+
 chatRouter.post(
   "/completions",
-  authMiddleware(),
+  unifiedAuthMiddleware(),
   rateLimitMiddleware(),
   async (c) => {
     const user = c.get("user");
     const token = c.get("token");
+    const authMode = c.get("authMode" as any) as string | undefined;
+    const examContext = c.get("examContext" as any) as any;
+    const sessionKey = c.get("sessionKey" as any) as any;
     const body = await c.req.json();
+
+    if (authMode === "exam") {
+      const liveExam = exams.get(examContext.examCode);
+      const currentAiOption = liveExam
+        ? liveExam.aiOption
+        : examContext.aiOption;
+
+      if (currentAiOption === "none") {
+        return c.json(
+          { error: "Tính năng AI bị vô hiệu hóa trong phòng thi này." },
+          403,
+        );
+      }
+      if (currentAiOption === "chatbot") {
+        if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+          return c.json(
+            {
+              error:
+                "Chỉ được phép sử dụng Chatbot cơ bản, tính năng Agent đã bị vô hiệu hóa.",
+            },
+            403,
+          );
+        }
+      }
+    }
 
     if (!body.messages || !Array.isArray(body.messages)) {
       return c.json(
@@ -509,6 +720,8 @@ chatRouter.post(
         : null;
 
     let classifierResultText = "";
+    let classifierLabel = "none";
+    let classifierConfidence = 0;
     if (
       lastMsg &&
       lastMsg.role === "user" &&
@@ -517,6 +730,8 @@ chatRouter.post(
       try {
         const res = await classifyPrompt(lastMsg.content);
         if (res && res.label) {
+          classifierLabel = res.label;
+          classifierConfidence = res.confidence;
           const formattedLabel = res.label.toLowerCase();
           const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
           console.log(
@@ -599,7 +814,8 @@ chatRouter.post(
         method: "POST",
         headers,
         body: JSON.stringify(upstreamBody),
-      });
+        // verbose: true, //stress test
+      } as any);
     } catch (err: any) {
       console.error("[Proxy] Upstream connection failed:", err.message);
       return c.json(
@@ -619,13 +835,34 @@ chatRouter.post(
     }
 
     const recordTokenUsage = async (consumed: number) => {
-      user.tokensConsumed += consumed;
-      if (redis && redis.status === "ready") {
-        try {
-          await redis.set(`key:auth:${token}`, JSON.stringify(user), "EX", 600);
-          await redis.incrby(`budget:consumed:${user.keyId}`, consumed);
-        } catch (err) {
-          console.error("[Proxy] Budget update failed:", err);
+      if (authMode === "exam") {
+        if (redis && redis.status === "ready") {
+          try {
+            await redis.hincrby(sessionKey, "consumed", consumed);
+          } catch (err) {
+            console.error("[Proxy] Redis budget increment failed:", err);
+          }
+        }
+        const { examStates } = await import("../services/examStore");
+        const stateKey = `${examContext.examCode}:${examContext.studentId}`;
+        const state = examStates.get(stateKey);
+        if (state) {
+          state.tokensConsumed += consumed;
+        }
+      } else {
+        user.tokensConsumed += consumed;
+        if (redis && redis.status === "ready") {
+          try {
+            await redis.set(
+              `key:auth:${token}`,
+              JSON.stringify(user),
+              "EX",
+              600,
+            );
+            await redis.incrby(`budget:consumed:${user.keyId}`, consumed);
+          } catch (err) {
+            console.error("[Proxy] Budget update failed:", err);
+          }
         }
       }
     };
@@ -692,6 +929,20 @@ chatRouter.post(
       }
 
       await recordTokenUsage(totalConsumed);
+
+      logStudentInteraction(
+        authMode,
+        examContext,
+        body,
+        responseData.choices?.[0]?.message?.content || "",
+        inputTokens,
+        totalConsumed - inputTokens,
+        totalConsumed,
+        classifierLabel,
+        classifierConfidence,
+        responseData.choices?.[0]?.message?.tool_calls,
+      ).catch((err) => console.error("[Logger] Non-stream logging error:", err));
+
       return c.json(responseData);
     }
 
@@ -711,9 +962,12 @@ chatRouter.post(
       let accumulatedBuffer = "";
       let isTerminated = false;
       let upstreamTotalTokens: number | null = null;
+      let outputTokens = 0;
+      let accumulatedDeltaText = "";
 
       let classifierChunkSent = false;
       let classifierSuppressedForToolCalls = false;
+      let streamToolCalls: any[] = [];
 
       const emitSyntheticUsageAndDone = async () => {
         // Flush any remaining tool call buffer
@@ -766,6 +1020,27 @@ chatRouter.post(
         try {
           const parsed = JSON.parse(rawJson);
           const delta = parsed.choices?.[0]?.delta;
+
+          if (delta && Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index ?? 0;
+              if (!streamToolCalls[idx]) {
+                streamToolCalls[idx] = {
+                  id: tc.id,
+                  type: tc.type || "function",
+                  function: {
+                    name: tc.function?.name || "",
+                    arguments: tc.function?.arguments || "",
+                  },
+                };
+              } else {
+                if (tc.id) streamToolCalls[idx].id = tc.id;
+                if (tc.type) streamToolCalls[idx].type = tc.type;
+                if (tc.function?.name) streamToolCalls[idx].function.name += tc.function.name;
+                if (tc.function?.arguments) streamToolCalls[idx].function.arguments += tc.function.arguments;
+              }
+            }
+          }
 
           // Normalize reasoning field names → unified "reasoning_content"
           // Different models use: reasoning_content (DeepSeek/Qwen), reasoning, thinking (Gemma/Anthropic)
@@ -825,10 +1100,27 @@ chatRouter.post(
           const reasoning = delta?.reasoning_content || delta?.reasoning || "";
           completionText += content + reasoning;
 
-          const outputTokens = countTokens(completionText);
-          const totalConsumed = inputTokens + outputTokens;
+          // High-performance token budgeting optimization:
+          // Instead of re-tokenizing the growing completionText on every chunk (O(N^2) complexity),
+          // we incrementally track characters and count tokens in batches of ~6 words (O(N) total complexity).
+          const deltaText = content + reasoning;
+          if (deltaText) {
+            accumulatedDeltaText += deltaText;
+          }
+          if (accumulatedDeltaText.length >= 24) {
+            outputTokens += countTokens(accumulatedDeltaText);
+            accumulatedDeltaText = "";
+          }
+          const currentOutputTokensApprox =
+            outputTokens + Math.ceil(accumulatedDeltaText.length / 4);
+          const totalConsumed = inputTokens + currentOutputTokensApprox;
 
           if (totalConsumed >= remainingBudget) {
+            // Flush remaining text for exact final token count
+            outputTokens += countTokens(accumulatedDeltaText);
+            accumulatedDeltaText = "";
+            const exactTotalConsumed = inputTokens + outputTokens;
+
             const errorChunk = {
               choices: [
                 {
@@ -848,7 +1140,7 @@ chatRouter.post(
               usage: {
                 prompt_tokens: inputTokens,
                 completion_tokens: outputTokens,
-                total_tokens: totalConsumed,
+                total_tokens: exactTotalConsumed,
               },
             };
             await stream.writeSSE({ data: JSON.stringify(usageChunk) });
@@ -877,6 +1169,24 @@ chatRouter.post(
             for (const convDelta of convertedDeltas) {
               if (convDelta.delta.tool_calls) {
                 classifierSuppressedForToolCalls = true;
+                for (const tc of convDelta.delta.tool_calls) {
+                  const idx = tc.index ?? 0;
+                  if (!streamToolCalls[idx]) {
+                    streamToolCalls[idx] = {
+                      id: tc.id,
+                      type: tc.type || "function",
+                      function: {
+                        name: tc.function?.name || "",
+                        arguments: tc.function?.arguments || "",
+                      },
+                    };
+                  } else {
+                    if (tc.id) streamToolCalls[idx].id = tc.id;
+                    if (tc.type) streamToolCalls[idx].type = tc.type;
+                    if (tc.function?.name) streamToolCalls[idx].function.name += tc.function.name;
+                    if (tc.function?.arguments) streamToolCalls[idx].function.arguments += tc.function.arguments;
+                  }
+                }
               }
               const newParsed = {
                 ...parsed,
@@ -933,16 +1243,31 @@ chatRouter.post(
           reader.releaseLock();
         } catch (_) {}
         let totalConsumed = 0;
+        let finalOutputTokens = 0;
         if (upstreamTotalTokens !== null) {
           totalConsumed = upstreamTotalTokens;
+          finalOutputTokens = Math.max(0, totalConsumed - inputTokens);
         } else {
-          const finalOutputTokens = countTokens(completionText);
+          finalOutputTokens = countTokens(completionText);
           totalConsumed = inputTokens + finalOutputTokens;
         }
         console.log(
           `\x1b[36m[Proxy]\x1b[0m ➔ Completed | Total: ${totalConsumed} tokens`,
         );
         await recordTokenUsage(totalConsumed);
+
+        logStudentInteraction(
+          authMode,
+          examContext,
+          body,
+          completionText,
+          inputTokens,
+          finalOutputTokens,
+          totalConsumed,
+          classifierLabel,
+          classifierConfidence,
+          streamToolCalls.filter(Boolean),
+        ).catch((err) => console.error("[Logger] Stream logging error:", err));
       }
     });
   },

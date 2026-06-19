@@ -20,7 +20,9 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
       try {
         const count = await redis.incr(redisKey);
         if (count === 1) {
-          await redis.expire(redisKey, 60);
+          redis.expire(redisKey, 60).catch((err) => {
+            console.error("[RateLimit] Redis expire error:", err);
+          });
         }
 
         if (count > REQUEST_LIMIT_PER_MINUTE) {

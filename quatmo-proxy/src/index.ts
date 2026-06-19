@@ -2,6 +2,8 @@ import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { chatRouter } from "./routes/chat";
+import { adminRouter } from "./routes/admin";
+import { examAuthRouter } from "./routes/examAuth";
 import { proxyKeyConfig } from "./services/proxyKey";
 import dotenv from "dotenv";
 
@@ -9,21 +11,30 @@ dotenv.config();
 
 const app = new Hono();
 
-// Global Logger
-app.use("*", logger());
+// Global Logger (only enabled in dev or if explicitly requested to maximize CCU)
+if (process.env.ENABLE_LOGS === "true" || process.env.NODE_ENV !== "production") {
+  app.use("*", logger());
+}
 
 // CORS Policy
-app.use("*", cors({
-  origin: "*",
-  allowMethods: ["GET", "POST", "OPTIONS"],
-  allowHeaders: ["Content-Type", "Authorization"]
-}));
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 
 // Route mappings
 app.route("/v1/chat", chatRouter);
+app.route("/admin", adminRouter);
+app.route("/v1/exam", examAuthRouter);
 
 // Health check endpoint
-app.get("/health", (c) => c.json({ status: "healthy", timestamp: new Date().toISOString() }));
+app.get("/health", (c) =>
+  c.json({ status: "healthy", timestamp: new Date().toISOString() }),
+);
 
 const port = parseInt(process.env.PORT || "3000", 10);
 
@@ -37,5 +48,6 @@ console.log(`[Proxy] Access key: ${proxyKeyConfig.value}`);
 
 export default {
   port,
-  fetch: app.fetch
+  idleTimeout: 255,
+  fetch: app.fetch,
 };

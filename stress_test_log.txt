@@ -1,0 +1,108 @@
+======================================================================
+             MODEL API TUNNEL STRESS TEST REPORT
+======================================================================
+Test Date:          6/18/2026, 4:25:31 AM
+Test Target:        PROXY
+Target URL:         http://localhost:3000/v1/chat/completions
+Model:              qwen3-coder
+Concurrent Flows:   10 (Threads)
+Requests/Flow:      3 (Consecutive)
+Total Requests:     30
+Stream Mode:        Enabled
+======================================================================
+[21:25:31.486] Starting stress test on the proxy tunnel...
+[21:25:31.486] Flow #1 | Request 1/3 | Sending...
+[21:25:31.487] Flow #2 | Request 1/3 | Sending...
+[21:25:31.487] Flow #3 | Request 1/3 | Sending...
+[21:25:31.487] Flow #4 | Request 1/3 | Sending...
+[21:25:31.487] Flow #5 | Request 1/3 | Sending...
+[21:25:31.487] Flow #6 | Request 1/3 | Sending...
+[21:25:31.487] Flow #7 | Request 1/3 | Sending...
+[21:25:31.487] Flow #8 | Request 1/3 | Sending...
+[21:25:31.487] Flow #9 | Request 1/3 | Sending...
+[21:25:31.487] Flow #10 | Request 1/3 | Sending...
+[21:25:46.251] Flow #2 | Request 1/3 | OK | TTFT: 3876ms | Total: 14764ms
+[21:25:46.354] Flow #2 | Request 2/3 | Sending...
+[21:25:46.400] Flow #7 | Request 1/3 | OK | TTFT: 3790ms | Total: 14913ms
+[21:25:46.507] Flow #7 | Request 2/3 | Sending...
+[21:25:46.710] Flow #4 | Request 1/3 | OK | TTFT: 3876ms | Total: 15223ms
+[21:25:46.926] Flow #4 | Request 2/3 | Sending...
+[21:25:47.066] Flow #5 | Request 1/3 | OK | TTFT: 3790ms | Total: 15579ms
+[21:25:47.066] Flow #6 | Request 1/3 | OK | TTFT: 3876ms | Total: 15579ms
+[21:25:47.312] Flow #5 | Request 2/3 | Sending...
+[21:25:47.312] Flow #6 | Request 2/3 | Sending...
+[21:25:47.443] Flow #10 | Request 1/3 | OK | TTFT: 3790ms | Total: 15956ms
+[21:25:47.593] Flow #9 | Request 1/3 | OK | TTFT: 3790ms | Total: 16106ms
+[21:25:47.617] Flow #10 | Request 2/3 | Sending...
+[21:25:47.697] Flow #9 | Request 2/3 | Sending...
+[21:25:56.910] Flow #3 | Request 1/3 | FAILED | Error: HTTP 502: {"error":"Connection to upstream provider failed: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()"}
+[21:25:56.910] Flow #8 | Request 1/3 | FAILED | Error: HTTP 502: {"error":"Connection to upstream provider failed: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()"}
+[21:25:56.910] Flow #1 | Request 1/3 | FAILED | Error: HTTP 502: {"error":"Connection to upstream provider failed: The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()"}
+[21:25:57.067] Flow #3 | Request 2/3 | Sending...
+[21:25:57.068] Flow #8 | Request 2/3 | Sending...
+[21:25:57.068] Flow #1 | Request 2/3 | Sending...
+[21:25:59.520] Flow #4 | Request 2/3 | OK | TTFT: 517ms | Total: 12593ms
+[21:25:59.712] Flow #4 | Request 3/3 | Sending...
+[21:25:59.928] Flow #2 | Request 2/3 | OK | TTFT: 248ms | Total: 13574ms
+[21:26:00.105] Flow #2 | Request 3/3 | Sending...
+[21:26:00.258] Flow #5 | Request 2/3 | OK | TTFT: 373ms | Total: 12946ms
+[21:26:00.394] Flow #5 | Request 3/3 | Sending...
+[21:26:00.431] Flow #6 | Request 2/3 | OK | TTFT: 531ms | Total: 13119ms
+[21:26:00.560] Flow #6 | Request 3/3 | Sending...
+[21:26:00.720] Flow #9 | Request 2/3 | OK | TTFT: 420ms | Total: 13022ms
+[21:26:00.902] Flow #9 | Request 3/3 | Sending...
+[21:26:00.955] Flow #7 | Request 2/3 | OK | TTFT: 273ms | Total: 14447ms
+[21:26:01.324] Flow #7 | Request 3/3 | Sending...
+[21:26:04.878] Flow #10 | Request 2/3 | OK | TTFT: 459ms | Total: 17261ms
+[21:26:04.988] Flow #10 | Request 3/3 | Sending...
+[21:26:15.647] Flow #1 | Request 2/3 | OK | TTFT: 409ms | Total: 18579ms
+[21:26:15.777] Flow #1 | Request 3/3 | Sending...
+[21:26:16.999] Flow #8 | Request 2/3 | OK | TTFT: 408ms | Total: 19931ms
+[21:26:17.107] Flow #8 | Request 3/3 | Sending...
+[21:26:17.292] Flow #3 | Request 2/3 | OK | TTFT: 475ms | Total: 20224ms
+[21:26:17.397] Flow #3 | Request 3/3 | Sending...
+[21:26:17.441] Flow #9 | Request 3/3 | OK | TTFT: 563ms | Total: 16538ms
+[21:26:17.694] Flow #6 | Request 3/3 | OK | TTFT: 604ms | Total: 17105ms
+[21:26:18.136] Flow #2 | Request 3/3 | OK | TTFT: 290ms | Total: 18031ms
+[21:26:18.287] Flow #4 | Request 3/3 | OK | TTFT: 394ms | Total: 18575ms
+[21:26:18.347] Flow #5 | Request 3/3 | OK | TTFT: 326ms | Total: 17953ms
+[21:26:20.924] Flow #7 | Request 3/3 | OK | TTFT: 778ms | Total: 19600ms
+[21:26:22.827] Flow #10 | Request 3/3 | OK | TTFT: 472ms | Total: 17690ms
+[21:26:27.042] Flow #3 | Request 3/3 | OK | TTFT: 238ms | Total: 9645ms
+[21:26:27.444] Flow #1 | Request 3/3 | OK | TTFT: 401ms | Total: 11668ms
+[21:26:27.674] Flow #8 | Request 3/3 | OK | TTFT: 257ms | Total: 10567ms
+
+======================================================================
+                          SUMMARY STATS
+======================================================================
+Total Test Duration:  56.19 seconds
+Total Requests Sent:  30
+Successful Requests:  27 / 30 (90.0%)
+Failed Requests:      3 / 30 (10.0%)
+
+Time-To-First-Token (TTFT) Metrics:
+  - Average:          1305 ms
+  - Min/Max:          238 ms / 3876 ms
+  - Median/p90:       472 ms / 3876 ms
+
+Total Request Latency Metrics:
+  - Average:          15600 ms
+  - Min/Max:          9645 ms / 20224 ms
+  - Median/p90:       15579 ms / 19600 ms
+
+======================================================================
+                        FLOW STATISTICS
+======================================================================
+Flow ID		Success Rate		Avg TTFT		Avg Total
+----------------------------------------------------------------------
+1		2/3			405 ms			15123 ms
+2		3/3			1471 ms			15456 ms
+3		2/3			356 ms			14935 ms
+4		3/3			1595 ms			15464 ms
+5		3/3			1496 ms			15492 ms
+6		3/3			1670 ms			15268 ms
+7		3/3			1614 ms			16320 ms
+8		2/3			333 ms			15249 ms
+9		3/3			1591 ms			15222 ms
+10		3/3			1574 ms			16969 ms
+======================================================================
