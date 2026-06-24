@@ -32,6 +32,7 @@ app.use(
 // Route mappings
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
+app.route("/v1/admin", adminRouter);
 app.route("/v1/exam", examAuthRouter);
 
 // Health check endpoint
