@@ -80,7 +80,10 @@ export const authMiddleware = (): MiddlewareHandler<{
 
     if (!session) {
       return c.json(
-        { error: "Unauthorized. Provided API key does not match the proxy access key." },
+        {
+          error:
+            "Unauthorized. Provided API key does not match the proxy access key.",
+        },
         401,
       );
     }

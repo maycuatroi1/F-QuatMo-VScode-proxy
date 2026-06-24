@@ -45,11 +45,13 @@ out/
 bun.lockb
 
 *.log
-npm-debug.log*
+logs/
+pm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 bun-debug.log*
+**/tests/
 .npm
 .eslintcache
 
