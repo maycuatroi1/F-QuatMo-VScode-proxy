@@ -702,8 +702,9 @@ chatRouter.post(
     // is only a checklist tracker and does not perform file modifications on disk.
     if (body.messages && Array.isArray(body.messages)) {
       let hasSystem = false;
-      const warningText = "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
-      
+      const warningText =
+        "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
+
       for (const msg of body.messages) {
         if (msg.role === "system") {
           hasSystem = true;
@@ -712,7 +713,7 @@ chatRouter.post(
           } else if (Array.isArray(msg.content)) {
             msg.content.push({
               type: "text",
-              text: warningText
+              text: warningText,
             });
           }
         }
@@ -720,7 +721,8 @@ chatRouter.post(
       if (!hasSystem) {
         body.messages.unshift({
           role: "system",
-          content: "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool."
+          content:
+            "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.",
         });
       }
     }
@@ -765,6 +767,7 @@ chatRouter.post(
     let classifierResultText = "";
     let classifierLabel = "none";
     let classifierConfidence = 0;
+    /*
     if (
       lastMsg &&
       lastMsg.role === "user" &&
@@ -786,6 +789,7 @@ chatRouter.post(
         console.error("[Classifier] Error during classification:", e);
       }
     }
+    */
 
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
