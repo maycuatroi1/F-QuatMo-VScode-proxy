@@ -198,9 +198,10 @@ function handleClassifierFailure() {
 
 async function classifyPrompt(prompt: string): Promise<any> {
   const apiUrl = process.env.CLASSIFIER_API_URL;
+  const classifierModel = process.env.CLASSIFIER_MODEL || "qwen3-coder";
   const truncatedPrompt = prompt.slice(0, 4000);
 
-  // CHẾ ĐỘ 1: Gọi qua Web API (Chuẩn Production - Ưu tiên hàng đầu)
+  // Gọi qua LiteLLM Prompt Management (Chuẩn Production)
   if (apiUrl) {
     if (Date.now() < classifierDisabledUntil) {
       console.warn(
@@ -221,15 +222,29 @@ async function classifyPrompt(prompt: string): Promise<any> {
       const response = await fetch(apiUrl, {
         method: "POST",
         headers,
-        body: JSON.stringify({ prompt: truncatedPrompt }),
-        signal: AbortSignal.timeout(30000), // Tự động huỷ sau 3 giây để không block request chính under load
+        body: JSON.stringify({
+          model: classifierModel,
+          prompt_id: "fvscode-classifier_test",
+          prompt_variables: {
+            student_prompt: truncatedPrompt,
+          },
+        }),
+        signal: AbortSignal.timeout(30000),
       });
 
       if (response.ok) {
-        const parsed = await response.json();
-        if (parsed && typeof parsed.label === "string") {
+        const responseData = await response.json();
+        const content = responseData.choices?.[0]?.message?.content || "";
+
+        const cleanJsonStr = content.replace(/```json|```/g, "").trim();
+        const parsed = JSON.parse(cleanJsonStr);
+
+        if (parsed && typeof parsed.level === "string") {
           classifierFailureCount = 0; // Reset counter on success
-          return parsed;
+          return {
+            label: parsed.level,
+            confidence: 1.0,
+          };
         }
       } else {
         console.error(`[Classifier API] HTTP Error: ${response.status}`);
@@ -243,76 +258,7 @@ async function classifyPrompt(prompt: string): Promise<any> {
     }
   }
 
-  // CHẾ ĐỘ 2: Chạy binary cục bộ (Chỉ dùng làm Fallback phát triển local)
-  return new Promise((resolve) => {
-    let resolved = false;
-    let child: any = null;
-
-    // Thiết lập timeout 60 giây để bắt buộc kết thúc nếu exe bị treo
-    const timeout = setTimeout(() => {
-      if (resolved) return;
-      resolved = true;
-      console.error("[Classifier] Process timeout (60s). Terminating...");
-      if (child) {
-        try {
-          child.kill("SIGKILL");
-        } catch (e) {}
-      }
-      resolve(null);
-    }, 60000);
-
-    try {
-      const exePath = path.resolve(process.cwd(), "bin", "classifier.exe");
-      child = spawn(exePath, ["--prompt", truncatedPrompt]);
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.on("data", (data: any) => {
-        stdout += data.toString();
-      });
-
-      child.stderr.on("data", (data: any) => {
-        stderr += data.toString();
-      });
-
-      child.on("error", (err: any) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-        console.error("[Classifier] Process error:", err);
-        resolve(null);
-      });
-
-      child.on("close", (code: number) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-
-        if (code === 0) {
-          try {
-            const parsed = JSON.parse(stdout.trim());
-            resolve(parsed);
-            return;
-          } catch (err) {
-            console.error("[Classifier] Failed to parse stdout:", stdout, err);
-          }
-        } else {
-          console.error(
-            `[Classifier] Exited with code ${code}. Stderr: ${stderr}`,
-          );
-        }
-        resolve(null);
-      });
-    } catch (err) {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        console.error("[Classifier] Spawn error:", err);
-        resolve(null);
-      }
-    }
-  });
+  return null;
 }
 
 function getUpstreamConfig(
@@ -767,7 +713,6 @@ chatRouter.post(
     let classifierResultText = "";
     let classifierLabel = "none";
     let classifierConfidence = 0;
-    /*
     if (
       lastMsg &&
       lastMsg.role === "user" &&
@@ -789,7 +734,6 @@ chatRouter.post(
         console.error("[Classifier] Error during classification:", e);
       }
     }
-    */
 
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
