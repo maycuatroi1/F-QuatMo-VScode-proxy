@@ -22,8 +22,7 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
   return async (c, next) => {
     const clientType = c.req.header("x-client-type");
     if (clientType === "quatmo-code") {
-      await next();
-      return;
+      return await next();
     }
 
     const user = c.get("user") as UserSession | undefined;
@@ -68,6 +67,6 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
       }
     }
 
-    await next();
+    return await next();
   };
 };
