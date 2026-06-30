@@ -2,7 +2,6 @@ import type { MiddlewareHandler } from "hono";
 import { redis } from "../services/redis";
 import type { UserSession } from "./auth";
 
-const REQUEST_LIMIT_PER_MINUTE = 30;
 const inMemoryStore = new Map<string, number>();
 
 setInterval(() => {
@@ -22,13 +21,24 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
   return async (c, next) => {
     const clientType = c.req.header("x-client-type");
     if (clientType === "quatmo-code") {
-      await next();
-      return;
+      return await next();
     }
 
     const user = c.get("user") as UserSession | undefined;
     if (!user) {
       return c.json({ error: "Context unauthorized" }, 401);
+    }
+
+    let limitVal = 30;
+    if (process.env.RATE_LIMIT_PER_MINUTE !== undefined) {
+      const parsed = parseInt(process.env.RATE_LIMIT_PER_MINUTE, 10);
+      if (!isNaN(parsed)) {
+        limitVal = parsed;
+      }
+    }
+
+    if (limitVal <= 0) {
+      return await next();
     }
 
     const currentMinute = Math.floor(Date.now() / 60000);
@@ -43,10 +53,10 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
           });
         }
 
-        if (count > REQUEST_LIMIT_PER_MINUTE) {
+        if (count > limitVal) {
           return c.json(
             {
-              error: `Too many requests. Rate limit exceeded (${REQUEST_LIMIT_PER_MINUTE} req/min).`,
+              error: `Too many requests. Rate limit exceeded (${limitVal} req/min).`,
             },
             429,
           );
@@ -58,16 +68,16 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
       // In-memory rate limiting fallback for local dev without Redis
       const count = (inMemoryStore.get(redisKey) || 0) + 1;
       inMemoryStore.set(redisKey, count);
-      if (count > REQUEST_LIMIT_PER_MINUTE) {
+      if (count > limitVal) {
         return c.json(
           {
-            error: `Too many requests. Rate limit exceeded (${REQUEST_LIMIT_PER_MINUTE} req/min).`,
+            error: `Too many requests. Rate limit exceeded (${limitVal} req/min).`,
           },
           429,
         );
       }
     }
 
-    await next();
+    return await next();
   };
 };

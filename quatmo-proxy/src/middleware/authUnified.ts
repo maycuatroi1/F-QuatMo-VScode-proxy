@@ -120,11 +120,11 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
       c.set("user", userSession);
       c.set("token", token);
 
-      await next();
+      return await next();
     } else {
       c.set("authMode", "normal");
       const originalAuth = normalAuthMiddleware();
-      await originalAuth(c, next);
+      return originalAuth(c, next);
     }
   };
 };

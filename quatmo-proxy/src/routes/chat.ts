@@ -714,6 +714,7 @@ chatRouter.post(
     let classifierLabel = "none";
     let classifierConfidence = 0;
     if (
+      process.env.CLASSIFIER_API_URL &&
       lastMsg &&
       lastMsg.role === "user" &&
       typeof lastMsg.content === "string"
