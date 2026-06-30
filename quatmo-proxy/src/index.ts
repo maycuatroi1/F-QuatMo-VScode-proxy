@@ -5,6 +5,7 @@ import { chatRouter } from "./routes/chat";
 import { adminRouter } from "./routes/admin";
 import { examAuthRouter } from "./routes/examAuth";
 import { proxyKeyConfig } from "./services/proxyKey";
+import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -33,6 +34,17 @@ app.use(
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
 app.route("/v1/exam", examAuthRouter);
+
+app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
+  return c.json({
+    data: [
+      { id: "qwen3-coder" },
+      { id: "gemma-4" },
+      { id: "whiterabbitneo-70b" },
+      { id: "foundation-sec" },
+    ],
+  });
+});
 
 // Health check endpoint
 app.get("/health", (c) =>

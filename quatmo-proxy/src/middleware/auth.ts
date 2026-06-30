@@ -91,6 +91,6 @@ export const authMiddleware = (): MiddlewareHandler<{
     // Attach user session to the request context
     c.set("user", session);
     c.set("token", token);
-    await next();
+    return await next();
   };
 };
