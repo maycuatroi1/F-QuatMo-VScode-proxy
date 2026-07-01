@@ -181,6 +181,23 @@ const chatRouter = new Hono<{
   Variables: { user: UserSession; token: string };
 }>();
 
+export const latestClassifications = new Map<
+  string,
+  { label: string; confidence: number }
+>();
+
+chatRouter.get("/latest-classification", unifiedAuthMiddleware(), (c) => {
+  const token = c.get("token");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const result = latestClassifications.get(token);
+  if (!result) {
+    return c.json({ label: "none", confidence: 0 });
+  }
+  return c.json(result);
+});
+
 let classifierFailureCount = 0;
 let classifierDisabledUntil = 0;
 const MAX_FAILURES = 3;
@@ -478,6 +495,21 @@ function normalizeUpstreamBody(
     ...body,
     model: upstream.actualModel,
   };
+
+  if (upstreamBody.messages && Array.isArray(upstreamBody.messages)) {
+    upstreamBody.messages = upstreamBody.messages.map((msg: any) => {
+      if (typeof msg.content === "string") {
+        return {
+          ...msg,
+          content: msg.content.replace(
+            /__CLASSIFIER_RESULT__:\{.*?\}(?:\r?\n)*/g,
+            "",
+          ),
+        };
+      }
+      return msg;
+    });
+  }
 
   if (upstream.provider === "custom") {
     const modelLower = upstream.actualModel.toLowerCase();
@@ -1022,9 +1054,16 @@ chatRouter.post(
             console.log(
               `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
             );
-            const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
-            responseData.choices[0].message.content =
-              classifierResultText + completionText;
+            latestClassifications.set(token, {
+              label: res.label,
+              confidence: res.confidence,
+            });
+
+            if (clientType !== "quatmo-code") {
+              const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
+              responseData.choices[0].message.content =
+                classifierResultText + completionText;
+            }
           }
         } catch (e) {
           console.error(
@@ -1105,17 +1144,26 @@ chatRouter.post(
               console.log(
                 `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
               );
-              const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
-              const classifierChunk = {
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: classifierResultText },
-                    finish_reason: null,
-                  },
-                ],
-              };
-              await stream.writeSSE({ data: JSON.stringify(classifierChunk) });
+              latestClassifications.set(token, {
+                label: res.label,
+                confidence: res.confidence,
+              });
+
+              if (clientType !== "quatmo-code") {
+                const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}`;
+                const classifierChunk = {
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: classifierResultText },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                await stream.writeSSE({
+                  data: JSON.stringify(classifierChunk),
+                });
+              }
             }
           } catch (e) {
             console.error(
