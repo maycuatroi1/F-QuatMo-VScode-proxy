@@ -196,12 +196,42 @@ function handleClassifierFailure() {
   }
 }
 
-async function classifyPrompt(prompt: string): Promise<any> {
+let cachedSystemPrompt = "";
+let lastLoadedTime = 0;
+
+async function getClassifierSystemPrompt(): Promise<string> {
+  const now = Date.now();
+  if (now - lastLoadedTime > 10000 || !cachedSystemPrompt) {
+    // Cache for 10s
+    try {
+      const filePath = path.join(
+        process.cwd(),
+        "src",
+        "system_prompt_ver21.md",
+      );
+      if (fs.existsSync(filePath)) {
+        cachedSystemPrompt = await fs.promises.readFile(filePath, "utf-8");
+        lastLoadedTime = now;
+      }
+    } catch (e) {
+      console.error("[Classifier] Error reading system_prompt_ver21.md:", e);
+    }
+  }
+  return (
+    cachedSystemPrompt ||
+    "You are a student prompt classifier. Return JSON: {level: string}"
+  );
+}
+
+async function classifyPrompt(
+  prompt: string,
+  completionText: string,
+): Promise<any> {
   const apiUrl = process.env.CLASSIFIER_API_URL;
   const classifierModel = process.env.CLASSIFIER_MODEL || "qwen3-coder";
-  const truncatedPrompt = prompt.slice(0, 4000);
+  // const truncatedPrompt = prompt.slice(0, 4000);
+  const truncatedPrompt = prompt;
 
-  // Gọi qua LiteLLM Prompt Management (Chuẩn Production)
   if (apiUrl) {
     if (Date.now() < classifierDisabledUntil) {
       console.warn(
@@ -219,25 +249,68 @@ async function classifyPrompt(prompt: string): Promise<any> {
         headers["Authorization"] = `Bearer ${classifierApiKey}`;
       }
 
+      const systemPrompt = await getClassifierSystemPrompt();
+      const classifierPayload = `Student Prompt: ${truncatedPrompt}\n\nAI Response Output:\n${completionText}`;
+
       const response = await fetch(apiUrl, {
         method: "POST",
         headers,
         body: JSON.stringify({
           model: classifierModel,
-          prompt_id: "fvscode-classifier_test",
-          prompt_variables: {
-            student_prompt: truncatedPrompt,
-          },
+          messages: [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content: classifierPayload,
+            },
+          ],
+          temperature: 0,
         }),
         signal: AbortSignal.timeout(30000),
       });
 
-      if (response.ok) {
-        const responseData = await response.json();
-        const content = responseData.choices?.[0]?.message?.content || "";
+      const responseText = await response.text();
 
-        const cleanJsonStr = content.replace(/```json|```/g, "").trim();
-        const parsed = JSON.parse(cleanJsonStr);
+      if (response.ok) {
+        let responseData: any;
+        let content = "";
+        try {
+          responseData = JSON.parse(responseText);
+          content = responseData.choices?.[0]?.message?.content || responseText;
+        } catch (e: any) {
+          content = responseText;
+        }
+
+        // Extract JSON block robustly from content
+        let parsed: any = null;
+        try {
+          const startIdx = content.indexOf("{");
+          const endIdx = content.lastIndexOf("}");
+          if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+            const jsonStr = content.substring(startIdx, endIdx + 1);
+            parsed = JSON.parse(jsonStr);
+          } else {
+            const cleanJsonStr = content.replace(/```json|```/g, "").trim();
+            parsed = JSON.parse(cleanJsonStr);
+          }
+        } catch (e: any) {
+          // If we still can't parse JSON, try regex lookup for a level number or "Thieu context"
+          const match =
+            content.match(/"level"\s*:\s*"([^"]+)"/) ||
+            content.match(/\b(L[0-6]|Thieu context)\b/);
+          if (match) {
+            parsed = { level: match[1] };
+          } else {
+            console.error(
+              "[Classifier API] Failed to parse classifier LLM output. Content was:",
+              content,
+            );
+            throw e;
+          }
+        }
 
         if (parsed && typeof parsed.level === "string") {
           classifierFailureCount = 0; // Reset counter on success
@@ -247,7 +320,10 @@ async function classifyPrompt(prompt: string): Promise<any> {
           };
         }
       } else {
-        console.error(`[Classifier API] HTTP Error: ${response.status}`);
+        console.error(
+          `[Classifier API] HTTP Error: ${response.status}. Response:`,
+          responseText.slice(0, 500),
+        );
         handleClassifierFailure();
       }
       return null;
@@ -637,6 +713,41 @@ chatRouter.post(
   unifiedAuthMiddleware(),
   rateLimitMiddleware(),
   async (c) => {
+    const allowedModesStr = process.env.ALLOWED_MODES || "";
+    const allowedModes = allowedModesStr
+      .split(",")
+      .map((m) => m.trim().toUpperCase())
+      .filter(Boolean);
+
+    const clientType = c.req.header("x-client-type") || "";
+
+    if (allowedModes.length === 0) {
+      return c.json(
+        { error: "Access Denied: No modes allowed by proxy configuration." },
+        403,
+      );
+    }
+
+    let isAllowed = false;
+    if (clientType === "quatmo-chat") {
+      if (allowedModes.includes("CHAT") || allowedModes.includes("AGENT")) {
+        isAllowed = true;
+      }
+    } else if (clientType === "quatmo-code") {
+      if (allowedModes.includes("AGENT")) {
+        isAllowed = true;
+      }
+    }
+
+    if (!isAllowed) {
+      return c.json(
+        {
+          error: `Access Denied: The client '${clientType || "unknown"}' is not allowed under the current proxy configuration.`,
+        },
+        403,
+      );
+    }
+
     const user = c.get("user");
     const token = c.get("token");
     const authMode = c.get("authMode" as any) as string | undefined;
@@ -710,31 +821,16 @@ chatRouter.post(
         ? body.messages[body.messages.length - 1]
         : null;
 
-    let classifierResultText = "";
-    let classifierLabel = "none";
-    let classifierConfidence = 0;
-    if (
+    const shouldClassify = !!(
       process.env.CLASSIFIER_API_URL &&
       lastMsg &&
       lastMsg.role === "user" &&
       typeof lastMsg.content === "string"
-    ) {
-      try {
-        const res = await classifyPrompt(lastMsg.content);
-        if (res && res.label) {
-          classifierLabel = res.label;
-          classifierConfidence = res.confidence;
-          const formattedLabel = res.label.toLowerCase();
-          const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
-          console.log(
-            `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
-          );
-          classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
-        }
-      } catch (e) {
-        console.error("[Classifier] Error during classification:", e);
-      }
-    }
+    );
+    const userPrompt = shouldClassify ? (lastMsg!.content as string) : "";
+
+    let classifierLabel = "none";
+    let classifierConfidence = 0;
 
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
@@ -911,13 +1007,31 @@ chatRouter.post(
 
       // Only inject classifier into plain text replies.
       if (
-        classifierResultText &&
+        shouldClassify &&
         responseData.choices?.[0]?.message &&
         !hasToolCalls
       ) {
-        responseData.choices[0].message.content =
-          classifierResultText +
-          (responseData.choices[0].message.content || "");
+        const completionText = responseData.choices[0].message.content || "";
+        try {
+          const res = await classifyPrompt(userPrompt, completionText);
+          if (res && res.label) {
+            classifierLabel = res.label;
+            classifierConfidence = res.confidence;
+            const formattedLabel = res.label.toLowerCase();
+            const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
+            console.log(
+              `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
+            );
+            const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
+            responseData.choices[0].message.content =
+              classifierResultText + completionText;
+          }
+        } catch (e) {
+          console.error(
+            "[Classifier] Error during post-completion classification:",
+            e,
+          );
+        }
       }
 
       await recordTokenUsage(totalConsumed);
@@ -959,14 +1073,15 @@ chatRouter.post(
       let outputTokens = 0;
       let accumulatedDeltaText = "";
 
-      let classifierChunkSent = false;
-      let classifierSuppressedForToolCalls = false;
       let streamToolCalls: any[] = [];
+      let hasAnyToolCalls = false;
 
       const emitSyntheticUsageAndDone = async () => {
-        // Flush any remaining tool call buffer
         const flushedDeltas = toolCallConverter.flush();
         for (const convDelta of flushedDeltas) {
+          if (convDelta.delta.tool_calls) {
+            hasAnyToolCalls = true;
+          }
           const flushChunk = {
             choices: [
               {
@@ -977,6 +1092,37 @@ chatRouter.post(
             ],
           };
           await stream.writeSSE({ data: JSON.stringify(flushChunk) });
+        }
+
+        if (shouldClassify && !hasAnyToolCalls) {
+          try {
+            const res = await classifyPrompt(userPrompt, completionText);
+            if (res && res.label) {
+              classifierLabel = res.label;
+              classifierConfidence = res.confidence;
+              const formattedLabel = res.label.toLowerCase();
+              const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
+              console.log(
+                `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
+              );
+              const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
+              const classifierChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: classifierResultText },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              await stream.writeSSE({ data: JSON.stringify(classifierChunk) });
+            }
+          } catch (e) {
+            console.error(
+              "[Classifier] Error during post-completion classification:",
+              e,
+            );
+          }
         }
 
         if (upstreamTotalTokens === null) {
@@ -1015,7 +1161,12 @@ chatRouter.post(
           const parsed = JSON.parse(rawJson);
           const delta = parsed.choices?.[0]?.delta;
 
-          if (delta && Array.isArray(delta.tool_calls)) {
+          if (
+            delta &&
+            Array.isArray(delta.tool_calls) &&
+            delta.tool_calls.length > 0
+          ) {
+            hasAnyToolCalls = true;
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;
               if (!streamToolCalls[idx]) {
@@ -1047,33 +1198,6 @@ chatRouter.post(
             }
             if (delta.thinking && !delta.reasoning_content) {
               delta.reasoning_content = delta.thinking;
-            }
-          }
-
-          const hasToolCalls =
-            Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0;
-          const hasContentDelta =
-            typeof delta?.content === "string" && delta.content.length > 0;
-
-          if (
-            !classifierChunkSent &&
-            !classifierSuppressedForToolCalls &&
-            classifierResultText
-          ) {
-            if (hasToolCalls) {
-              classifierSuppressedForToolCalls = true;
-            } else if (hasContentDelta) {
-              const classifierChunk = {
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: classifierResultText },
-                    finish_reason: null,
-                  },
-                ],
-              };
-              await stream.writeSSE({ data: JSON.stringify(classifierChunk) });
-              classifierChunkSent = true;
             }
           }
 
@@ -1165,7 +1289,7 @@ chatRouter.post(
             );
             for (const convDelta of convertedDeltas) {
               if (convDelta.delta.tool_calls) {
-                classifierSuppressedForToolCalls = true;
+                hasAnyToolCalls = true;
                 for (const tc of convDelta.delta.tool_calls) {
                   const idx = tc.index ?? 0;
                   if (!streamToolCalls[idx]) {
