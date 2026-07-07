@@ -5,7 +5,15 @@ import { rateLimitMiddleware } from "../middleware/rateLimit";
 import { countMessagesTokens, countTokens } from "../services/token";
 import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
+import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
 import { exams } from "../services/examStore";
+import { logSession, logGlobal } from "../services/secureLogger";
+import {
+  validateUserMessages,
+  checkText,
+  VIETNAMESE_REGEX,
+  ENGLISH_ONLY_SYSTEM_INSTRUCTION,
+} from "../services/safetyGuard";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
 import path from "path";
@@ -181,6 +189,8 @@ const chatRouter = new Hono<{
   Variables: { user: UserSession; token: string };
 }>();
 
+chatRouter.use("*", verifyFingerprintMiddleware());
+
 export const latestClassifications = new Map<
   string,
   { label: string; confidence: number }
@@ -224,6 +234,7 @@ async function getClassifierSystemPrompt(): Promise<string> {
       const filePath = path.join(
         process.cwd(),
         "src",
+        "systemPrompts",
         "system_prompt_ver21.md",
       );
       if (fs.existsSync(filePath)) {
@@ -656,7 +667,7 @@ async function logStudentInteraction(
       : "";
 
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
-  const logDir = path.resolve(process.cwd(), "logs", "exams", examCode);
+  const logDir = path.resolve(process.cwd(), "logs", "sessions", examCode);
   const logFilePath = path.resolve(logDir, `${studentId}.json`);
 
   try {
@@ -735,8 +746,19 @@ async function logStudentInteraction(
       JSON.stringify(logs, null, 2),
       "utf-8",
     );
+
+    const sessionEntry =
+      isContinuation && lastEntry ? lastEntry : logs[logs.length - 1];
+    await logSession(examCode, studentId, sessionEntry);
   } catch (err) {
     console.error("[Logger] Failed to write student log:", err);
+    logGlobal({
+      level: "error",
+      event: "session_log_write_failed",
+      examCode,
+      studentId,
+      error: String(err),
+    });
   }
 }
 
@@ -787,8 +809,40 @@ chatRouter.post(
     const sessionKey = c.get("sessionKey" as any) as any;
     const body = await c.req.json();
 
-    // Prevent LLM tool-calling confusion: explicitly inject system instruction that todowrite
-    // is only a checklist tracker and does not perform file modifications on disk.
+    if (body.messages && Array.isArray(body.messages)) {
+      const safetyResult = await validateUserMessages(body.messages);
+      if (!safetyResult.allowed && safetyResult.violation) {
+        const v = safetyResult.violation;
+        console.warn(
+          `[Safety] BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+        );
+        const errorMsg = v.message;
+        if (body.stream) {
+          return streamSSE(c, async (stream) => {
+            const errChunk = {
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: `\n\n**[${errorMsg}]**\n\n` },
+                  finish_reason: "error",
+                },
+              ],
+              error: {
+                message: errorMsg,
+                code: v.code,
+                type: v.type,
+              },
+            };
+            await stream.writeSSE({ data: JSON.stringify(errChunk) });
+            await stream.writeSSE({ data: "[DONE]" });
+          });
+        }
+        return c.json(
+          { error: { message: errorMsg, code: v.code, type: v.type } },
+          400,
+        );
+      }
+    }
     if (body.messages && Array.isArray(body.messages)) {
       let hasSystem = false;
       const warningText =
@@ -798,11 +852,11 @@ chatRouter.post(
         if (msg.role === "system") {
           hasSystem = true;
           if (typeof msg.content === "string") {
-            msg.content += warningText;
+            msg.content += warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION;
           } else if (Array.isArray(msg.content)) {
             msg.content.push({
               type: "text",
-              text: warningText,
+              text: warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION,
             });
           }
         }
@@ -811,7 +865,8 @@ chatRouter.post(
         body.messages.unshift({
           role: "system",
           content:
-            "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.",
+            "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool." +
+            ENGLISH_ONLY_SYSTEM_INSTRUCTION,
         });
       }
     }
@@ -938,6 +993,12 @@ chatRouter.post(
       } as any);
     } catch (err: any) {
       console.error("[Proxy] Upstream connection failed:", err.message);
+      logGlobal({
+        level: "error",
+        event: "upstream_connection_failed",
+        url: upstream.url,
+        error: err.message,
+      });
       return c.json(
         { error: `Connection to upstream provider failed: ${err.message}` },
         502,
@@ -951,6 +1012,13 @@ chatRouter.post(
         response.status,
         errBody,
       );
+      logGlobal({
+        level: "error",
+        event: "upstream_error_response",
+        url: upstream.url,
+        status: response.status,
+        body: errBody.slice(0, 500),
+      });
       return c.text(errBody, response.status as any);
     }
 
@@ -1014,8 +1082,18 @@ chatRouter.post(
         Array.isArray(responseData.choices?.[0]?.message?.tool_calls) &&
         responseData.choices[0].message.tool_calls.length > 0;
 
+      // Output Safety Guard: check if the AI response violates language/profanity rules
+      let content = responseData.choices?.[0]?.message?.content || "";
+      const outputSafety = await checkText(content);
+      if (!outputSafety.allowed && outputSafety.violation) {
+        const v = outputSafety.violation;
+        return c.json(
+          { error: { message: v.message, code: v.code, type: v.type } },
+          400,
+        );
+      }
+
       // Convert XML tool call in non-streaming response if present
-      const content = responseData.choices?.[0]?.message?.content || "";
       if (!hasToolCalls && content.includes("<function=")) {
         const cleanContent = content.replace(/<\/tool_call>/g, "");
         const parsedTool = parseXmlToolCall(cleanContent);
@@ -1106,8 +1184,17 @@ chatRouter.post(
     return streamSSE(c, async (stream) => {
       const toolCallConverter = new XmlToolCallConverter();
       let completionText = "";
+      const chunksToWrite: string[] = [];
+      const writeBufferedChunks = async () => {
+        for (const dataStr of chunksToWrite) {
+          await stream.writeSSE({ data: dataStr });
+          await new Promise((resolve) => setTimeout(resolve, 15));
+        }
+        chunksToWrite.length = 0;
+      };
       let accumulatedBuffer = "";
       let isTerminated = false;
+      let receivedChunks = 0;
       let upstreamTotalTokens: number | null = null;
       let outputTokens = 0;
       let accumulatedDeltaText = "";
@@ -1116,6 +1203,41 @@ chatRouter.post(
       let hasAnyToolCalls = false;
 
       const emitSyntheticUsageAndDone = async () => {
+        // 1. Run output safety check on the complete response before releasing any chunks
+        if (!hasAnyToolCalls) {
+          const outputSafety = await checkText(completionText);
+          if (!outputSafety.allowed && outputSafety.violation) {
+            const v = outputSafety.violation;
+            console.warn(
+              `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+            );
+
+            const errorChunk = {
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
+                  finish_reason: "error",
+                },
+              ],
+              error: {
+                message: v.message,
+                code: v.code,
+                type: v.type,
+              },
+            };
+            await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+            await stream.writeSSE({ data: "[DONE]" });
+            await stream.close();
+            isTerminated = true;
+            return;
+          }
+        }
+
+        // 2. Safe or has tool calls, write all buffered chunks to client
+        await writeBufferedChunks();
+
+        // 3. Flush tool deltas to client
         const flushedDeltas = toolCallConverter.flush();
         for (const convDelta of flushedDeltas) {
           if (convDelta.delta.tool_calls) {
@@ -1194,6 +1316,7 @@ chatRouter.post(
 
       const handleSseLine = async (trimmed: string) => {
         if (!trimmed) return;
+        receivedChunks++;
 
         if (trimmed === "data: [DONE]") {
           await emitSyntheticUsageAndDone();
@@ -1269,10 +1392,12 @@ chatRouter.post(
           const reasoning = delta?.reasoning_content || delta?.reasoning || "";
           completionText += content + reasoning;
 
+          // Inline chunk safety checks removed in favor of post-generation Output Guardrail LLM check.
+          const deltaText = content + reasoning;
+
           // High-performance token budgeting optimization:
           // Instead of re-tokenizing the growing completionText on every chunk (O(N^2) complexity),
           // we incrementally track characters and count tokens in batches of ~6 words (O(N) total complexity).
-          const deltaText = content + reasoning;
           if (deltaText) {
             accumulatedDeltaText += deltaText;
           }
@@ -1289,6 +1414,41 @@ chatRouter.post(
             outputTokens += countTokens(accumulatedDeltaText);
             accumulatedDeltaText = "";
             const exactTotalConsumed = inputTokens + outputTokens;
+
+            // Run output safety check on the complete response before releasing any chunks
+            if (!hasAnyToolCalls) {
+              const outputSafety = await checkText(completionText);
+              if (!outputSafety.allowed && outputSafety.violation) {
+                const v = outputSafety.violation;
+                console.warn(
+                  `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+                );
+
+                const errorChunk = {
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
+                      finish_reason: "error",
+                    },
+                  ],
+                  error: {
+                    message: v.message,
+                    code: v.code,
+                    type: v.type,
+                  },
+                };
+                await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                await stream.writeSSE({ data: "[DONE]" });
+                await stream.close();
+                reader.cancel();
+                isTerminated = true;
+                return;
+              }
+            }
+
+            // Safe, write all buffered chunks to client
+            await writeBufferedChunks();
 
             const errorChunk = {
               choices: [
@@ -1372,13 +1532,13 @@ chatRouter.post(
                   },
                 ],
               };
-              await stream.writeSSE({ data: JSON.stringify(newParsed) });
+              chunksToWrite.push(JSON.stringify(newParsed));
             }
           } else {
-            await stream.writeSSE({ data: JSON.stringify(parsed) });
+            chunksToWrite.push(JSON.stringify(parsed));
           }
         } catch (err) {
-          await stream.writeSSE({ data: rawJson });
+          chunksToWrite.push(rawJson);
         }
       };
 

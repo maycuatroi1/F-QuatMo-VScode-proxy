@@ -6,6 +6,7 @@ import { adminRouter } from "./routes/admin";
 import { examAuthRouter } from "./routes/examAuth";
 import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
+import { logGlobal } from "./services/secureLogger";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -60,6 +61,20 @@ console.log(
     : "[Proxy] No PROXY_API_KEY found. Generated runtime proxy key.",
 );
 console.log(`[Proxy] Access key: ${proxyKeyConfig.value}`);
+
+logGlobal({ level: "info", event: "server_start", port });
+
+process.on("uncaughtException", (err) => {
+  console.error("[Proxy] Uncaught exception:", err);
+  logGlobal({ level: "error", event: "uncaught_exception", error: err.message, stack: err.stack });
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  console.error("[Proxy] Unhandled rejection:", msg);
+  logGlobal({ level: "error", event: "unhandled_rejection", error: msg, stack });
+});
 
 export default {
   port,
