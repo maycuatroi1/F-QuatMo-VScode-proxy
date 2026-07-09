@@ -1,6 +1,10 @@
 import { Hono } from "hono";
 import { getProxyApiKey } from "../services/proxyKey";
 import { redis } from "../services/redis";
+import AdmZip from "adm-zip";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 
 declare const Bun: any;
 import {
@@ -263,6 +267,62 @@ adminRouter.get("/sessions", async (c) => {
 
   const sessionList = await Promise.all(sessionPromises);
   return c.json({ success: true, sessions: sessionList });
+});
+
+adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json({ error: `Session with code ${sessionCode} not found.` }, 404);
+  }
+
+  const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  if (!fs.existsSync(sessionLogDir)) {
+    return c.json({ error: `No logs found for session ${sessionCode}.` }, 404);
+  }
+
+  try {
+    const zip = new AdmZip();
+    const files = await fs.promises.readdir(sessionLogDir);
+    let addedFilesCount = 0;
+    
+    // Get encryption key from environment or use a secure fallback
+    const secret = (process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase").trim();
+
+    for (const file of files) {
+      if (file.endsWith(".json") || file.endsWith(".log")) {
+        const filePath = path.join(sessionLogDir, file);
+        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+        
+        // Encrypt log file content using AES-256-CBC
+        const key = crypto.createHash("sha256").update(secret).digest();
+        const iv = crypto.createHash("sha256").update(key).digest().subarray(0, 16);
+        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+        const encryptedBuffer = Buffer.concat([
+          cipher.update(fileContent, "utf-8"),
+          cipher.final()
+        ]);
+        
+        // Add encrypted buffer as <filename>.enc to ZIP
+        zip.addFile(`${file}.enc`, encryptedBuffer);
+        addedFilesCount++;
+      }
+    }
+
+    if (addedFilesCount === 0) {
+      return c.json({ error: `No log files found in session directory.` }, 404);
+    }
+
+    const zipBuffer = zip.toBuffer();
+
+    c.header("Content-Type", "application/zip");
+    c.header("Content-Disposition", `attachment; filename=session-${sessionCode}-logs.zip`);
+    return c.body(zipBuffer);
+  } catch (err: any) {
+    console.error(`[Admin] Failed to zip logs for session ${sessionCode}:`, err);
+    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+  }
 });
 
 export { adminRouter };

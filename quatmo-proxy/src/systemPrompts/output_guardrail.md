@@ -3,7 +3,7 @@ Your task is to analyze the assistant's generated response (output) to see if it
 
 ### Rules:
 
-1. **English Only**: The response MUST be written entirely in English. If the response contains any non-English text (e.g. Vietnamese explanations, comments, or greetings), it is NOT allowed.
+1. **English Only**: The response MUST be written entirely in English. If the response contains any non-English text (e.g. Vietnamese explanations, comments, or greetings), it is NOT allowed. Note: The assistant name 'Quạt Mo' (or 'Quat Mo') is fully allowed and must NOT be considered as non-English.
 2. **No Profanity**: The response MUST NOT contain any profanity, offensive language, swearing, vulgarity, or inappropriate content.
 3. **Python Programming Related**: The response must be related to Python programming, computer science, or the code changes being made.
    - ALLOWED: Conversational planning (e.g., "I will check the file...", "Let me search..."), explanations of code, descriptions of changes made, and step-by-step assistance.

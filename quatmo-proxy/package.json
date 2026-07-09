@@ -10,12 +10,14 @@
     "build": "tsc"
   },
   "dependencies": {
-    "hono": "^4.10.7",
+    "adm-zip": "^0.5.18",
     "dotenv": "^16.4.5",
+    "hono": "^4.10.7",
     "ioredis": "^5.4.1",
     "tiktoken": "^1.0.18"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/node": "^20.12.7",
     "typescript": "^5.4.5"
   }

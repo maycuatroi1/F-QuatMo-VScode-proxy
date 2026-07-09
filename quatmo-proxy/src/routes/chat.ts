@@ -13,6 +13,8 @@ import {
   checkText,
   VIETNAMESE_REGEX,
   ENGLISH_ONLY_SYSTEM_INSTRUCTION,
+  type SafetyCheckResult,
+  type SafetyViolation,
 } from "../services/safetyGuard";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
@@ -360,7 +362,9 @@ function getUpstreamConfig(
 
   if (
     matchesConfiguredCustomModel ||
+    lowerModel.includes("gemma4-26b") ||
     lowerModel.includes("gemma-4") ||
+    lowerModel.includes("gemma4") ||
     lowerModel.includes("qwen3-coder") ||
     lowerModel.includes("whiterabbitneo") ||
     lowerModel.includes("foundation-sec")
@@ -677,6 +681,103 @@ async function logStudentInteraction(
   }
 }
 
+async function logStudentError(
+  sessionCode: string,
+  studentId: string,
+  currentAiOption: string,
+  body: any,
+  errorMsg: string,
+  layer: string,
+  code?: string,
+  httpStatus?: number,
+) {
+  const clientContext = await redisStore
+    .getClientContext(sessionCode, studentId)
+    .catch(() => null);
+  const codeSnapshot = clientContext?.activeFile?.content || "";
+  const activeFilePath = clientContext?.activeFile?.path || "";
+  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
+  const codeSnapshots = clientContext?.files || [];
+
+  const userMessages =
+    body?.messages?.filter((m: any) => m.role === "user") || [];
+  const currentUserMsg =
+    userMessages.length > 0
+      ? userMessages[userMessages.length - 1].content
+          ?.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+          .trimStart()
+      : "";
+
+  const logDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  const logFilePath = path.resolve(logDir, `${studentId}.json`);
+
+  try {
+    await fs.promises.mkdir(logDir, { recursive: true });
+
+    let logs: any[] = [];
+    if (fs.existsSync(logFilePath)) {
+      try {
+        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+        logs = JSON.parse(fileContent);
+      } catch (e) {
+        // file empty or invalid
+      }
+    }
+
+    const newEntry: any = {
+      timestamp: new Date().toISOString(),
+      prompt: currentUserMsg,
+      aiOption: currentAiOption,
+      error: {
+        layer,
+        message: errorMsg,
+        code: code || "ERROR",
+        httpStatus: httpStatus || 500,
+      },
+      history: body?.messages || [],
+      codeSnapshot,
+      activeFilePath,
+      activeFileLanguageId,
+      codeSnapshots,
+    };
+
+    logs.push(newEntry);
+
+    await fs.promises.writeFile(
+      logFilePath,
+      JSON.stringify(logs, null, 2),
+      "utf-8",
+    );
+
+    await logSession(sessionCode, studentId, newEntry).catch(() => {});
+  } catch (err) {
+    console.error("[Logger] Failed to write student error log:", err);
+  }
+}
+
+let cachedTutorPrompt = "";
+async function getPythonTutorPrompt(): Promise<string> {
+  if (process.env.NODE_ENV === "production" && cachedTutorPrompt) {
+    return cachedTutorPrompt;
+  }
+  try {
+    const tutorPath = path.join(
+      process.cwd(),
+      "src",
+      "systemPrompts",
+      "python_tutor.md",
+    );
+    if (fs.existsSync(tutorPath)) {
+      const prompt = await fs.promises.readFile(tutorPath, "utf-8");
+      cachedTutorPrompt = prompt;
+      return prompt;
+    }
+  } catch (err) {
+    console.error("[PythonTutor] Error reading tutor prompt:", err);
+  }
+  return "You are a Python programming tutor.";
+}
+
 chatRouter.post(
   "/completions",
   unifiedAuthMiddleware(),
@@ -748,14 +849,62 @@ chatRouter.post(
     finalSessionCode = finalSessionCode.toUpperCase();
     finalStudentId = finalStudentId.toUpperCase();
 
-    if (body.messages && Array.isArray(body.messages)) {
-      const safetyResult = await validateUserMessages(body.messages);
+    const startTime = performance.now();
+    let inputSafetyDuration = 0;
+
+    const messages = body.messages;
+    let lastMsg = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null;
+    
+    const isRealUserPrompt = () => {
+      if (!lastMsg || lastMsg.role !== "user") return false;
+      const content = typeof lastMsg.content === "string"
+        ? lastMsg.content
+        : Array.isArray(lastMsg.content)
+          ? JSON.stringify(lastMsg.content)
+          : "";
+      
+      if (
+        lastMsg.tool_call_id ||
+        lastMsg.tool_calls ||
+        content.includes("<system-reminder>") ||
+        content.includes("Called the ") ||
+        content.includes("tool failed") ||
+        content.includes("<task ") ||
+        content.includes("<task_result>") ||
+        content.includes("<task_error>") ||
+        content.includes("<shell_result>") ||
+        content.includes("<shell_metadata>") ||
+        content.includes("Attached media from tool result:")
+      ) {
+        return false;
+      }
+      return true;
+    };
+    const isUserPrompt = isRealUserPrompt();
+
+    if (isUserPrompt && messages && Array.isArray(messages)) {
+      const inputSafetyStart = performance.now();
+      const safetyResult = await validateUserMessages(messages);
+      inputSafetyDuration = performance.now() - inputSafetyStart;
+      console.log(`[Perf] Input safety check took ${inputSafetyDuration.toFixed(0)}ms`);
       if (!safetyResult.allowed && safetyResult.violation) {
         const v = safetyResult.violation;
         console.warn(
           `[Safety] BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
         );
         const errorMsg = v.message;
+        if (authMode === "session") {
+          await logStudentError(
+            finalSessionCode,
+            finalStudentId,
+            currentAiOption,
+            body,
+            errorMsg,
+            "Input Safety Guardrail",
+            v.code,
+            400
+          ).catch(() => {});
+        }
         if (body.stream) {
           return streamSSE(c, async (stream) => {
             const errChunk = {
@@ -787,16 +936,20 @@ chatRouter.post(
       const warningText =
         "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
 
+      const tutorPrompt = await getPythonTutorPrompt();
+
       for (const msg of body.messages) {
         if (msg.role === "system") {
           hasSystem = true;
           if (typeof msg.content === "string") {
-            msg.content += warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION;
+            msg.content = tutorPrompt + warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION;
           } else if (Array.isArray(msg.content)) {
-            msg.content.push({
-              type: "text",
-              text: warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION,
-            });
+            msg.content = [
+              {
+                type: "text",
+                text: tutorPrompt + warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION,
+              }
+            ];
           }
         }
       }
@@ -804,6 +957,7 @@ chatRouter.post(
         body.messages.unshift({
           role: "system",
           content:
+            tutorPrompt +
             "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool." +
             ENGLISH_ONLY_SYSTEM_INSTRUCTION,
         });
@@ -842,7 +996,7 @@ chatRouter.post(
       );
     }
 
-    const lastMsg =
+    lastMsg =
       body.messages && body.messages.length > 0
         ? body.messages[body.messages.length - 1]
         : null;
@@ -887,6 +1041,18 @@ chatRouter.post(
 
     if (remainingBudget <= 0) {
       const errorMsg = "Monthly token budget exceeded. Access Denied.";
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          errorMsg,
+          "Rate Limiting",
+          "BUDGET_EXCEEDED",
+          402
+        ).catch(() => {});
+      }
       if (body.stream) {
         return streamSSE(c, async (stream) => {
           const errChunk = {
@@ -927,6 +1093,7 @@ chatRouter.post(
     }
 
     let response: Response;
+    const mainLlmStart = performance.now();
     try {
       response = await fetch(upstream.url, {
         method: "POST",
@@ -934,6 +1101,8 @@ chatRouter.post(
         body: JSON.stringify(upstreamBody),
         // verbose: true, //stress test
       } as any);
+      const mainLlmDuration = performance.now() - mainLlmStart;
+      console.log(`[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`);
     } catch (err: any) {
       console.error("[Proxy] Upstream connection failed:", err.message);
       logGlobal({
@@ -942,6 +1111,18 @@ chatRouter.post(
         url: upstream.url,
         error: err.message,
       });
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          `Connection to upstream provider failed: ${err.message}`,
+          "Upstream LLM Provider",
+          "UPSTREAM_CONNECTION_FAILED",
+          502
+        ).catch(() => {});
+      }
       return c.json(
         { error: `Connection to upstream provider failed: ${err.message}` },
         502,
@@ -962,6 +1143,18 @@ chatRouter.post(
         status: response.status,
         body: errBody.slice(0, 500),
       });
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          errBody || `Upstream returned status ${response.status}`,
+          "Upstream LLM Provider",
+          "UPSTREAM_ERROR_STATUS",
+          response.status
+        ).catch(() => {});
+      }
       return c.text(errBody, response.status as any);
     }
 
@@ -1027,13 +1220,30 @@ chatRouter.post(
 
       // Output Safety Guard: check if the AI response violates language/profanity rules
       let content = responseData.choices?.[0]?.message?.content || "";
-      const outputSafety = await checkText(content);
-      if (!outputSafety.allowed && outputSafety.violation) {
-        const v = outputSafety.violation;
-        return c.json(
-          { error: { message: v.message, code: v.code, type: v.type } },
-          400,
-        );
+      if (isUserPrompt) {
+        const outputSafetyStart = performance.now();
+        const outputSafety = await checkText(content);
+        const outputSafetyDuration = performance.now() - outputSafetyStart;
+        console.log(`[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`);
+        if (!outputSafety.allowed && outputSafety.violation) {
+          const v = outputSafety.violation;
+          if (authMode === "session") {
+            await logStudentError(
+              finalSessionCode,
+              finalStudentId,
+              currentAiOption,
+              body,
+              v.message,
+              "Output Safety Guardrail",
+              v.code,
+              400
+            ).catch(() => {});
+          }
+          return c.json(
+            { error: { message: v.message, code: v.code, type: v.type } },
+            400,
+          );
+        }
       }
 
       // Convert XML tool call in non-streaming response if present
@@ -1109,6 +1319,11 @@ chatRouter.post(
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
+    c.header("Content-Type", "text/event-stream");
+    c.header("Cache-Control", "no-cache, no-transform");
+    c.header("Connection", "keep-alive");
+    c.header("X-Accel-Buffering", "no");
+
     return streamSSE(c, async (stream) => {
       const toolCallConverter = new XmlToolCallConverter();
       let completionText = "";
@@ -1124,6 +1339,8 @@ chatRouter.post(
 
       let streamToolCalls: any[] = [];
       let hasAnyToolCalls = false;
+
+
 
       const emitSyntheticUsageAndDone = async () => {
         // Flush tool deltas to client
@@ -1157,67 +1374,105 @@ chatRouter.post(
           });
         }
 
-        // Run output safety check synchronously at the end of the stream before closing
-        if (!hasAnyToolCalls) {
-          try {
-            const outputSafety = await checkText(completionText);
-            if (!outputSafety.allowed && outputSafety.violation) {
-              wasBlockedByGuardrail = true;
-              const v = outputSafety.violation;
-              console.warn(
-                `[Safety] Output BLOCKED ${v.code} from studentId=${finalStudentId} | evidence: ${v.evidence.join(", ")}`,
-              );
+        // Run output safety check asynchronously (non-blocking chunk delivery)
+        if (isUserPrompt && !hasAnyToolCalls) {
+          const outputSafetyStart = performance.now();
+          const checkPromise = checkText(completionText)
+            .then(async (outputSafety) => {
+              const outputSafetyDuration = performance.now() - outputSafetyStart;
+              console.log(`[Perf] Asynchronous output safety check completed in ${outputSafetyDuration.toFixed(0)}ms`);
+              if (!outputSafety.allowed && outputSafety.violation) {
+                wasBlockedByGuardrail = true;
+                const v = outputSafety.violation;
+                console.warn(
+                  `[Safety] Output BLOCKED ${v.code} from studentId=${finalStudentId} | evidence: ${v.evidence.join(", ")}`,
+                );
 
-              const errorChunk = {
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: `\n\n**[${v.message}]**\n\n` },
-                    finish_reason: "error",
+                if (authMode === "session") {
+                  await logStudentError(
+                    finalSessionCode,
+                    finalStudentId,
+                    currentAiOption,
+                    body,
+                    v.message,
+                    "Output Safety Guardrail",
+                    v.code,
+                    400
+                  ).catch(() => {});
+                }
+
+                const errorChunk = {
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: `\n\n**[${v.message}]**\n\n` },
+                      finish_reason: "error",
+                    },
+                  ],
+                  error: {
+                    message: v.message,
+                    code: v.code,
+                    type: v.type,
                   },
-                ],
-                error: {
-                  message: v.message,
-                  code: v.code,
-                  type: v.type,
-                },
-              };
-              await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                };
+                await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+              }
+            })
+            .catch((err) => {
+              console.error(
+                "[Safety Guardrail] Error running safety check:",
+                err.message,
+              );
+            })
+            .finally(async () => {
+              if (upstreamTotalTokens === null) {
+                const finalOutputTokens = countTokens(completionText);
+                const totalConsumed = inputTokens + finalOutputTokens;
+
+                const usageChunk = {
+                  choices: [],
+                  usage: {
+                    prompt_tokens: inputTokens,
+                    completion_tokens: finalOutputTokens,
+                    total_tokens: totalConsumed,
+                  },
+                };
+                await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+              }
               await stream.writeSSE({ data: "[DONE]" });
               await stream.close();
               isTerminated = true;
-              return;
-            }
-          } catch (err: any) {
-            console.error(
-              "[Safety Guardrail] Error running safety check:",
-              err.message,
-            );
+            });
+
+          await checkPromise;
+        } else {
+          if (upstreamTotalTokens === null) {
+            const finalOutputTokens = countTokens(completionText);
+            const totalConsumed = inputTokens + finalOutputTokens;
+
+            const usageChunk = {
+              choices: [],
+              usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: finalOutputTokens,
+                total_tokens: totalConsumed,
+              },
+            };
+            await stream.writeSSE({ data: JSON.stringify(usageChunk) });
           }
+          await stream.writeSSE({ data: "[DONE]" });
+          await stream.close();
+          isTerminated = true;
         }
-
-        if (upstreamTotalTokens === null) {
-          const finalOutputTokens = countTokens(completionText);
-          const totalConsumed = inputTokens + finalOutputTokens;
-
-          const usageChunk = {
-            choices: [],
-            usage: {
-              prompt_tokens: inputTokens,
-              completion_tokens: finalOutputTokens,
-              total_tokens: totalConsumed,
-            },
-          };
-          await stream.writeSSE({ data: JSON.stringify(usageChunk) });
-        }
-        await stream.writeSSE({ data: "[DONE]" });
-        await stream.close();
-        isTerminated = true;
       };
 
       const handleSseLine = async (trimmed: string) => {
         if (!trimmed) return;
         receivedChunks++;
+        if (receivedChunks === 1) {
+          const ttft = performance.now() - startTime;
+          console.log(`[Perf] Time to first token (TTFT): ${ttft.toFixed(0)}ms (including input safety check)`);
+        }
 
         if (trimmed === "data: [DONE]") {
           await emitSyntheticUsageAndDone();
@@ -1339,77 +1594,134 @@ chatRouter.post(
             accumulatedDeltaText = "";
             const exactTotalConsumed = inputTokens + outputTokens;
 
-            // Run output safety check on the complete response before releasing any chunks
-            if (!hasAnyToolCalls) {
-              const outputSafety = await checkText(completionText);
-              if (!outputSafety.allowed && outputSafety.violation) {
-                wasBlockedByGuardrail = true;
-                const v = outputSafety.violation;
-                console.warn(
-                  `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
-                );
+            if (isUserPrompt && !hasAnyToolCalls) {
+              const checkPromise = checkText(completionText)
+                .then(async (outputSafety) => {
+                  if (!outputSafety.allowed && outputSafety.violation) {
+                    wasBlockedByGuardrail = true;
+                    const v = outputSafety.violation;
+                    console.warn(
+                      `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+                    );
 
-                const errorChunk = {
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
-                      finish_reason: "error",
+                    if (authMode === "session") {
+                      await logStudentError(
+                        finalSessionCode,
+                        finalStudentId,
+                        currentAiOption,
+                        body,
+                        v.message,
+                        "Output Safety Guardrail",
+                        v.code,
+                        400
+                      ).catch(() => {});
+                    }
+
+                    const errorChunk = {
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
+                          finish_reason: "error",
+                        },
+                      ],
+                      error: {
+                        message: v.message,
+                        code: v.code,
+                        type: v.type,
+                      },
+                    };
+                    await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                  } else {
+                    const errorChunk = {
+                      choices: [
+                        {
+                          index: 0,
+                          delta: {
+                            content:
+                              "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
+                          },
+                          finish_reason: null,
+                        },
+                      ],
+                    };
+                    await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                  }
+                })
+                .catch((err) => {
+                  console.error(
+                    "[Safety Guardrail] Error running budget safety check:",
+                    err.message,
+                  );
+                })
+                .finally(async () => {
+                  const usageChunk = {
+                    choices: [],
+                    usage: {
+                      prompt_tokens: inputTokens,
+                      completion_tokens: outputTokens,
+                      total_tokens: exactTotalConsumed,
                     },
-                  ],
-                  error: {
-                    message: v.message,
-                    code: v.code,
-                    type: v.type,
+                  };
+                  await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+
+                  const stopChunk = {
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: "length",
+                      },
+                    ],
+                  };
+                  await stream.writeSSE({ data: JSON.stringify(stopChunk) });
+                  await stream.writeSSE({ data: "[DONE]" });
+                  await stream.close();
+                  reader.cancel();
+                  isTerminated = true;
+                });
+
+              await checkPromise;
+            } else {
+              const errorChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      content:
+                        "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
+                    },
+                    finish_reason: null,
                   },
-                };
-                await stream.writeSSE({ data: JSON.stringify(errorChunk) });
-                await stream.writeSSE({ data: "[DONE]" });
-                await stream.close();
-                reader.cancel();
-                isTerminated = true;
-                return;
-              }
+                ],
+              };
+              await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+
+              const usageChunk = {
+                choices: [],
+                usage: {
+                  prompt_tokens: inputTokens,
+                  completion_tokens: outputTokens,
+                  total_tokens: exactTotalConsumed,
+                },
+              };
+              await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+
+              const stopChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "length",
+                  },
+                ],
+              };
+              await stream.writeSSE({ data: JSON.stringify(stopChunk) });
+              await stream.writeSSE({ data: "[DONE]" });
+              await stream.close();
+              reader.cancel();
+              isTerminated = true;
             }
-
-            const errorChunk = {
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    content:
-                      "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
-                  },
-                  finish_reason: null,
-                },
-              ],
-            };
-            await stream.writeSSE({ data: JSON.stringify(errorChunk) });
-
-            const usageChunk = {
-              choices: [],
-              usage: {
-                prompt_tokens: inputTokens,
-                completion_tokens: outputTokens,
-                total_tokens: exactTotalConsumed,
-              },
-            };
-            await stream.writeSSE({ data: JSON.stringify(usageChunk) });
-
-            const stopChunk = {
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: "length",
-                },
-              ],
-            };
-            await stream.writeSSE({ data: JSON.stringify(stopChunk) });
-            await stream.writeSSE({ data: "[DONE]" });
-            await stream.close();
-            reader.cancel();
-            isTerminated = true;
             return;
           }
 

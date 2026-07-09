@@ -39,13 +39,11 @@ app.route("/v1/session", sessionAuthRouter);
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
   return c.json({
     data: [
-      { id: "qwen3-coder" },
-      { id: "gemma-4" },
-      { id: "whiterabbitneo-70b" },
-      { id: "foundation-sec" },
+      { id: "gemma4-26b" },
     ],
   });
 });
+
 
 // Health check endpoint
 app.get("/health", (c) =>
@@ -78,6 +76,6 @@ process.on("unhandledRejection", (reason) => {
 
 export default {
   port,
-  idleTimeout: 255,
+  idleTimeout: 0,
   fetch: app.fetch,
 };
