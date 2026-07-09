@@ -6,7 +6,7 @@ import { countMessagesTokens, countTokens } from "../services/token";
 import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
 import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
-import { exams } from "../services/examStore";
+import { sessions } from "../services/sessionStore";
 import { logSession, logGlobal } from "../services/secureLogger";
 import {
   validateUserMessages,
@@ -18,6 +18,8 @@ import dotenv from "dotenv";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
+import { redisStore } from "../services/classifier/redisStore";
+import { evaluateTurnAndSession } from "../services/classifier/index";
 
 dotenv.config();
 
@@ -186,7 +188,13 @@ export class XmlToolCallConverter {
 }
 
 const chatRouter = new Hono<{
-  Variables: { user: UserSession; token: string };
+  Variables: {
+    user: UserSession;
+    token: string;
+    authMode?: "session" | "normal";
+    sessionContext?: any;
+    sessionKey?: string;
+  };
 }>();
 
 chatRouter.use("*", verifyFingerprintMiddleware());
@@ -196,10 +204,20 @@ export const latestClassifications = new Map<
   { label: string; confidence: number }
 >();
 
-chatRouter.get("/latest-classification", unifiedAuthMiddleware(), (c) => {
+chatRouter.get("/latest-classification", unifiedAuthMiddleware(), async (c) => {
   const token = c.get("token");
   if (!token) {
     return c.json({ error: "Unauthorized" }, 401);
+  }
+  // Wait if evaluation is pending (long polling)
+  let retries = 0;
+  while ((await redisStore.isEvaluationPending(token)) && retries < 25) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    retries++;
+  }
+  const cached = await redisStore.getCachedClassification(token);
+  if (cached) {
+    return c.json(cached);
   }
   const result = latestClassifications.get(token);
   if (!result) {
@@ -208,162 +226,46 @@ chatRouter.get("/latest-classification", unifiedAuthMiddleware(), (c) => {
   return c.json(result);
 });
 
-let classifierFailureCount = 0;
-let classifierDisabledUntil = 0;
-const MAX_FAILURES = 3;
-const CIRCUIT_BREAKER_DURATION_MS = 60000; // 60 seconds
-
-function handleClassifierFailure() {
-  classifierFailureCount++;
-  if (classifierFailureCount >= MAX_FAILURES) {
-    classifierDisabledUntil = Date.now() + CIRCUIT_BREAKER_DURATION_MS;
-    console.error(
-      `[Classifier] ${MAX_FAILURES} consecutive failures detected. Circuit breaker tripped! Bypassing classification for ${CIRCUIT_BREAKER_DURATION_MS / 1000}s to protect response latency.`,
-    );
+chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
+  const token = c.get("token");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
-}
+  const body = await c.req.json();
+  const user = c.get("user");
+  const sessionContext = c.get("sessionContext");
+  const machineId =
+    c.req.header("x-machine-id") || c.req.header("X-Machine-Id") || "";
 
-let cachedSystemPrompt = "";
-let lastLoadedTime = 0;
+  let sessionCode = "DEFAULT";
+  let studentId = machineId || "DEFAULT_USER";
 
-async function getClassifierSystemPrompt(): Promise<string> {
-  const now = Date.now();
-  if (now - lastLoadedTime > 10000 || !cachedSystemPrompt) {
-    // Cache for 10s
-    try {
-      const filePath = path.join(
-        process.cwd(),
-        "src",
-        "systemPrompts",
-        "system_prompt_ver21.md",
-      );
-      if (fs.existsSync(filePath)) {
-        cachedSystemPrompt = await fs.promises.readFile(filePath, "utf-8");
-        lastLoadedTime = now;
-      }
-    } catch (e) {
-      console.error("[Classifier] Error reading system_prompt_ver21.md:", e);
-    }
-  }
-  return (
-    cachedSystemPrompt ||
-    "You are a student prompt classifier. Return JSON: {level: string}"
-  );
-}
-
-async function classifyPrompt(
-  prompt: string,
-  completionText: string,
-): Promise<any> {
-  const apiUrl = process.env.CLASSIFIER_API_URL;
-  const classifierModel = process.env.CLASSIFIER_MODEL || "qwen3-coder";
-  // const truncatedPrompt = prompt.slice(0, 4000);
-  const truncatedPrompt = prompt;
-
-  if (apiUrl) {
-    if (Date.now() < classifierDisabledUntil) {
-      console.warn(
-        "[Classifier] Circuit breaker active. Bypassing classification request.",
-      );
-      return null;
-    }
-
-    try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      const classifierApiKey = process.env.CLASSIFIER_API_KEY?.trim();
-      if (classifierApiKey) {
-        headers["Authorization"] = `Bearer ${classifierApiKey}`;
-      }
-
-      const systemPrompt = await getClassifierSystemPrompt();
-      const classifierPayload = `Student Prompt: ${truncatedPrompt}\n\nAI Response Output:\n${completionText}`;
-
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: classifierModel,
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt,
-            },
-            {
-              role: "user",
-              content: classifierPayload,
-            },
-          ],
-          temperature: 0,
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
-
-      const responseText = await response.text();
-
-      if (response.ok) {
-        let responseData: any;
-        let content = "";
-        try {
-          responseData = JSON.parse(responseText);
-          content = responseData.choices?.[0]?.message?.content || responseText;
-        } catch (e: any) {
-          content = responseText;
-        }
-
-        // Extract JSON block robustly from content
-        let parsed: any = null;
-        try {
-          const startIdx = content.indexOf("{");
-          const endIdx = content.lastIndexOf("}");
-          if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-            const jsonStr = content.substring(startIdx, endIdx + 1);
-            parsed = JSON.parse(jsonStr);
-          } else {
-            const cleanJsonStr = content.replace(/```json|```/g, "").trim();
-            parsed = JSON.parse(cleanJsonStr);
-          }
-        } catch (e: any) {
-          // If we still can't parse JSON, try regex lookup for a level number or "Thieu context"
-          const match =
-            content.match(/"level"\s*:\s*"([^"]+)"/) ||
-            content.match(/\b(L[0-6]|Thieu context)\b/);
-          if (match) {
-            parsed = { level: match[1] };
-          } else {
-            console.error(
-              "[Classifier API] Failed to parse classifier LLM output. Content was:",
-              content,
-            );
-            throw e;
-          }
-        }
-
-        if (parsed && typeof parsed.level === "string") {
-          classifierFailureCount = 0; // Reset counter on success
-          return {
-            label: parsed.level,
-            confidence: 1.0,
-          };
-        }
-      } else {
-        console.error(
-          `[Classifier API] HTTP Error: ${response.status}. Response:`,
-          responseText.slice(0, 500),
-        );
-        handleClassifierFailure();
-      }
-      return null;
-    } catch (err: any) {
-      console.error("[Classifier API] Request failed:", err.message);
-      handleClassifierFailure();
-      return null;
+  if (sessionContext) {
+    sessionCode = sessionContext.sessionCode || "DEFAULT";
+    studentId = sessionContext.studentId || "DEFAULT_USER";
+  } else {
+    if (
+      user?.userId &&
+      user.userId !== "master-user" &&
+      user.userId !== "local-user"
+    ) {
+      studentId = user.userId;
     }
   }
 
-  return null;
-}
+  sessionCode = sessionCode.toUpperCase();
+  studentId = studentId.toUpperCase();
+
+  const { activeFile, recentPaste, files } = body;
+  await redisStore.saveClientContext(sessionCode, studentId, {
+    activeFile,
+    recentPaste,
+    files,
+  });
+  return c.json({ success: true });
+});
+
+// Removed old 6-level classifier code
 
 function getUpstreamConfig(
   model: string,
@@ -579,8 +481,10 @@ function extractToolCalls(
 }
 
 async function logStudentInteraction(
-  authMode: string | undefined,
-  examContext: any,
+  sessionCode: string,
+  studentId: string,
+  currentAiOption: string,
+  tokenLimit: number,
   body: any,
   completionText: string,
   inputTokens: number,
@@ -590,11 +494,14 @@ async function logStudentInteraction(
   classifierConfidence: number,
   nativeToolCalls?: any[],
 ) {
-  if (authMode !== "exam" || !examContext) return;
-
-  const examCode = examContext.examCode.toUpperCase();
-  const studentId = examContext.studentId.toUpperCase();
-  const currentAiOption = examContext.aiOption || "chatbot";
+  const clientContext = await redisStore.getClientContext(
+    sessionCode,
+    studentId,
+  );
+  const codeSnapshot = clientContext?.activeFile?.content || "";
+  const activeFilePath = clientContext?.activeFile?.path || "";
+  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
+  const codeSnapshots = clientContext?.files || [];
 
   // Clean CLASSIFIER_RESULT prefix from completionText
   const cleanCompletion = completionText
@@ -667,7 +574,7 @@ async function logStudentInteraction(
       : "";
 
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
-  const logDir = path.resolve(process.cwd(), "logs", "sessions", examCode);
+  const logDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
   const logFilePath = path.resolve(logDir, `${studentId}.json`);
 
   try {
@@ -695,6 +602,10 @@ async function logStudentInteraction(
       lastEntry.output = cleanCompletion;
       lastEntry.history = cleanHistory;
       lastEntry.lastUpdated = new Date().toISOString();
+      lastEntry.codeSnapshot = codeSnapshot;
+      lastEntry.activeFilePath = activeFilePath;
+      lastEntry.activeFileLanguageId = activeFileLanguageId;
+      lastEntry.codeSnapshots = codeSnapshots;
       if (
         finalLabel &&
         finalLabel !== "none" &&
@@ -722,11 +633,15 @@ async function logStudentInteraction(
           confidence: finalConfidence || 0,
         },
         aiOption: currentAiOption,
-        tokenLimit: examContext.defaultTokenBudget,
+        tokenLimit,
         tokensConsumedTotal: totalConsumed,
         output: cleanCompletion,
         agentLoops: [],
         history: cleanHistory,
+        codeSnapshot,
+        activeFilePath,
+        activeFileLanguageId,
+        codeSnapshots,
       };
 
       if (toolCalls.length > 0) {
@@ -749,13 +664,13 @@ async function logStudentInteraction(
 
     const sessionEntry =
       isContinuation && lastEntry ? lastEntry : logs[logs.length - 1];
-    await logSession(examCode, studentId, sessionEntry);
+    await logSession(sessionCode, studentId, sessionEntry);
   } catch (err) {
     console.error("[Logger] Failed to write student log:", err);
     logGlobal({
       level: "error",
       event: "session_log_write_failed",
-      examCode,
+      sessionCode,
       studentId,
       error: String(err),
     });
@@ -805,9 +720,33 @@ chatRouter.post(
     const user = c.get("user");
     const token = c.get("token");
     const authMode = c.get("authMode" as any) as string | undefined;
-    const examContext = c.get("examContext" as any) as any;
+    const sessionContext = c.get("sessionContext" as any) as any;
     const sessionKey = c.get("sessionKey" as any) as any;
     const body = await c.req.json();
+
+    const machineId =
+      c.req.header("x-machine-id") || c.req.header("X-Machine-Id") || "";
+
+    let finalSessionCode = "DEFAULT";
+    let finalStudentId = machineId || "DEFAULT_USER";
+    let currentAiOption = "agent";
+
+    if (authMode === "session" && sessionContext) {
+      finalSessionCode = sessionContext.sessionCode || "DEFAULT";
+      finalStudentId = sessionContext.studentId || "DEFAULT_USER";
+      currentAiOption = sessionContext.aiOption || "agent";
+    } else {
+      if (
+        user?.userId &&
+        user.userId !== "master-user" &&
+        user.userId !== "local-user"
+      ) {
+        finalStudentId = user.userId;
+      }
+    }
+
+    finalSessionCode = finalSessionCode.toUpperCase();
+    finalStudentId = finalStudentId.toUpperCase();
 
     if (body.messages && Array.isArray(body.messages)) {
       const safetyResult = await validateUserMessages(body.messages);
@@ -871,15 +810,15 @@ chatRouter.post(
       }
     }
 
-    if (authMode === "exam") {
-      const liveExam = exams.get(examContext.examCode);
-      const currentAiOption = liveExam
-        ? liveExam.aiOption
-        : examContext.aiOption;
+    if (authMode === "session") {
+      const liveSession = sessions.get(sessionContext.sessionCode);
+      const currentAiOption = liveSession
+        ? liveSession.aiOption
+        : sessionContext.aiOption;
 
       if (currentAiOption === "none") {
         return c.json(
-          { error: "Tính năng AI bị vô hiệu hóa trong phòng thi này." },
+          { error: "Tính năng AI bị vô hiệu hóa trong session này." },
           403,
         );
       }
@@ -915,6 +854,10 @@ chatRouter.post(
       typeof lastMsg.content === "string"
     );
     const userPrompt = shouldClassify ? (lastMsg!.content as string) : "";
+
+    if (shouldClassify) {
+      await redisStore.setEvaluationPending(token, true).catch(() => {});
+    }
 
     let classifierLabel = "none";
     let classifierConfidence = 0;
@@ -1023,7 +966,7 @@ chatRouter.post(
     }
 
     const recordTokenUsage = async (consumed: number) => {
-      if (authMode === "exam") {
+      if (authMode === "session") {
         if (redis && redis.status === "ready") {
           try {
             await redis.hincrby(sessionKey, "consumed", consumed);
@@ -1031,9 +974,9 @@ chatRouter.post(
             console.error("[Proxy] Redis budget increment failed:", err);
           }
         }
-        const { examStates } = await import("../services/examStore");
-        const stateKey = `${examContext.examCode}:${examContext.studentId}`;
-        const state = examStates.get(stateKey);
+        const { sessionStates } = await import("../services/sessionStore");
+        const stateKey = `${sessionContext.sessionCode}:${sessionContext.studentId}`;
+        const state = sessionStates.get(stateKey);
         if (state) {
           state.tokensConsumed += consumed;
         }
@@ -1122,40 +1065,25 @@ chatRouter.post(
         !hasToolCalls
       ) {
         const completionText = responseData.choices[0].message.content || "";
-        try {
-          const res = await classifyPrompt(userPrompt, completionText);
-          if (res && res.label) {
-            classifierLabel = res.label;
-            classifierConfidence = res.confidence;
-            const formattedLabel = res.label.toLowerCase();
-            const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
-            console.log(
-              `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
-            );
-            latestClassifications.set(token, {
-              label: res.label,
-              confidence: res.confidence,
-            });
-
-            if (clientType !== "quatmo-code") {
-              const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
-              responseData.choices[0].message.content =
-                classifierResultText + completionText;
-            }
-          }
-        } catch (e) {
-          console.error(
-            "[Classifier] Error during post-completion classification:",
-            e,
-          );
-        }
+        setImmediate(() => {
+          evaluateTurnAndSession(
+            finalSessionCode,
+            finalStudentId,
+            token,
+            userPrompt,
+            completionText,
+            body.messages,
+          ).catch((e) => console.error("[Background Classifier] Error:", e));
+        });
       }
 
       await recordTokenUsage(totalConsumed);
 
       logStudentInteraction(
-        authMode,
-        examContext,
+        finalSessionCode,
+        finalStudentId,
+        currentAiOption,
+        user?.monthlyTokenLimit || 0,
         body,
         responseData.choices?.[0]?.message?.content || "",
         inputTokens,
@@ -1184,60 +1112,21 @@ chatRouter.post(
     return streamSSE(c, async (stream) => {
       const toolCallConverter = new XmlToolCallConverter();
       let completionText = "";
-      const chunksToWrite: string[] = [];
-      const writeBufferedChunks = async () => {
-        for (const dataStr of chunksToWrite) {
-          await stream.writeSSE({ data: dataStr });
-          await new Promise((resolve) => setTimeout(resolve, 15));
-        }
-        chunksToWrite.length = 0;
-      };
       let accumulatedBuffer = "";
       let isTerminated = false;
+      let wasBlockedByGuardrail = false;
       let receivedChunks = 0;
       let upstreamTotalTokens: number | null = null;
       let outputTokens = 0;
       let accumulatedDeltaText = "";
+      let hasReasoningStarted = false;
+      let hasContentStarted = false;
 
       let streamToolCalls: any[] = [];
       let hasAnyToolCalls = false;
 
       const emitSyntheticUsageAndDone = async () => {
-        // 1. Run output safety check on the complete response before releasing any chunks
-        if (!hasAnyToolCalls) {
-          const outputSafety = await checkText(completionText);
-          if (!outputSafety.allowed && outputSafety.violation) {
-            const v = outputSafety.violation;
-            console.warn(
-              `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
-            );
-
-            const errorChunk = {
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
-                  finish_reason: "error",
-                },
-              ],
-              error: {
-                message: v.message,
-                code: v.code,
-                type: v.type,
-              },
-            };
-            await stream.writeSSE({ data: JSON.stringify(errorChunk) });
-            await stream.writeSSE({ data: "[DONE]" });
-            await stream.close();
-            isTerminated = true;
-            return;
-          }
-        }
-
-        // 2. Safe or has tool calls, write all buffered chunks to client
-        await writeBufferedChunks();
-
-        // 3. Flush tool deltas to client
+        // Flush tool deltas to client
         const flushedDeltas = toolCallConverter.flush();
         for (const convDelta of flushedDeltas) {
           if (convDelta.delta.tool_calls) {
@@ -1256,41 +1145,53 @@ chatRouter.post(
         }
 
         if (shouldClassify && !hasAnyToolCalls) {
-          try {
-            const res = await classifyPrompt(userPrompt, completionText);
-            if (res && res.label) {
-              classifierLabel = res.label;
-              classifierConfidence = res.confidence;
-              const formattedLabel = res.label.toLowerCase();
-              const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
-              console.log(
-                `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
-              );
-              latestClassifications.set(token, {
-                label: res.label,
-                confidence: res.confidence,
-              });
+          setImmediate(() => {
+            evaluateTurnAndSession(
+              finalSessionCode,
+              finalStudentId,
+              token,
+              userPrompt,
+              completionText,
+              body.messages,
+            ).catch((e) => console.error("[Background Classifier] Error:", e));
+          });
+        }
 
-              if (clientType !== "quatmo-code") {
-                const classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}`;
-                const classifierChunk = {
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: classifierResultText },
-                      finish_reason: null,
-                    },
-                  ],
-                };
-                await stream.writeSSE({
-                  data: JSON.stringify(classifierChunk),
-                });
-              }
+        // Run output safety check synchronously at the end of the stream before closing
+        if (!hasAnyToolCalls) {
+          try {
+            const outputSafety = await checkText(completionText);
+            if (!outputSafety.allowed && outputSafety.violation) {
+              wasBlockedByGuardrail = true;
+              const v = outputSafety.violation;
+              console.warn(
+                `[Safety] Output BLOCKED ${v.code} from studentId=${finalStudentId} | evidence: ${v.evidence.join(", ")}`,
+              );
+
+              const errorChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: `\n\n**[${v.message}]**\n\n` },
+                    finish_reason: "error",
+                  },
+                ],
+                error: {
+                  message: v.message,
+                  code: v.code,
+                  type: v.type,
+                },
+              };
+              await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+              await stream.writeSSE({ data: "[DONE]" });
+              await stream.close();
+              isTerminated = true;
+              return;
             }
-          } catch (e) {
+          } catch (err: any) {
             console.error(
-              "[Classifier] Error during post-completion classification:",
-              e,
+              "[Safety Guardrail] Error running safety check:",
+              err.message,
             );
           }
         }
@@ -1389,8 +1290,31 @@ chatRouter.post(
           }
 
           const content = delta?.content || "";
-          const reasoning = delta?.reasoning_content || delta?.reasoning || "";
+          const reasoning = delta?.reasoning_content || "";
           completionText += content + reasoning;
+
+          let clientContent = "";
+          if (reasoning) {
+            if (!hasReasoningStarted) {
+              hasReasoningStarted = true;
+              clientContent += "*Suy nghĩ:*\n> ";
+            }
+            clientContent += reasoning.replace(/\n/g, "\n> ");
+          } else if (content) {
+            if (hasReasoningStarted && !hasContentStarted) {
+              hasContentStarted = true;
+              clientContent += "\n\n---\n\n";
+            }
+            clientContent += content;
+          }
+
+          if (delta) {
+            if (clientContent) {
+              delta.content = clientContent;
+            } else {
+              delete delta.content;
+            }
+          }
 
           // Inline chunk safety checks removed in favor of post-generation Output Guardrail LLM check.
           const deltaText = content + reasoning;
@@ -1419,6 +1343,7 @@ chatRouter.post(
             if (!hasAnyToolCalls) {
               const outputSafety = await checkText(completionText);
               if (!outputSafety.allowed && outputSafety.violation) {
+                wasBlockedByGuardrail = true;
                 const v = outputSafety.violation;
                 console.warn(
                   `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
@@ -1446,9 +1371,6 @@ chatRouter.post(
                 return;
               }
             }
-
-            // Safe, write all buffered chunks to client
-            await writeBufferedChunks();
 
             const errorChunk = {
               choices: [
@@ -1532,13 +1454,13 @@ chatRouter.post(
                   },
                 ],
               };
-              chunksToWrite.push(JSON.stringify(newParsed));
+              await stream.writeSSE({ data: JSON.stringify(newParsed) });
             }
           } else {
-            chunksToWrite.push(JSON.stringify(parsed));
+            await stream.writeSSE({ data: JSON.stringify(parsed) });
           }
         } catch (err) {
-          chunksToWrite.push(rawJson);
+          await stream.writeSSE({ data: rawJson });
         }
       };
 
@@ -1586,11 +1508,19 @@ chatRouter.post(
         console.log(
           `\x1b[36m[Proxy]\x1b[0m ➔ Completed | Total: ${totalConsumed} tokens`,
         );
-        await recordTokenUsage(totalConsumed);
+        if (!wasBlockedByGuardrail) {
+          await recordTokenUsage(totalConsumed);
+        } else {
+          console.log(
+            `\x1b[33m[Proxy]\x1b[0m ➔ Blocked by Guardrail | Charged 0 tokens`,
+          );
+        }
 
         logStudentInteraction(
-          authMode,
-          examContext,
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          user?.monthlyTokenLimit || 0,
           body,
           completionText,
           inputTokens,

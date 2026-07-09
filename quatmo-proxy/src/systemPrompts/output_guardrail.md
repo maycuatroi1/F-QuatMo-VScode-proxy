@@ -5,7 +5,9 @@ Your task is to analyze the assistant's generated response (output) to see if it
 
 1. **English Only**: The response MUST be written entirely in English. If the response contains any non-English text (e.g. Vietnamese explanations, comments, or greetings), it is NOT allowed.
 2. **No Profanity**: The response MUST NOT contain any profanity, offensive language, swearing, vulgarity, or inappropriate content.
-3. **Python Programming Related**: The response MUST NOT answer non-Python or non-programming questions. It must only provide Python-related assistance, code, or explanations. If the response starts answering off-topic questions, it is NOT allowed.
+3. **Python Programming Related**: The response must be related to Python programming, computer science, or the code changes being made.
+   - ALLOWED: Conversational planning (e.g., "I will check the file...", "Let me search..."), explanations of code, descriptions of changes made, and step-by-step assistance.
+   - BLOCKED: Answers to completely off-topic questions (e.g., general history, geography, recipes, or writing non-Python languages like Java/C++ unless directly compared to Python).
 
 ### Output Format:
 

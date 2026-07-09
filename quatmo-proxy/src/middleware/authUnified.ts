@@ -9,7 +9,7 @@ import {
 
 // ─── FLOW ────────────────────────────────────────────────────────────────────
 //  Middleware hợp nhất tự động định tuyến các request xác thực:
-//  - Chế độ thi cử (JWT): Xác thực JWT, kiểm tra thời gian hết hạn phòng thi,
+//  - Chế độ session (JWT): Xác thực JWT, kiểm tra thời gian hết hạn session,
 //    kiểm tra thời hạn AI dựa trên giờ login của SV và kiểm tra budget từ Redis.
 //  - Chế độ thường (API Key): Chuyển tiếp cho authMiddleware cũ.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,8 +31,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
       } catch (err) {
         return c.json(
           {
-            error:
-              "Token phòng thi không hợp lệ hoặc đã hết thời gian làm bài.",
+            error: "Token session không hợp lệ hoặc đã hết thời gian sử dụng.",
           },
           403,
         );
@@ -40,30 +39,28 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
 
       const now = Math.floor(Date.now() / 1000);
 
-      // isExamHasTime
-      if (now > payload.examEndTime) {
+      if (now > payload.sessionEndTime) {
         return c.json(
-          { error: "Kỳ thi đã kết thúc. Quyền truy cập AI đã bị khóa." },
+          { error: "Session đã kết thúc. Quyền truy cập AI đã bị khóa." },
           403,
         );
       }
 
       // isTokenAIHasTime
-
       const aiExpirationTime =
         payload.loginTime + payload.aiValidityMinutes * 60;
       if (now > aiExpirationTime) {
         return c.json(
           {
             error:
-              "Đã hết thời gian sử dụng AI được phép của bạn trong phòng thi này.",
+              "Đã hết thời gian sử dụng AI được phép của bạn trong session này.",
           },
           403,
         );
       }
 
       // isStudentTokenAvailable (Redis)
-      const sessionKey = `exam:session:${payload.examCode}:${payload.studentId}`;
+      const sessionKey = `session:user:${payload.sessionCode}:${payload.studentId}`;
       let budget = 0;
       let consumed = 0;
 
@@ -72,7 +69,10 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
           const sessionData = await redis.hgetall(sessionKey);
           if (!sessionData || Object.keys(sessionData).length === 0) {
             return c.json(
-              { error: "Phiên thi không tồn tại hoặc đã bị giám thị reset." },
+              {
+                error:
+                  "Phiên làm việc không tồn tại hoặc đã bị quản trị viên reset.",
+              },
               403,
             );
           }
@@ -86,14 +86,15 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
           return c.json({ error: "Lỗi kết nối cơ sở dữ liệu session." }, 500);
         }
       } else {
-        const { examStates, exams } = await import("../services/examStore");
-        const stateKey = `${payload.examCode}:${payload.studentId}`;
-        const state = examStates.get(stateKey);
-        const exam = exams.get(payload.examCode);
-        if (!state || !exam) {
-          return c.json({ error: "Không tìm thấy thông tin phòng thi." }, 403);
+        const { sessionStates, sessions } =
+          await import("../services/sessionStore");
+        const stateKey = `${payload.sessionCode}:${payload.studentId}`;
+        const state = sessionStates.get(stateKey);
+        const sessionObj = sessions.get(payload.sessionCode);
+        if (!state || !sessionObj) {
+          return c.json({ error: "Không tìm thấy thông tin session." }, 403);
         }
-        budget = exam.defaultTokenBudget;
+        budget = sessionObj.defaultTokenBudget;
         consumed = state.tokensConsumed;
       }
 
@@ -101,18 +102,18 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         return c.json(
           {
             error:
-              "Tài khoản của bạn đã vượt quá giới hạn token được cấp cho bài thi này.",
+              "Tài khoản của bạn đã vượt quá giới hạn token được cấp cho session này.",
           },
           402,
         );
       }
 
-      c.set("authMode", "exam");
-      c.set("examContext", payload);
+      c.set("authMode", "session");
+      c.set("sessionContext", payload);
       c.set("sessionKey", sessionKey);
 
       const userSession: UserSession = {
-        keyId: `exam-${payload.examCode}`,
+        keyId: `session-${payload.sessionCode}`,
         userId: payload.studentId,
         monthlyTokenLimit: budget,
         tokensConsumed: consumed,

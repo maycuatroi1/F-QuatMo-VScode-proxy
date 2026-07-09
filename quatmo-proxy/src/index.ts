@@ -3,7 +3,7 @@ import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { chatRouter } from "./routes/chat";
 import { adminRouter } from "./routes/admin";
-import { examAuthRouter } from "./routes/examAuth";
+import { sessionAuthRouter } from "./routes/sessionAuth";
 import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
@@ -34,7 +34,7 @@ app.use(
 // Route mappings
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
-app.route("/v1/exam", examAuthRouter);
+app.route("/v1/session", sessionAuthRouter);
 
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
   return c.json({
