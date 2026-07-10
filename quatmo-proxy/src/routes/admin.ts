@@ -11,6 +11,7 @@ import {
   studentAccounts,
   sessions,
   sessionStates,
+  studentGroups,
   type Session,
   type StudentSessionState,
 } from "../services/sessionStore";
@@ -274,10 +275,18 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
   const session = sessions.get(sessionCode);
 
   if (!session) {
-    return c.json({ error: `Session with code ${sessionCode} not found.` }, 404);
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
   }
 
-  const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  const sessionLogDir = path.resolve(
+    process.cwd(),
+    "logs",
+    "sessions",
+    sessionCode,
+  );
   if (!fs.existsSync(sessionLogDir)) {
     return c.json({ error: `No logs found for session ${sessionCode}.` }, 404);
   }
@@ -286,24 +295,30 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
     const zip = new AdmZip();
     const files = await fs.promises.readdir(sessionLogDir);
     let addedFilesCount = 0;
-    
+
     // Get encryption key from environment or use a secure fallback
-    const secret = (process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase").trim();
+    const secret = (
+      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
+    ).trim();
 
     for (const file of files) {
       if (file.endsWith(".json") || file.endsWith(".log")) {
         const filePath = path.join(sessionLogDir, file);
         const fileContent = await fs.promises.readFile(filePath, "utf-8");
-        
+
         // Encrypt log file content using AES-256-CBC
         const key = crypto.createHash("sha256").update(secret).digest();
-        const iv = crypto.createHash("sha256").update(key).digest().subarray(0, 16);
+        const iv = crypto
+          .createHash("sha256")
+          .update(key)
+          .digest()
+          .subarray(0, 16);
         const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
         const encryptedBuffer = Buffer.concat([
           cipher.update(fileContent, "utf-8"),
-          cipher.final()
+          cipher.final(),
         ]);
-        
+
         // Add encrypted buffer as <filename>.enc to ZIP
         zip.addFile(`${file}.enc`, encryptedBuffer);
         addedFilesCount++;
@@ -317,12 +332,55 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
     const zipBuffer = zip.toBuffer();
 
     c.header("Content-Type", "application/zip");
-    c.header("Content-Disposition", `attachment; filename=session-${sessionCode}-logs.zip`);
+    c.header(
+      "Content-Disposition",
+      `attachment; filename=session-${sessionCode}-logs.zip`,
+    );
     return c.body(zipBuffer);
   } catch (err: any) {
-    console.error(`[Admin] Failed to zip logs for session ${sessionCode}:`, err);
+    console.error(
+      `[Admin] Failed to zip logs for session ${sessionCode}:`,
+      err,
+    );
     return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
   }
+});
+
+adminRouter.get("/groups", async (c) => {
+  const groupsList = Array.from(studentGroups.values());
+  return c.json({ success: true, groups: groupsList });
+});
+
+adminRouter.post("/groups", async (c) => {
+  const body = await c.req.json();
+  const { name, userIds } = body as { name?: string; userIds?: string[] };
+
+  if (!name) {
+    return c.json({ error: "Missing required field: name" }, 400);
+  }
+
+  const groupName = name.trim();
+  const members = Array.isArray(userIds)
+    ? userIds.map((uid) => uid.toUpperCase())
+    : [];
+
+  studentGroups.set(groupName, {
+    name: groupName,
+    userIds: members,
+  });
+
+  return c.json({ success: true, message: `Group '${groupName}' saved.` });
+});
+
+adminRouter.delete("/groups/:name", async (c) => {
+  const groupName = c.req.param("name").trim();
+  const existed = studentGroups.delete(groupName);
+
+  if (!existed) {
+    return c.json({ error: `Group '${groupName}' not found.` }, 404);
+  }
+
+  return c.json({ success: true, message: `Group '${groupName}' deleted.` });
 });
 
 export { adminRouter };
