@@ -3,9 +3,10 @@ import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { chatRouter } from "./routes/chat";
 import { adminRouter } from "./routes/admin";
-import { examAuthRouter } from "./routes/examAuth";
+import { sessionAuthRouter } from "./routes/sessionAuth";
 import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
+import { logGlobal } from "./services/secureLogger";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -33,18 +34,16 @@ app.use(
 // Route mappings
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
-app.route("/v1/exam", examAuthRouter);
+app.route("/v1/session", sessionAuthRouter);
 
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
   return c.json({
     data: [
-      { id: "qwen3-coder" },
-      { id: "gemma-4" },
-      { id: "whiterabbitneo-70b" },
-      { id: "foundation-sec" },
+      { id: "gemma4-26b" },
     ],
   });
 });
+
 
 // Health check endpoint
 app.get("/health", (c) =>
@@ -61,8 +60,22 @@ console.log(
 );
 console.log(`[Proxy] Access key: ${proxyKeyConfig.value}`);
 
+logGlobal({ level: "info", event: "server_start", port });
+
+process.on("uncaughtException", (err) => {
+  console.error("[Proxy] Uncaught exception:", err);
+  logGlobal({ level: "error", event: "uncaught_exception", error: err.message, stack: err.stack });
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  console.error("[Proxy] Unhandled rejection:", msg);
+  logGlobal({ level: "error", event: "unhandled_rejection", error: msg, stack });
+});
+
 export default {
   port,
-  idleTimeout: 255,
+  idleTimeout: 0,
   fetch: app.fetch,
 };

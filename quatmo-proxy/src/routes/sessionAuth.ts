@@ -6,14 +6,14 @@ import { getJwtSecret } from "../services/jwtKey";
 declare const Bun: any;
 import {
   studentAccounts,
-  exams,
-  examStates,
-  type StudentExamState,
-} from "../services/examStore";
+  sessions,
+  sessionStates,
+  type StudentSessionState,
+} from "../services/sessionStore";
 
-const examAuthRouter = new Hono();
+const sessionAuthRouter = new Hono();
 
-examAuthRouter.get("/status", async (c) => {
+sessionAuthRouter.get("/status", async (c) => {
   const authHeader = c.req.header("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return c.json({ error: "Missing or invalid token" }, 401);
@@ -28,23 +28,28 @@ examAuthRouter.get("/status", async (c) => {
     return c.json({ error: "Token không hợp lệ hoặc đã hết hạn" }, 401);
   }
 
-  const { studentId, examCode } = payload;
-  const exam = exams.get(examCode);
-  if (!exam) {
-    return c.json({ error: "Phòng thi không tồn tại." }, 404);
+  const { studentId, sessionCode } = payload;
+  const session = sessions.get(sessionCode);
+  if (!session) {
+    return c.json({ error: "Session không tồn tại." }, 404);
   }
 
-  const stateKey = `${examCode}:${studentId}`;
-  const state = examStates.get(stateKey);
+  const stateKey = `${sessionCode}:${studentId}`;
+  const state = sessionStates.get(stateKey);
   if (!state) {
-    return c.json({ error: "Không tìm thấy thông tin trạng thái học viên." }, 404);
+    return c.json(
+      { error: "Không tìm thấy thông tin trạng thái học viên." },
+      404,
+    );
   }
 
-  // Lấy lượng token đã dùng từ Redis (nếu có) hoặc RAM fallback
   let consumed = state.tokensConsumed;
   if (redis && redis.status === "ready") {
     try {
-      const val = await redis.hget(`exam:session:${examCode}:${studentId}`, "consumed");
+      const val = await redis.hget(
+        `session:user:${sessionCode}:${studentId}`,
+        "consumed",
+      );
       if (val !== null) {
         consumed = parseInt(val, 10);
       }
@@ -54,61 +59,61 @@ examAuthRouter.get("/status", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const examEndTime = exam.startTime + exam.durationMinutes * 60;
-  const aiExpirationTime = payload.loginTime + exam.aiValidityMinutes * 60;
-  const examRemainingSeconds = Math.max(0, examEndTime - now);
+  const sessionEndTime = session.startTime + session.durationMinutes * 60;
+  const aiExpirationTime = payload.loginTime + session.aiValidityMinutes * 60;
+  const sessionRemainingSeconds = Math.max(0, sessionEndTime - now);
   const aiRemainingSeconds = Math.max(0, aiExpirationTime - now);
 
   return c.json({
     success: true,
     studentId,
-    examCode,
-    aiOption: exam.aiOption,
-    tokenBudget: exam.defaultTokenBudget,
+    sessionCode,
+    aiOption: session.aiOption,
+    tokenBudget: session.defaultTokenBudget,
     tokensConsumed: consumed,
-    tokensRemaining: Math.max(0, exam.defaultTokenBudget - consumed),
-    examRemainingMinutes: Math.ceil(examRemainingSeconds / 60),
+    tokensRemaining: Math.max(0, session.defaultTokenBudget - consumed),
+    sessionRemainingMinutes: Math.ceil(sessionRemainingSeconds / 60),
     aiRemainingMinutes: Math.ceil(aiRemainingSeconds / 60),
   });
 });
 
-examAuthRouter.post("/login", async (c) => {
+sessionAuthRouter.post("/login", async (c) => {
   const body = await c.req.json();
   const {
-    examCode: rawExamCode,
+    sessionCode: rawSessionCode,
     studentId: rawStudentId,
     password,
   } = body as {
-    examCode?: string;
+    sessionCode?: string;
     studentId?: string;
     password?: string;
   };
 
-  if (!rawExamCode || !rawStudentId || !password) {
+  if (!rawSessionCode || !rawStudentId || !password) {
     return c.json(
-      { error: "Missing required fields: examCode, studentId, password" },
+      { error: "Missing required fields: sessionCode, studentId, password" },
       400,
     );
   }
 
-  const examCode = rawExamCode.trim().toUpperCase();
+  const sessionCode = rawSessionCode.trim().toUpperCase();
   const studentId = rawStudentId.trim().toUpperCase();
 
-  // isExamExisted
-  const exam = exams.get(examCode);
-  if (!exam) {
-    return c.json({ error: "Phòng thi không tồn tại." }, 404);
+  const session = sessions.get(sessionCode);
+  if (!session) {
+    return c.json({ error: "Session không tồn tại." }, 404);
   }
 
-  // isAllowedStudent
-  if (!exam.allowedStudentIds.has(studentId)) {
+  if (!session.allowedStudentIds.has(studentId)) {
     return c.json(
-      { error: "Sinh viên không nằm trong danh sách được phép thi phòng này." },
+      {
+        error:
+          "Sinh viên không nằm trong danh sách được phép tham gia session này.",
+      },
       403,
     );
   }
 
-  // isStudentExist
   const account = studentAccounts.get(studentId);
   if (!account) {
     return c.json(
@@ -117,7 +122,6 @@ examAuthRouter.post("/login", async (c) => {
     );
   }
 
-  // Check password valid
   const isPasswordValid = await Bun.password.verify(
     password,
     account.passwordHash,
@@ -126,53 +130,49 @@ examAuthRouter.post("/login", async (c) => {
     return c.json({ error: "Mật khẩu tài khoản không chính xác." }, 403);
   }
 
-  // isExamHasTime
   const now = Math.floor(Date.now() / 1000);
-  const examEndTime = exam.startTime + exam.durationMinutes * 60;
-  const remainingSeconds = examEndTime - now;
+  const sessionEndTime = session.startTime + session.durationMinutes * 60;
+  const remainingSeconds = sessionEndTime - now;
 
   if (remainingSeconds <= 0) {
-    return c.json({ error: "Kỳ thi này đã kết thúc." }, 403);
+    return c.json({ error: "Session này đã kết thúc." }, 403);
   }
 
-  // isAccountLoginDuplicate
-  const stateKey = `${examCode}:${studentId}`;
-  let state = examStates.get(stateKey);
+  const stateKey = `${sessionCode}:${studentId}`;
+  let state = sessionStates.get(stateKey);
   if (!state) {
     state = {
-      examCode,
+      sessionCode,
       studentId,
       hasLoggedIn: false,
       loginTimestamp: 0,
       tokensConsumed: 0,
       reassigned: false,
     };
-    examStates.set(stateKey, state);
+    sessionStates.set(stateKey, state);
   }
 
   if (state.hasLoggedIn && !state.reassigned) {
     return c.json(
       {
         error:
-          "Tài khoản đang đăng nhập trên thiết bị khác. Vui lòng liên hệ giám thị để reset.",
+          "Tài khoản đang đăng nhập trên thiết bị khác. Vui lòng liên hệ giám thị hoặc quản trị viên để reset.",
       },
       403,
     );
   }
 
-  // updateLoginState
   state.hasLoggedIn = true;
   if (!state.loginTimestamp || state.loginTimestamp === 0) {
     state.loginTimestamp = now;
   }
   state.reassigned = false;
 
-  // set session redis
   if (redis && redis.status === "ready") {
     try {
-      const redisKey = `exam:session:${examCode}:${studentId}`;
+      const redisKey = `session:user:${sessionCode}:${studentId}`;
       await redis.hset(redisKey, {
-        budget: String(exam.defaultTokenBudget),
+        budget: String(session.defaultTokenBudget),
         consumed: String(state.tokensConsumed),
         loginTime: String(state.loginTimestamp),
       });
@@ -185,22 +185,20 @@ examAuthRouter.post("/login", async (c) => {
       return c.json({ error: "Lỗi kết nối cơ sở dữ liệu RAM (Redis)." }, 500);
     }
   } else {
-    // If redis is offline, use RAM map
     console.warn(
-      "[Auth] Redis is offline. Running exam session check from RAM only.",
+      "[Auth] Redis is offline. Running session check from RAM only.",
     );
   }
 
-  // sinh JWT
   const jwtSecret = getJwtSecret();
   const payload = {
     studentId,
-    examCode,
-    aiOption: exam.aiOption,
-    aiValidityMinutes: exam.aiValidityMinutes,
+    sessionCode,
+    aiOption: session.aiOption,
+    aiValidityMinutes: session.aiValidityMinutes,
     loginTime: state.loginTimestamp,
-    examEndTime,
-    exp: examEndTime,
+    sessionEndTime,
+    exp: sessionEndTime,
   };
 
   const token = await sign(payload, jwtSecret);
@@ -209,8 +207,8 @@ examAuthRouter.post("/login", async (c) => {
     success: true,
     token,
     studentId,
-    examCode,
+    sessionCode,
   });
 });
 
-export { examAuthRouter };
+export { sessionAuthRouter };

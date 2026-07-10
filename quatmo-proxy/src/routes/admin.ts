@@ -1,15 +1,19 @@
 import { Hono } from "hono";
 import { getProxyApiKey } from "../services/proxyKey";
 import { redis } from "../services/redis";
+import AdmZip from "adm-zip";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
 
 declare const Bun: any;
 import {
   studentAccounts,
-  exams,
-  examStates,
-  type Exam,
-  type StudentExamState,
-} from "../services/examStore";
+  sessions,
+  sessionStates,
+  type Session,
+  type StudentSessionState,
+} from "../services/sessionStore";
 
 const adminRouter = new Hono();
 
@@ -74,8 +78,7 @@ adminRouter.get("/students", async (c) => {
   return c.json({ success: true, students: list });
 });
 
-// 2. Tạo phòng thi mới (Gen ngẫu nhiên examCode dài 6 ký tự)
-adminRouter.post("/exams", async (c) => {
+adminRouter.post("/sessions", async (c) => {
   const body = await c.req.json();
   const { durationMinutes, aiOption, aiValidityMinutes, defaultTokenBudget } =
     body as {
@@ -100,21 +103,20 @@ adminRouter.post("/exams", async (c) => {
     );
   }
 
-  // Tạo mã examCode ngẫu nhiên và đảm bảo duy nhất
-  let examCode = "";
+  let sessionCode = "";
   do {
     const chars = "ABCDEFGHJKLMNOPQRSTUVWXYZ23456789";
-    let code = "EX-";
+    let code = "SS-";
     for (let i = 0; i < 4; i++) {
       code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
-    if (!exams.has(code)) {
-      examCode = code;
+    if (!sessions.has(code)) {
+      sessionCode = code;
     }
-  } while (!examCode);
+  } while (!sessionCode);
 
-  const newExam: Exam = {
-    examCode,
+  const newSession: Session = {
+    sessionCode,
     startTime: Math.floor(Date.now() / 1000),
     durationMinutes,
     aiOption,
@@ -124,18 +126,23 @@ adminRouter.post("/exams", async (c) => {
     createdAt: Date.now(),
   };
 
-  exams.set(examCode, newExam);
+  sessions.set(sessionCode, newSession);
 
-  return c.json({ success: true, exam: { ...newExam, allowedStudentIds: [] } });
+  return c.json({
+    success: true,
+    session: { ...newSession, allowedStudentIds: [] },
+  });
 });
 
-// 3. Nạp danh sách mã sinh viên được phép vào phòng thi
-adminRouter.post("/exams/:examCode/students", async (c) => {
-  const examCode = c.req.param("examCode").toUpperCase();
-  const exam = exams.get(examCode);
+adminRouter.post("/sessions/:sessionCode/students", async (c) => {
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
 
-  if (!exam) {
-    return c.json({ error: `Exam with code ${examCode} not found.` }, 404);
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
   }
 
   const body = await c.req.json();
@@ -151,110 +158,171 @@ adminRouter.post("/exams/:examCode/students", async (c) => {
   let addedCount = 0;
   for (const rawId of studentIds) {
     const id = rawId.toUpperCase();
-    exam.allowedStudentIds.add(id);
+    session.allowedStudentIds.add(id);
 
-    // Khởi tạo trạng thái thi ban đầu cho học viên nếu chưa có
-    const stateKey = `${examCode}:${id}`;
-    if (!examStates.has(stateKey)) {
-      const initialState: StudentExamState = {
-        examCode,
+    const stateKey = `${sessionCode}:${id}`;
+    if (!sessionStates.has(stateKey)) {
+      const initialState: StudentSessionState = {
+        sessionCode,
         studentId: id,
         hasLoggedIn: false,
         loginTimestamp: 0,
         tokensConsumed: 0,
         reassigned: false,
       };
-      examStates.set(stateKey, initialState);
+      sessionStates.set(stateKey, initialState);
     }
     addedCount++;
   }
 
   return c.json({
     success: true,
-    message: `Added ${addedCount} students to exam ${examCode}.`,
-    totalStudents: exam.allowedStudentIds.size,
+    message: `Added ${addedCount} students to session ${sessionCode}.`,
+    totalStudents: session.allowedStudentIds.size,
   });
 });
 
-// 4. Reset trạng thái đăng nhập (Reassign) cho học viên vào thi lại
-adminRouter.post("/exams/:examCode/students/:studentId/reassign", async (c) => {
-  const examCode = c.req.param("examCode").toUpperCase();
-  const studentId = c.req.param("studentId").toUpperCase();
-  const stateKey = `${examCode}:${studentId}`;
+adminRouter.post(
+  "/sessions/:sessionCode/students/:studentId/reassign",
+  async (c) => {
+    const sessionCode = c.req.param("sessionCode").toUpperCase();
+    const studentId = c.req.param("studentId").toUpperCase();
+    const stateKey = `${sessionCode}:${studentId}`;
 
-  const state = examStates.get(stateKey);
-  if (!state) {
-    return c.json({ error: "Student exam state not found." }, 404);
-  }
-
-  state.reassigned = true;
-  state.hasLoggedIn = false;
-
-  // Xóa session trên Redis để lập tức vô hiệu hóa token JWT cũ đang hoạt động
-  if (redis && redis.status === "ready") {
-    try {
-      const redisKey = `exam:session:${examCode}:${studentId}`;
-      await redis.del(redisKey);
-    } catch (err) {
-      console.error(
-        `[Admin] Failed to delete Redis session for ${stateKey}:`,
-        err,
-      );
+    const state = sessionStates.get(stateKey);
+    if (!state) {
+      return c.json({ error: "Student session state not found." }, 404);
     }
-  }
 
-  return c.json({
-    success: true,
-    message: `Student ${studentId} reassigned successfully in exam ${examCode}.`,
-  });
-});
+    state.reassigned = true;
+    state.hasLoggedIn = false;
 
-adminRouter.get("/exams", async (c) => {
-  const examPromises = Array.from(exams.entries()).map(async ([code, exam]) => {
-    const studentStatesPromises = Array.from(exam.allowedStudentIds).map(async (studentId) => {
-      const stateKey = `${code}:${studentId}`;
-      const state = examStates.get(stateKey);
-
-      let consumed = state?.tokensConsumed ?? 0;
-      if (redis && redis.status === "ready") {
-        try {
-          const val = await redis.hget(
-            `exam:session:${code}:${studentId}`,
-            "consumed",
-          );
-          if (val !== null) {
-            consumed = parseInt(val, 10);
-          }
-        } catch {
-          // fallback
-        }
+    // Xóa session trên Redis để lập tức vô hiệu hóa token JWT cũ đang hoạt động
+    if (redis && redis.status === "ready") {
+      try {
+        const redisKey = `session:user:${sessionCode}:${studentId}`;
+        await redis.del(redisKey);
+      } catch (err) {
+        console.error(
+          `[Admin] Failed to delete Redis session for ${stateKey}:`,
+          err,
+        );
       }
+    }
+
+    return c.json({
+      success: true,
+      message: `Student ${studentId} reassigned successfully in session ${sessionCode}.`,
+    });
+  },
+);
+
+adminRouter.get("/sessions", async (c) => {
+  const sessionPromises = Array.from(sessions.entries()).map(
+    async ([code, session]) => {
+      const studentStatesPromises = Array.from(session.allowedStudentIds).map(
+        async (studentId) => {
+          const stateKey = `${code}:${studentId}`;
+          const state = sessionStates.get(stateKey);
+
+          let consumed = state?.tokensConsumed ?? 0;
+          if (redis && redis.status === "ready") {
+            try {
+              const val = await redis.hget(
+                `session:user:${code}:${studentId}`,
+                "consumed",
+              );
+              if (val !== null) {
+                consumed = parseInt(val, 10);
+              }
+            } catch {
+              // fallback
+            }
+          }
+
+          return {
+            studentId,
+            hasLoggedIn: state?.hasLoggedIn ?? false,
+            loginTimestamp: state?.loginTimestamp ?? 0,
+            tokensConsumed: consumed,
+            reassigned: state?.reassigned ?? false,
+          };
+        },
+      );
+
+      const studentStates = await Promise.all(studentStatesPromises);
 
       return {
-        studentId,
-        hasLoggedIn: state?.hasLoggedIn ?? false,
-        loginTimestamp: state?.loginTimestamp ?? 0,
-        tokensConsumed: consumed,
-        reassigned: state?.reassigned ?? false,
+        sessionCode: session.sessionCode,
+        startTime: session.startTime,
+        durationMinutes: session.durationMinutes,
+        aiOption: session.aiOption,
+        aiValidityMinutes: session.aiValidityMinutes,
+        defaultTokenBudget: session.defaultTokenBudget,
+        createdAt: session.createdAt || session.startTime * 1000,
+        students: studentStates,
       };
-    });
+    },
+  );
 
-    const studentStates = await Promise.all(studentStatesPromises);
+  const sessionList = await Promise.all(sessionPromises);
+  return c.json({ success: true, sessions: sessionList });
+});
 
-    return {
-      examCode: exam.examCode,
-      startTime: exam.startTime,
-      durationMinutes: exam.durationMinutes,
-      aiOption: exam.aiOption,
-      aiValidityMinutes: exam.aiValidityMinutes,
-      defaultTokenBudget: exam.defaultTokenBudget,
-      createdAt: exam.createdAt || exam.startTime * 1000,
-      students: studentStates,
-    };
-  });
+adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
 
-  const examList = await Promise.all(examPromises);
-  return c.json({ success: true, exams: examList });
+  if (!session) {
+    return c.json({ error: `Session with code ${sessionCode} not found.` }, 404);
+  }
+
+  const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  if (!fs.existsSync(sessionLogDir)) {
+    return c.json({ error: `No logs found for session ${sessionCode}.` }, 404);
+  }
+
+  try {
+    const zip = new AdmZip();
+    const files = await fs.promises.readdir(sessionLogDir);
+    let addedFilesCount = 0;
+    
+    // Get encryption key from environment or use a secure fallback
+    const secret = (process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase").trim();
+
+    for (const file of files) {
+      if (file.endsWith(".json") || file.endsWith(".log")) {
+        const filePath = path.join(sessionLogDir, file);
+        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+        
+        // Encrypt log file content using AES-256-CBC
+        const key = crypto.createHash("sha256").update(secret).digest();
+        const iv = crypto.createHash("sha256").update(key).digest().subarray(0, 16);
+        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+        const encryptedBuffer = Buffer.concat([
+          cipher.update(fileContent, "utf-8"),
+          cipher.final()
+        ]);
+        
+        // Add encrypted buffer as <filename>.enc to ZIP
+        zip.addFile(`${file}.enc`, encryptedBuffer);
+        addedFilesCount++;
+      }
+    }
+
+    if (addedFilesCount === 0) {
+      return c.json({ error: `No log files found in session directory.` }, 404);
+    }
+
+    const zipBuffer = zip.toBuffer();
+
+    c.header("Content-Type", "application/zip");
+    c.header("Content-Disposition", `attachment; filename=session-${sessionCode}-logs.zip`);
+    return c.body(zipBuffer);
+  } catch (err: any) {
+    console.error(`[Admin] Failed to zip logs for session ${sessionCode}:`, err);
+    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+  }
 });
 
 export { adminRouter };

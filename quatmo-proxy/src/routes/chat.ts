@@ -5,11 +5,23 @@ import { rateLimitMiddleware } from "../middleware/rateLimit";
 import { countMessagesTokens, countTokens } from "../services/token";
 import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
-import { exams } from "../services/examStore";
+import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
+import { sessions } from "../services/sessionStore";
+import { logSession, logGlobal } from "../services/secureLogger";
+import {
+  validateUserMessages,
+  checkText,
+  VIETNAMESE_REGEX,
+  ENGLISH_ONLY_SYSTEM_INSTRUCTION,
+  type SafetyCheckResult,
+  type SafetyViolation,
+} from "../services/safetyGuard";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
+import { redisStore } from "../services/classifier/redisStore";
+import { evaluateTurnAndSession } from "../services/classifier/index";
 
 dotenv.config();
 
@@ -178,88 +190,84 @@ export class XmlToolCallConverter {
 }
 
 const chatRouter = new Hono<{
-  Variables: { user: UserSession; token: string };
+  Variables: {
+    user: UserSession;
+    token: string;
+    authMode?: "session" | "normal";
+    sessionContext?: any;
+    sessionKey?: string;
+  };
 }>();
 
-let classifierFailureCount = 0;
-let classifierDisabledUntil = 0;
-const MAX_FAILURES = 3;
-const CIRCUIT_BREAKER_DURATION_MS = 60000; // 60 seconds
+chatRouter.use("*", verifyFingerprintMiddleware());
 
-function handleClassifierFailure() {
-  classifierFailureCount++;
-  if (classifierFailureCount >= MAX_FAILURES) {
-    classifierDisabledUntil = Date.now() + CIRCUIT_BREAKER_DURATION_MS;
-    console.error(
-      `[Classifier] ${MAX_FAILURES} consecutive failures detected. Circuit breaker tripped! Bypassing classification for ${CIRCUIT_BREAKER_DURATION_MS / 1000}s to protect response latency.`,
-    );
+export const latestClassifications = new Map<
+  string,
+  { label: string; confidence: number }
+>();
+
+chatRouter.get("/latest-classification", unifiedAuthMiddleware(), async (c) => {
+  const token = c.get("token");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
   }
-}
+  // Wait if evaluation is pending (long polling)
+  let retries = 0;
+  while ((await redisStore.isEvaluationPending(token)) && retries < 25) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    retries++;
+  }
+  const cached = await redisStore.getCachedClassification(token);
+  if (cached) {
+    return c.json(cached);
+  }
+  const result = latestClassifications.get(token);
+  if (!result) {
+    return c.json({ label: "none", confidence: 0 });
+  }
+  return c.json(result);
+});
 
-async function classifyPrompt(prompt: string): Promise<any> {
-  const apiUrl = process.env.CLASSIFIER_API_URL;
-  const classifierModel = process.env.CLASSIFIER_MODEL || "qwen3-coder";
-  const truncatedPrompt = prompt.slice(0, 4000);
+chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
+  const token = c.get("token");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const body = await c.req.json();
+  const user = c.get("user");
+  const sessionContext = c.get("sessionContext");
+  const machineId =
+    c.req.header("x-machine-id") || c.req.header("X-Machine-Id") || "";
 
-  // Gọi qua LiteLLM Prompt Management (Chuẩn Production)
-  if (apiUrl) {
-    if (Date.now() < classifierDisabledUntil) {
-      console.warn(
-        "[Classifier] Circuit breaker active. Bypassing classification request.",
-      );
-      return null;
-    }
+  let sessionCode = "DEFAULT";
+  let studentId = machineId || "DEFAULT_USER";
 
-    try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      const classifierApiKey = process.env.CLASSIFIER_API_KEY?.trim();
-      if (classifierApiKey) {
-        headers["Authorization"] = `Bearer ${classifierApiKey}`;
-      }
-
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: classifierModel,
-          prompt_id: "fvscode-classifier_test",
-          prompt_variables: {
-            student_prompt: truncatedPrompt,
-          },
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (response.ok) {
-        const responseData = await response.json();
-        const content = responseData.choices?.[0]?.message?.content || "";
-
-        const cleanJsonStr = content.replace(/```json|```/g, "").trim();
-        const parsed = JSON.parse(cleanJsonStr);
-
-        if (parsed && typeof parsed.level === "string") {
-          classifierFailureCount = 0; // Reset counter on success
-          return {
-            label: parsed.level,
-            confidence: 1.0,
-          };
-        }
-      } else {
-        console.error(`[Classifier API] HTTP Error: ${response.status}`);
-        handleClassifierFailure();
-      }
-      return null;
-    } catch (err: any) {
-      console.error("[Classifier API] Request failed:", err.message);
-      handleClassifierFailure();
-      return null;
+  if (sessionContext) {
+    sessionCode = sessionContext.sessionCode || "DEFAULT";
+    studentId = sessionContext.studentId || "DEFAULT_USER";
+  } else {
+    if (
+      user?.userId &&
+      user.userId !== "master-user" &&
+      user.userId !== "local-user"
+    ) {
+      studentId = user.userId;
     }
   }
 
-  return null;
-}
+  sessionCode = sessionCode.toUpperCase();
+  studentId = studentId.toUpperCase();
+
+  const { activeFile, recentPaste, files } = body;
+  await redisStore.saveClientContext(sessionCode, studentId, {
+    activeFile,
+    recentPaste,
+    files,
+  });
+  return c.json({ success: true });
+});
+
+// Removed old 6-level classifier code
 
 function getUpstreamConfig(
   model: string,
@@ -354,7 +362,9 @@ function getUpstreamConfig(
 
   if (
     matchesConfiguredCustomModel ||
+    lowerModel.includes("gemma4-26b") ||
     lowerModel.includes("gemma-4") ||
+    lowerModel.includes("gemma4") ||
     lowerModel.includes("qwen3-coder") ||
     lowerModel.includes("whiterabbitneo") ||
     lowerModel.includes("foundation-sec")
@@ -402,6 +412,21 @@ function normalizeUpstreamBody(
     ...body,
     model: upstream.actualModel,
   };
+
+  if (upstreamBody.messages && Array.isArray(upstreamBody.messages)) {
+    upstreamBody.messages = upstreamBody.messages.map((msg: any) => {
+      if (typeof msg.content === "string") {
+        return {
+          ...msg,
+          content: msg.content.replace(
+            /__CLASSIFIER_RESULT__:\{.*?\}(?:\r?\n)*/g,
+            "",
+          ),
+        };
+      }
+      return msg;
+    });
+  }
 
   if (upstream.provider === "custom") {
     const modelLower = upstream.actualModel.toLowerCase();
@@ -460,8 +485,10 @@ function extractToolCalls(
 }
 
 async function logStudentInteraction(
-  authMode: string | undefined,
-  examContext: any,
+  sessionCode: string,
+  studentId: string,
+  currentAiOption: string,
+  tokenLimit: number,
   body: any,
   completionText: string,
   inputTokens: number,
@@ -471,11 +498,14 @@ async function logStudentInteraction(
   classifierConfidence: number,
   nativeToolCalls?: any[],
 ) {
-  if (authMode !== "exam" || !examContext) return;
-
-  const examCode = examContext.examCode.toUpperCase();
-  const studentId = examContext.studentId.toUpperCase();
-  const currentAiOption = examContext.aiOption || "chatbot";
+  const clientContext = await redisStore.getClientContext(
+    sessionCode,
+    studentId,
+  );
+  const codeSnapshot = clientContext?.activeFile?.content || "";
+  const activeFilePath = clientContext?.activeFile?.path || "";
+  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
+  const codeSnapshots = clientContext?.files || [];
 
   // Clean CLASSIFIER_RESULT prefix from completionText
   const cleanCompletion = completionText
@@ -548,7 +578,7 @@ async function logStudentInteraction(
       : "";
 
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
-  const logDir = path.resolve(process.cwd(), "logs", "exams", examCode);
+  const logDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
   const logFilePath = path.resolve(logDir, `${studentId}.json`);
 
   try {
@@ -576,6 +606,10 @@ async function logStudentInteraction(
       lastEntry.output = cleanCompletion;
       lastEntry.history = cleanHistory;
       lastEntry.lastUpdated = new Date().toISOString();
+      lastEntry.codeSnapshot = codeSnapshot;
+      lastEntry.activeFilePath = activeFilePath;
+      lastEntry.activeFileLanguageId = activeFileLanguageId;
+      lastEntry.codeSnapshots = codeSnapshots;
       if (
         finalLabel &&
         finalLabel !== "none" &&
@@ -603,11 +637,15 @@ async function logStudentInteraction(
           confidence: finalConfidence || 0,
         },
         aiOption: currentAiOption,
-        tokenLimit: examContext.defaultTokenBudget,
+        tokenLimit,
         tokensConsumedTotal: totalConsumed,
         output: cleanCompletion,
         agentLoops: [],
         history: cleanHistory,
+        codeSnapshot,
+        activeFilePath,
+        activeFileLanguageId,
+        codeSnapshots,
       };
 
       if (toolCalls.length > 0) {
@@ -627,9 +665,117 @@ async function logStudentInteraction(
       JSON.stringify(logs, null, 2),
       "utf-8",
     );
+
+    const sessionEntry =
+      isContinuation && lastEntry ? lastEntry : logs[logs.length - 1];
+    await logSession(sessionCode, studentId, sessionEntry);
   } catch (err) {
     console.error("[Logger] Failed to write student log:", err);
+    logGlobal({
+      level: "error",
+      event: "session_log_write_failed",
+      sessionCode,
+      studentId,
+      error: String(err),
+    });
   }
+}
+
+async function logStudentError(
+  sessionCode: string,
+  studentId: string,
+  currentAiOption: string,
+  body: any,
+  errorMsg: string,
+  layer: string,
+  code?: string,
+  httpStatus?: number,
+) {
+  const clientContext = await redisStore
+    .getClientContext(sessionCode, studentId)
+    .catch(() => null);
+  const codeSnapshot = clientContext?.activeFile?.content || "";
+  const activeFilePath = clientContext?.activeFile?.path || "";
+  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
+  const codeSnapshots = clientContext?.files || [];
+
+  const userMessages =
+    body?.messages?.filter((m: any) => m.role === "user") || [];
+  const currentUserMsg =
+    userMessages.length > 0
+      ? userMessages[userMessages.length - 1].content
+          ?.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+          .trimStart()
+      : "";
+
+  const logDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  const logFilePath = path.resolve(logDir, `${studentId}.json`);
+
+  try {
+    await fs.promises.mkdir(logDir, { recursive: true });
+
+    let logs: any[] = [];
+    if (fs.existsSync(logFilePath)) {
+      try {
+        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+        logs = JSON.parse(fileContent);
+      } catch (e) {
+        // file empty or invalid
+      }
+    }
+
+    const newEntry: any = {
+      timestamp: new Date().toISOString(),
+      prompt: currentUserMsg,
+      aiOption: currentAiOption,
+      error: {
+        layer,
+        message: errorMsg,
+        code: code || "ERROR",
+        httpStatus: httpStatus || 500,
+      },
+      history: body?.messages || [],
+      codeSnapshot,
+      activeFilePath,
+      activeFileLanguageId,
+      codeSnapshots,
+    };
+
+    logs.push(newEntry);
+
+    await fs.promises.writeFile(
+      logFilePath,
+      JSON.stringify(logs, null, 2),
+      "utf-8",
+    );
+
+    await logSession(sessionCode, studentId, newEntry).catch(() => {});
+  } catch (err) {
+    console.error("[Logger] Failed to write student error log:", err);
+  }
+}
+
+let cachedTutorPrompt = "";
+async function getPythonTutorPrompt(): Promise<string> {
+  if (process.env.NODE_ENV === "production" && cachedTutorPrompt) {
+    return cachedTutorPrompt;
+  }
+  try {
+    const tutorPath = path.join(
+      process.cwd(),
+      "src",
+      "systemPrompts",
+      "python_tutor.md",
+    );
+    if (fs.existsSync(tutorPath)) {
+      const prompt = await fs.promises.readFile(tutorPath, "utf-8");
+      cachedTutorPrompt = prompt;
+      return prompt;
+    }
+  } catch (err) {
+    console.error("[PythonTutor] Error reading tutor prompt:", err);
+  }
+  return "You are a Python programming tutor.";
 }
 
 chatRouter.post(
@@ -637,30 +783,173 @@ chatRouter.post(
   unifiedAuthMiddleware(),
   rateLimitMiddleware(),
   async (c) => {
+    const allowedModesStr = process.env.ALLOWED_MODES || "";
+    const allowedModes = allowedModesStr
+      .split(",")
+      .map((m) => m.trim().toUpperCase())
+      .filter(Boolean);
+
+    const clientType = c.req.header("x-client-type") || "";
+
+    if (allowedModes.length === 0) {
+      return c.json(
+        { error: "Access Denied: No modes allowed by proxy configuration." },
+        403,
+      );
+    }
+
+    let isAllowed = false;
+    if (clientType === "quatmo-chat") {
+      if (allowedModes.includes("CHAT") || allowedModes.includes("AGENT")) {
+        isAllowed = true;
+      }
+    } else if (clientType === "quatmo-code") {
+      if (allowedModes.includes("AGENT")) {
+        isAllowed = true;
+      }
+    }
+
+    if (!isAllowed) {
+      return c.json(
+        {
+          error: `Access Denied: The client '${clientType || "unknown"}' is not allowed under the current proxy configuration.`,
+        },
+        403,
+      );
+    }
+
     const user = c.get("user");
     const token = c.get("token");
     const authMode = c.get("authMode" as any) as string | undefined;
-    const examContext = c.get("examContext" as any) as any;
+    const sessionContext = c.get("sessionContext" as any) as any;
     const sessionKey = c.get("sessionKey" as any) as any;
     const body = await c.req.json();
 
-    // Prevent LLM tool-calling confusion: explicitly inject system instruction that todowrite
-    // is only a checklist tracker and does not perform file modifications on disk.
+    const machineId =
+      c.req.header("x-machine-id") || c.req.header("X-Machine-Id") || "";
+
+    let finalSessionCode = "DEFAULT";
+    let finalStudentId = machineId || "DEFAULT_USER";
+    let currentAiOption = "agent";
+
+    if (authMode === "session" && sessionContext) {
+      finalSessionCode = sessionContext.sessionCode || "DEFAULT";
+      finalStudentId = sessionContext.studentId || "DEFAULT_USER";
+      currentAiOption = sessionContext.aiOption || "agent";
+    } else {
+      if (
+        user?.userId &&
+        user.userId !== "master-user" &&
+        user.userId !== "local-user"
+      ) {
+        finalStudentId = user.userId;
+      }
+    }
+
+    finalSessionCode = finalSessionCode.toUpperCase();
+    finalStudentId = finalStudentId.toUpperCase();
+
+    const startTime = performance.now();
+    let inputSafetyDuration = 0;
+
+    const messages = body.messages;
+    let lastMsg = Array.isArray(messages) && messages.length > 0 ? messages[messages.length - 1] : null;
+    
+    const isRealUserPrompt = () => {
+      if (!lastMsg || lastMsg.role !== "user") return false;
+      const content = typeof lastMsg.content === "string"
+        ? lastMsg.content
+        : Array.isArray(lastMsg.content)
+          ? JSON.stringify(lastMsg.content)
+          : "";
+      
+      if (
+        lastMsg.tool_call_id ||
+        lastMsg.tool_calls ||
+        content.includes("<system-reminder>") ||
+        content.includes("Called the ") ||
+        content.includes("tool failed") ||
+        content.includes("<task ") ||
+        content.includes("<task_result>") ||
+        content.includes("<task_error>") ||
+        content.includes("<shell_result>") ||
+        content.includes("<shell_metadata>") ||
+        content.includes("Attached media from tool result:")
+      ) {
+        return false;
+      }
+      return true;
+    };
+    const isUserPrompt = isRealUserPrompt();
+
+    if (isUserPrompt && messages && Array.isArray(messages)) {
+      const inputSafetyStart = performance.now();
+      const safetyResult = await validateUserMessages(messages);
+      inputSafetyDuration = performance.now() - inputSafetyStart;
+      console.log(`[Perf] Input safety check took ${inputSafetyDuration.toFixed(0)}ms`);
+      if (!safetyResult.allowed && safetyResult.violation) {
+        const v = safetyResult.violation;
+        console.warn(
+          `[Safety] BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+        );
+        const errorMsg = v.message;
+        if (authMode === "session") {
+          await logStudentError(
+            finalSessionCode,
+            finalStudentId,
+            currentAiOption,
+            body,
+            errorMsg,
+            "Input Safety Guardrail",
+            v.code,
+            400
+          ).catch(() => {});
+        }
+        if (body.stream) {
+          return streamSSE(c, async (stream) => {
+            const errChunk = {
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: `\n\n**[${errorMsg}]**\n\n` },
+                  finish_reason: "error",
+                },
+              ],
+              error: {
+                message: errorMsg,
+                code: v.code,
+                type: v.type,
+              },
+            };
+            await stream.writeSSE({ data: JSON.stringify(errChunk) });
+            await stream.writeSSE({ data: "[DONE]" });
+          });
+        }
+        return c.json(
+          { error: { message: errorMsg, code: v.code, type: v.type } },
+          400,
+        );
+      }
+    }
     if (body.messages && Array.isArray(body.messages)) {
       let hasSystem = false;
       const warningText =
         "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
 
+      const tutorPrompt = await getPythonTutorPrompt();
+
       for (const msg of body.messages) {
         if (msg.role === "system") {
           hasSystem = true;
           if (typeof msg.content === "string") {
-            msg.content += warningText;
+            msg.content = tutorPrompt + warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION;
           } else if (Array.isArray(msg.content)) {
-            msg.content.push({
-              type: "text",
-              text: warningText,
-            });
+            msg.content = [
+              {
+                type: "text",
+                text: tutorPrompt + warningText + ENGLISH_ONLY_SYSTEM_INSTRUCTION,
+              }
+            ];
           }
         }
       }
@@ -668,20 +957,22 @@ chatRouter.post(
         body.messages.unshift({
           role: "system",
           content:
-            "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.",
+            tutorPrompt +
+            "- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool." +
+            ENGLISH_ONLY_SYSTEM_INSTRUCTION,
         });
       }
     }
 
-    if (authMode === "exam") {
-      const liveExam = exams.get(examContext.examCode);
-      const currentAiOption = liveExam
-        ? liveExam.aiOption
-        : examContext.aiOption;
+    if (authMode === "session") {
+      const liveSession = sessions.get(sessionContext.sessionCode);
+      const currentAiOption = liveSession
+        ? liveSession.aiOption
+        : sessionContext.aiOption;
 
       if (currentAiOption === "none") {
         return c.json(
-          { error: "Tính năng AI bị vô hiệu hóa trong phòng thi này." },
+          { error: "Tính năng AI bị vô hiệu hóa trong session này." },
           403,
         );
       }
@@ -705,36 +996,25 @@ chatRouter.post(
       );
     }
 
-    const lastMsg =
+    lastMsg =
       body.messages && body.messages.length > 0
         ? body.messages[body.messages.length - 1]
         : null;
 
-    let classifierResultText = "";
-    let classifierLabel = "none";
-    let classifierConfidence = 0;
-    if (
+    const shouldClassify = !!(
       process.env.CLASSIFIER_API_URL &&
       lastMsg &&
       lastMsg.role === "user" &&
       typeof lastMsg.content === "string"
-    ) {
-      try {
-        const res = await classifyPrompt(lastMsg.content);
-        if (res && res.label) {
-          classifierLabel = res.label;
-          classifierConfidence = res.confidence;
-          const formattedLabel = res.label.toLowerCase();
-          const confidencePct = `${(res.confidence * 100).toFixed(1)}%`;
-          console.log(
-            `\x1b[32m[Classifier]\x1b[0m ➔ ${formattedLabel} (${confidencePct})`,
-          );
-          classifierResultText = `__CLASSIFIER_RESULT__:{"label":"${res.label}","confidence":${res.confidence}}\n\n`;
-        }
-      } catch (e) {
-        console.error("[Classifier] Error during classification:", e);
-      }
+    );
+    const userPrompt = shouldClassify ? (lastMsg!.content as string) : "";
+
+    if (shouldClassify) {
+      await redisStore.setEvaluationPending(token, true).catch(() => {});
     }
+
+    let classifierLabel = "none";
+    let classifierConfidence = 0;
 
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
@@ -761,6 +1041,18 @@ chatRouter.post(
 
     if (remainingBudget <= 0) {
       const errorMsg = "Monthly token budget exceeded. Access Denied.";
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          errorMsg,
+          "Rate Limiting",
+          "BUDGET_EXCEEDED",
+          402
+        ).catch(() => {});
+      }
       if (body.stream) {
         return streamSSE(c, async (stream) => {
           const errChunk = {
@@ -801,6 +1093,7 @@ chatRouter.post(
     }
 
     let response: Response;
+    const mainLlmStart = performance.now();
     try {
       response = await fetch(upstream.url, {
         method: "POST",
@@ -808,8 +1101,28 @@ chatRouter.post(
         body: JSON.stringify(upstreamBody),
         // verbose: true, //stress test
       } as any);
+      const mainLlmDuration = performance.now() - mainLlmStart;
+      console.log(`[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`);
     } catch (err: any) {
       console.error("[Proxy] Upstream connection failed:", err.message);
+      logGlobal({
+        level: "error",
+        event: "upstream_connection_failed",
+        url: upstream.url,
+        error: err.message,
+      });
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          `Connection to upstream provider failed: ${err.message}`,
+          "Upstream LLM Provider",
+          "UPSTREAM_CONNECTION_FAILED",
+          502
+        ).catch(() => {});
+      }
       return c.json(
         { error: `Connection to upstream provider failed: ${err.message}` },
         502,
@@ -823,11 +1136,30 @@ chatRouter.post(
         response.status,
         errBody,
       );
+      logGlobal({
+        level: "error",
+        event: "upstream_error_response",
+        url: upstream.url,
+        status: response.status,
+        body: errBody.slice(0, 500),
+      });
+      if (authMode === "session") {
+        await logStudentError(
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          body,
+          errBody || `Upstream returned status ${response.status}`,
+          "Upstream LLM Provider",
+          "UPSTREAM_ERROR_STATUS",
+          response.status
+        ).catch(() => {});
+      }
       return c.text(errBody, response.status as any);
     }
 
     const recordTokenUsage = async (consumed: number) => {
-      if (authMode === "exam") {
+      if (authMode === "session") {
         if (redis && redis.status === "ready") {
           try {
             await redis.hincrby(sessionKey, "consumed", consumed);
@@ -835,9 +1167,9 @@ chatRouter.post(
             console.error("[Proxy] Redis budget increment failed:", err);
           }
         }
-        const { examStates } = await import("../services/examStore");
-        const stateKey = `${examContext.examCode}:${examContext.studentId}`;
-        const state = examStates.get(stateKey);
+        const { sessionStates } = await import("../services/sessionStore");
+        const stateKey = `${sessionContext.sessionCode}:${sessionContext.studentId}`;
+        const state = sessionStates.get(stateKey);
         if (state) {
           state.tokensConsumed += consumed;
         }
@@ -886,8 +1218,35 @@ chatRouter.post(
         Array.isArray(responseData.choices?.[0]?.message?.tool_calls) &&
         responseData.choices[0].message.tool_calls.length > 0;
 
+      // Output Safety Guard: check if the AI response violates language/profanity rules
+      let content = responseData.choices?.[0]?.message?.content || "";
+      if (isUserPrompt) {
+        const outputSafetyStart = performance.now();
+        const outputSafety = await checkText(content);
+        const outputSafetyDuration = performance.now() - outputSafetyStart;
+        console.log(`[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`);
+        if (!outputSafety.allowed && outputSafety.violation) {
+          const v = outputSafety.violation;
+          if (authMode === "session") {
+            await logStudentError(
+              finalSessionCode,
+              finalStudentId,
+              currentAiOption,
+              body,
+              v.message,
+              "Output Safety Guardrail",
+              v.code,
+              400
+            ).catch(() => {});
+          }
+          return c.json(
+            { error: { message: v.message, code: v.code, type: v.type } },
+            400,
+          );
+        }
+      }
+
       // Convert XML tool call in non-streaming response if present
-      const content = responseData.choices?.[0]?.message?.content || "";
       if (!hasToolCalls && content.includes("<function=")) {
         const cleanContent = content.replace(/<\/tool_call>/g, "");
         const parsedTool = parseXmlToolCall(cleanContent);
@@ -911,20 +1270,30 @@ chatRouter.post(
 
       // Only inject classifier into plain text replies.
       if (
-        classifierResultText &&
+        shouldClassify &&
         responseData.choices?.[0]?.message &&
         !hasToolCalls
       ) {
-        responseData.choices[0].message.content =
-          classifierResultText +
-          (responseData.choices[0].message.content || "");
+        const completionText = responseData.choices[0].message.content || "";
+        setImmediate(() => {
+          evaluateTurnAndSession(
+            finalSessionCode,
+            finalStudentId,
+            token,
+            userPrompt,
+            completionText,
+            body.messages,
+          ).catch((e) => console.error("[Background Classifier] Error:", e));
+        });
       }
 
       await recordTokenUsage(totalConsumed);
 
       logStudentInteraction(
-        authMode,
-        examContext,
+        finalSessionCode,
+        finalStudentId,
+        currentAiOption,
+        user?.monthlyTokenLimit || 0,
         body,
         responseData.choices?.[0]?.message?.content || "",
         inputTokens,
@@ -950,23 +1319,36 @@ chatRouter.post(
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
+    c.header("Content-Type", "text/event-stream");
+    c.header("Cache-Control", "no-cache, no-transform");
+    c.header("Connection", "keep-alive");
+    c.header("X-Accel-Buffering", "no");
+
     return streamSSE(c, async (stream) => {
       const toolCallConverter = new XmlToolCallConverter();
       let completionText = "";
       let accumulatedBuffer = "";
       let isTerminated = false;
+      let wasBlockedByGuardrail = false;
+      let receivedChunks = 0;
       let upstreamTotalTokens: number | null = null;
       let outputTokens = 0;
       let accumulatedDeltaText = "";
+      let hasReasoningStarted = false;
+      let hasContentStarted = false;
 
-      let classifierChunkSent = false;
-      let classifierSuppressedForToolCalls = false;
       let streamToolCalls: any[] = [];
+      let hasAnyToolCalls = false;
+
+
 
       const emitSyntheticUsageAndDone = async () => {
-        // Flush any remaining tool call buffer
+        // Flush tool deltas to client
         const flushedDeltas = toolCallConverter.flush();
         for (const convDelta of flushedDeltas) {
+          if (convDelta.delta.tool_calls) {
+            hasAnyToolCalls = true;
+          }
           const flushChunk = {
             choices: [
               {
@@ -979,27 +1361,118 @@ chatRouter.post(
           await stream.writeSSE({ data: JSON.stringify(flushChunk) });
         }
 
-        if (upstreamTotalTokens === null) {
-          const finalOutputTokens = countTokens(completionText);
-          const totalConsumed = inputTokens + finalOutputTokens;
-
-          const usageChunk = {
-            choices: [],
-            usage: {
-              prompt_tokens: inputTokens,
-              completion_tokens: finalOutputTokens,
-              total_tokens: totalConsumed,
-            },
-          };
-          await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+        if (shouldClassify && !hasAnyToolCalls) {
+          setImmediate(() => {
+            evaluateTurnAndSession(
+              finalSessionCode,
+              finalStudentId,
+              token,
+              userPrompt,
+              completionText,
+              body.messages,
+            ).catch((e) => console.error("[Background Classifier] Error:", e));
+          });
         }
-        await stream.writeSSE({ data: "[DONE]" });
-        await stream.close();
-        isTerminated = true;
+
+        // Run output safety check asynchronously (non-blocking chunk delivery)
+        if (isUserPrompt && !hasAnyToolCalls) {
+          const outputSafetyStart = performance.now();
+          const checkPromise = checkText(completionText)
+            .then(async (outputSafety) => {
+              const outputSafetyDuration = performance.now() - outputSafetyStart;
+              console.log(`[Perf] Asynchronous output safety check completed in ${outputSafetyDuration.toFixed(0)}ms`);
+              if (!outputSafety.allowed && outputSafety.violation) {
+                wasBlockedByGuardrail = true;
+                const v = outputSafety.violation;
+                console.warn(
+                  `[Safety] Output BLOCKED ${v.code} from studentId=${finalStudentId} | evidence: ${v.evidence.join(", ")}`,
+                );
+
+                if (authMode === "session") {
+                  await logStudentError(
+                    finalSessionCode,
+                    finalStudentId,
+                    currentAiOption,
+                    body,
+                    v.message,
+                    "Output Safety Guardrail",
+                    v.code,
+                    400
+                  ).catch(() => {});
+                }
+
+                const errorChunk = {
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: `\n\n**[${v.message}]**\n\n` },
+                      finish_reason: "error",
+                    },
+                  ],
+                  error: {
+                    message: v.message,
+                    code: v.code,
+                    type: v.type,
+                  },
+                };
+                await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+              }
+            })
+            .catch((err) => {
+              console.error(
+                "[Safety Guardrail] Error running safety check:",
+                err.message,
+              );
+            })
+            .finally(async () => {
+              if (upstreamTotalTokens === null) {
+                const finalOutputTokens = countTokens(completionText);
+                const totalConsumed = inputTokens + finalOutputTokens;
+
+                const usageChunk = {
+                  choices: [],
+                  usage: {
+                    prompt_tokens: inputTokens,
+                    completion_tokens: finalOutputTokens,
+                    total_tokens: totalConsumed,
+                  },
+                };
+                await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+              }
+              await stream.writeSSE({ data: "[DONE]" });
+              await stream.close();
+              isTerminated = true;
+            });
+
+          await checkPromise;
+        } else {
+          if (upstreamTotalTokens === null) {
+            const finalOutputTokens = countTokens(completionText);
+            const totalConsumed = inputTokens + finalOutputTokens;
+
+            const usageChunk = {
+              choices: [],
+              usage: {
+                prompt_tokens: inputTokens,
+                completion_tokens: finalOutputTokens,
+                total_tokens: totalConsumed,
+              },
+            };
+            await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+          }
+          await stream.writeSSE({ data: "[DONE]" });
+          await stream.close();
+          isTerminated = true;
+        }
       };
 
       const handleSseLine = async (trimmed: string) => {
         if (!trimmed) return;
+        receivedChunks++;
+        if (receivedChunks === 1) {
+          const ttft = performance.now() - startTime;
+          console.log(`[Perf] Time to first token (TTFT): ${ttft.toFixed(0)}ms (including input safety check)`);
+        }
 
         if (trimmed === "data: [DONE]") {
           await emitSyntheticUsageAndDone();
@@ -1015,7 +1488,12 @@ chatRouter.post(
           const parsed = JSON.parse(rawJson);
           const delta = parsed.choices?.[0]?.delta;
 
-          if (delta && Array.isArray(delta.tool_calls)) {
+          if (
+            delta &&
+            Array.isArray(delta.tool_calls) &&
+            delta.tool_calls.length > 0
+          ) {
+            hasAnyToolCalls = true;
             for (const tc of delta.tool_calls) {
               const idx = tc.index ?? 0;
               if (!streamToolCalls[idx]) {
@@ -1050,33 +1528,6 @@ chatRouter.post(
             }
           }
 
-          const hasToolCalls =
-            Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0;
-          const hasContentDelta =
-            typeof delta?.content === "string" && delta.content.length > 0;
-
-          if (
-            !classifierChunkSent &&
-            !classifierSuppressedForToolCalls &&
-            classifierResultText
-          ) {
-            if (hasToolCalls) {
-              classifierSuppressedForToolCalls = true;
-            } else if (hasContentDelta) {
-              const classifierChunk = {
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: classifierResultText },
-                    finish_reason: null,
-                  },
-                ],
-              };
-              await stream.writeSSE({ data: JSON.stringify(classifierChunk) });
-              classifierChunkSent = true;
-            }
-          }
-
           if (parsed.usage) {
             const u = parsed.usage;
             const total =
@@ -1094,13 +1545,38 @@ chatRouter.post(
           }
 
           const content = delta?.content || "";
-          const reasoning = delta?.reasoning_content || delta?.reasoning || "";
+          const reasoning = delta?.reasoning_content || "";
           completionText += content + reasoning;
+
+          let clientContent = "";
+          if (reasoning) {
+            if (!hasReasoningStarted) {
+              hasReasoningStarted = true;
+              clientContent += "*Suy nghĩ:*\n> ";
+            }
+            clientContent += reasoning.replace(/\n/g, "\n> ");
+          } else if (content) {
+            if (hasReasoningStarted && !hasContentStarted) {
+              hasContentStarted = true;
+              clientContent += "\n\n---\n\n";
+            }
+            clientContent += content;
+          }
+
+          if (delta) {
+            if (clientContent) {
+              delta.content = clientContent;
+            } else {
+              delete delta.content;
+            }
+          }
+
+          // Inline chunk safety checks removed in favor of post-generation Output Guardrail LLM check.
+          const deltaText = content + reasoning;
 
           // High-performance token budgeting optimization:
           // Instead of re-tokenizing the growing completionText on every chunk (O(N^2) complexity),
           // we incrementally track characters and count tokens in batches of ~6 words (O(N) total complexity).
-          const deltaText = content + reasoning;
           if (deltaText) {
             accumulatedDeltaText += deltaText;
           }
@@ -1118,44 +1594,134 @@ chatRouter.post(
             accumulatedDeltaText = "";
             const exactTotalConsumed = inputTokens + outputTokens;
 
-            const errorChunk = {
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    content:
-                      "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
+            if (isUserPrompt && !hasAnyToolCalls) {
+              const checkPromise = checkText(completionText)
+                .then(async (outputSafety) => {
+                  if (!outputSafety.allowed && outputSafety.violation) {
+                    wasBlockedByGuardrail = true;
+                    const v = outputSafety.violation;
+                    console.warn(
+                      `[Safety] Output BLOCKED ${v.code} from clientId=${c.get("clientId" as any) || "unknown"} | evidence: ${v.evidence.join(", ")}`,
+                    );
+
+                    if (authMode === "session") {
+                      await logStudentError(
+                        finalSessionCode,
+                        finalStudentId,
+                        currentAiOption,
+                        body,
+                        v.message,
+                        "Output Safety Guardrail",
+                        v.code,
+                        400
+                      ).catch(() => {});
+                    }
+
+                    const errorChunk = {
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: `\n\n**[Error: ${v.message}]**\n\n` },
+                          finish_reason: "error",
+                        },
+                      ],
+                      error: {
+                        message: v.message,
+                        code: v.code,
+                        type: v.type,
+                      },
+                    };
+                    await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                  } else {
+                    const errorChunk = {
+                      choices: [
+                        {
+                          index: 0,
+                          delta: {
+                            content:
+                              "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
+                          },
+                          finish_reason: null,
+                        },
+                      ],
+                    };
+                    await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                  }
+                })
+                .catch((err) => {
+                  console.error(
+                    "[Safety Guardrail] Error running budget safety check:",
+                    err.message,
+                  );
+                })
+                .finally(async () => {
+                  const usageChunk = {
+                    choices: [],
+                    usage: {
+                      prompt_tokens: inputTokens,
+                      completion_tokens: outputTokens,
+                      total_tokens: exactTotalConsumed,
+                    },
+                  };
+                  await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+
+                  const stopChunk = {
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: "length",
+                      },
+                    ],
+                  };
+                  await stream.writeSSE({ data: JSON.stringify(stopChunk) });
+                  await stream.writeSSE({ data: "[DONE]" });
+                  await stream.close();
+                  reader.cancel();
+                  isTerminated = true;
+                });
+
+              await checkPromise;
+            } else {
+              const errorChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      content:
+                        "\n\n**[Proxy Error: Token limit exceeded. Request truncated.]**\n\n",
+                    },
+                    finish_reason: null,
                   },
-                  finish_reason: null,
-                },
-              ],
-            };
-            await stream.writeSSE({ data: JSON.stringify(errorChunk) });
+                ],
+              };
+              await stream.writeSSE({ data: JSON.stringify(errorChunk) });
 
-            const usageChunk = {
-              choices: [],
-              usage: {
-                prompt_tokens: inputTokens,
-                completion_tokens: outputTokens,
-                total_tokens: exactTotalConsumed,
-              },
-            };
-            await stream.writeSSE({ data: JSON.stringify(usageChunk) });
-
-            const stopChunk = {
-              choices: [
-                {
-                  index: 0,
-                  delta: {},
-                  finish_reason: "length",
+              const usageChunk = {
+                choices: [],
+                usage: {
+                  prompt_tokens: inputTokens,
+                  completion_tokens: outputTokens,
+                  total_tokens: exactTotalConsumed,
                 },
-              ],
-            };
-            await stream.writeSSE({ data: JSON.stringify(stopChunk) });
-            await stream.writeSSE({ data: "[DONE]" });
-            await stream.close();
-            reader.cancel();
-            isTerminated = true;
+              };
+              await stream.writeSSE({ data: JSON.stringify(usageChunk) });
+
+              const stopChunk = {
+                choices: [
+                  {
+                    index: 0,
+                    delta: {},
+                    finish_reason: "length",
+                  },
+                ],
+              };
+              await stream.writeSSE({ data: JSON.stringify(stopChunk) });
+              await stream.writeSSE({ data: "[DONE]" });
+              await stream.close();
+              reader.cancel();
+              isTerminated = true;
+            }
             return;
           }
 
@@ -1165,7 +1731,7 @@ chatRouter.post(
             );
             for (const convDelta of convertedDeltas) {
               if (convDelta.delta.tool_calls) {
-                classifierSuppressedForToolCalls = true;
+                hasAnyToolCalls = true;
                 for (const tc of convDelta.delta.tool_calls) {
                   const idx = tc.index ?? 0;
                   if (!streamToolCalls[idx]) {
@@ -1254,11 +1820,19 @@ chatRouter.post(
         console.log(
           `\x1b[36m[Proxy]\x1b[0m ➔ Completed | Total: ${totalConsumed} tokens`,
         );
-        await recordTokenUsage(totalConsumed);
+        if (!wasBlockedByGuardrail) {
+          await recordTokenUsage(totalConsumed);
+        } else {
+          console.log(
+            `\x1b[33m[Proxy]\x1b[0m ➔ Blocked by Guardrail | Charged 0 tokens`,
+          );
+        }
 
         logStudentInteraction(
-          authMode,
-          examContext,
+          finalSessionCode,
+          finalStudentId,
+          currentAiOption,
+          user?.monthlyTokenLimit || 0,
           body,
           completionText,
           inputTokens,
