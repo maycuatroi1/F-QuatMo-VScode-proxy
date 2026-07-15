@@ -35,9 +35,7 @@ export const authMiddleware = (): MiddlewareHandler<{
 
     let session: UserSession | null = null;
 
-    const openAiKey = process.env.OPENAI_API_KEY || "";
-    const openRouterKey = process.env.OPENROUTER_API_KEY || "";
-    const customApiKey = process.env.CUSTOM_API_KEY || "";
+    // Upstream API keys not needed in auth verification
 
     if (token === proxyApiKey) {
       session = {

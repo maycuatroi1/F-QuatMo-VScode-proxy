@@ -25,6 +25,7 @@ export interface StudentSessionState {
   loginTimestamp: number;
   tokensConsumed: number;
   reassigned: boolean;
+  latestClassification?: string;
 }
 
 export interface Group {
@@ -67,9 +68,16 @@ db.run(`
     login_timestamp INTEGER NOT NULL,
     tokens_consumed INTEGER NOT NULL,
     reassigned INTEGER NOT NULL,
+    latest_classification TEXT,
     PRIMARY KEY (session_code, student_id)
   )
 `);
+
+try {
+  db.run("ALTER TABLE session_states ADD COLUMN latest_classification TEXT");
+} catch (e) {
+  // Ignore if column already exists
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS student_groups (
@@ -97,8 +105,8 @@ const stmtDeleteSession = db.prepare(`
 `);
 
 const stmtSaveState = db.prepare(`
-  INSERT OR REPLACE INTO session_states (session_code, student_id, has_logged_in, login_timestamp, tokens_consumed, reassigned)
-  VALUES ($code, $student, $has_login, $login_time, $tokens, $reassign)
+  INSERT OR REPLACE INTO session_states (session_code, student_id, has_logged_in, login_timestamp, tokens_consumed, reassigned, latest_classification)
+  VALUES ($code, $student, $has_login, $login_time, $tokens, $reassign, $classification)
 `);
 
 const stmtDeleteState = db.prepare(`
@@ -164,6 +172,7 @@ export class PersistedSessionStates extends Map<string, StudentSessionState> {
       $login_time: value.loginTimestamp,
       $tokens: value.tokensConsumed,
       $reassign: value.reassigned ? 1 : 0,
+      $classification: value.latestClassification || "none",
     });
     return this;
   }
@@ -226,6 +235,7 @@ try {
   }
 
   const rowsStates = db.query("SELECT * FROM session_states").all() as any[];
+  const repairedSessionCodes = new Set<string>();
   for (const r of rowsStates) {
     const key = `${r.session_code}:${r.student_id}`;
     Map.prototype.set.call(sessionStates, key, {
@@ -235,7 +245,21 @@ try {
       loginTimestamp: r.login_timestamp,
       tokensConsumed: r.tokens_consumed,
       reassigned: r.reassigned === 1,
+      latestClassification: r.latest_classification || "none",
     });
+
+    const session = sessions.get(r.session_code);
+    if (session && !session.allowedStudentIds.has(r.student_id)) {
+      session.allowedStudentIds.add(r.student_id);
+      repairedSessionCodes.add(r.session_code);
+    }
+  }
+
+  for (const sessionCode of repairedSessionCodes) {
+    const session = sessions.get(sessionCode);
+    if (session) {
+      sessions.set(sessionCode, session);
+    }
   }
 
   const rowsGroups = db.query("SELECT * FROM student_groups").all() as any[];

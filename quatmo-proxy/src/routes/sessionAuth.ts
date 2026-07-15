@@ -59,8 +59,12 @@ sessionAuthRouter.get("/status", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime = session.startTime + session.durationMinutes * 60;
-  const aiExpirationTime = payload.loginTime + session.aiValidityMinutes * 60;
+  const sessionEndTime = session.durationMinutes === -1
+    ? session.startTime + 24 * 60 * 60
+    : session.startTime + session.durationMinutes * 60;
+  const aiExpirationTime = session.aiValidityMinutes === -1
+    ? payload.loginTime + 24 * 60 * 60
+    : payload.loginTime + session.aiValidityMinutes * 60;
   const sessionRemainingSeconds = Math.max(0, sessionEndTime - now);
   const aiRemainingSeconds = Math.max(0, aiExpirationTime - now);
 
@@ -72,8 +76,8 @@ sessionAuthRouter.get("/status", async (c) => {
     tokenBudget: session.defaultTokenBudget,
     tokensConsumed: consumed,
     tokensRemaining: Math.max(0, session.defaultTokenBudget - consumed),
-    sessionRemainingMinutes: Math.ceil(sessionRemainingSeconds / 60),
-    aiRemainingMinutes: Math.ceil(aiRemainingSeconds / 60),
+    sessionRemainingMinutes: session.durationMinutes === -1 ? -1 : Math.ceil(sessionRemainingSeconds / 60),
+    aiRemainingMinutes: session.aiValidityMinutes === -1 ? -1 : Math.ceil(aiRemainingSeconds / 60),
   });
 });
 
@@ -104,7 +108,10 @@ sessionAuthRouter.post("/login", async (c) => {
     return c.json({ error: "Session không tồn tại." }, 404);
   }
 
-  if (!session.allowedStudentIds.has(studentId)) {
+  const stateKey = `${sessionCode}:${studentId}`;
+  const existingState = sessionStates.get(stateKey);
+
+  if (!session.allowedStudentIds.has(studentId) && !existingState) {
     return c.json(
       {
         error:
@@ -112,6 +119,11 @@ sessionAuthRouter.post("/login", async (c) => {
       },
       403,
     );
+  }
+
+  if (!session.allowedStudentIds.has(studentId) && existingState) {
+    session.allowedStudentIds.add(studentId);
+    sessions.set(sessionCode, session);
   }
 
   const account = studentAccounts.get(studentId);
@@ -131,15 +143,16 @@ sessionAuthRouter.post("/login", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime = session.startTime + session.durationMinutes * 60;
+  const sessionEndTime = session.durationMinutes === -1
+    ? session.startTime + 24 * 60 * 60
+    : session.startTime + session.durationMinutes * 60;
   const remainingSeconds = sessionEndTime - now;
 
   if (remainingSeconds <= 0) {
     return c.json({ error: "Session này đã kết thúc." }, 403);
   }
 
-  const stateKey = `${sessionCode}:${studentId}`;
-  let state = sessionStates.get(stateKey);
+  let state = existingState;
   if (!state) {
     state = {
       sessionCode,

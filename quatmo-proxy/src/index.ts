@@ -35,6 +35,7 @@ app.use(
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
 app.route("/v1/admin", adminRouter);
+app.route("/session", sessionAuthRouter);
 app.route("/v1/session", sessionAuthRouter);
 
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
