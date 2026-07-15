@@ -7,6 +7,7 @@ export interface TurnLog {
   codeSnapshot?: string;
   I_score: number;
   E_score: number;
+  featureVector?: Record<string, number>;
 }
 
 export interface ClientContext {
@@ -203,4 +204,3 @@ export const redisStore = {
 };
 
 const localPendingEvaluations = new Map<string, boolean>();
-

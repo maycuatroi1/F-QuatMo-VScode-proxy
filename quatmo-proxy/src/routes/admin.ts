@@ -1,10 +1,17 @@
 import { Hono } from "hono";
 import { getProxyApiKey } from "../services/proxyKey";
+import { getAdminUsername, getAdminPassword } from "../services/adminCredentials";
 import { redis } from "../services/redis";
+import { sign } from "hono/jwt";
+import { getJwtSecret } from "../services/jwtKey";
 import AdmZip from "adm-zip";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9\-_]/g, "");
+}
 
 declare const Bun: any;
 import {
@@ -19,9 +26,16 @@ import {
 const adminRouter = new Hono();
 
 // ─── FLOW ────────────────────────────────────────────────────────────────────
-//  Middleware bảo vệ các API của Admin bằng PROXY_API_KEY
+//  Middleware bảo vệ các API dữ liệu Admin chỉ bằng PROXY_API_KEY
 // ─────────────────────────────────────────────────────────────────────────────
 adminRouter.use("*", async (c, next) => {
+  const path = c.req.path;
+  const url = c.req.url;
+  if (c.req.method === "OPTIONS" || path.includes("/login") || url.includes("/login")) {
+    await next();
+    return;
+  }
+
   const authHeader = c.req.header("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return c.json({ error: "Missing or invalid Admin API Key" }, 401);
@@ -29,12 +43,37 @@ adminRouter.use("*", async (c, next) => {
 
   const token = authHeader.substring(7).trim();
   const masterKey = getProxyApiKey();
-
-  if (token !== masterKey) {
-    return c.json({ error: "Unauthorized. Invalid Admin API Key" }, 401);
+  if (token === masterKey) {
+    await next();
+    return;
   }
 
-  await next();
+  return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
+});
+
+// Endpoint đăng nhập Admin bằng tài khoản và mật khẩu cấu hình
+adminRouter.post("/login", async (c) => {
+  const body = await c.req.json();
+  const { username, password } = body as { username?: string; password?: string };
+
+  if (!username || !password) {
+    return c.json({ error: "Username and password are required." }, 400);
+  }
+
+  const expectedUsername = getAdminUsername();
+  const expectedPassword = getAdminPassword();
+
+  if (username === expectedUsername && password === expectedPassword) {
+    const jwtSecret = getJwtSecret();
+    const payload = {
+      role: "admin",
+      exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60, // Giới hạn tối đa 24h
+    };
+    const token = await sign(payload, jwtSecret);
+    return c.json({ success: true, token });
+  }
+
+  return c.json({ error: "Invalid username or password." }, 401);
 });
 
 // 1. Khởi tạo danh mục tài khoản học viên toàn cục
@@ -175,6 +214,7 @@ adminRouter.post("/sessions/:sessionCode/students", async (c) => {
     }
     addedCount++;
   }
+  sessions.set(sessionCode, session);
 
   return c.json({
     success: true,
@@ -221,7 +261,14 @@ adminRouter.post(
 adminRouter.get("/sessions", async (c) => {
   const sessionPromises = Array.from(sessions.entries()).map(
     async ([code, session]) => {
-      const studentStatesPromises = Array.from(session.allowedStudentIds).map(
+      const studentIds = new Set(session.allowedStudentIds);
+      for (const state of sessionStates.values()) {
+        if (state.sessionCode === code) {
+          studentIds.add(state.studentId);
+        }
+      }
+
+      const studentStatesPromises = Array.from(studentIds).map(
         async (studentId) => {
           const stateKey = `${code}:${studentId}`;
           const state = sessionStates.get(stateKey);
@@ -247,6 +294,7 @@ adminRouter.get("/sessions", async (c) => {
             loginTimestamp: state?.loginTimestamp ?? 0,
             tokensConsumed: consumed,
             reassigned: state?.reassigned ?? false,
+            latestClassification: state?.latestClassification ?? "none",
           };
         },
       );
@@ -271,7 +319,7 @@ adminRouter.get("/sessions", async (c) => {
 });
 
 adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
-  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const sessionCode = sanitizeFilename(c.req.param("sessionCode")).toUpperCase();
   const session = sessions.get(sessionCode);
 
   if (!session) {
@@ -342,6 +390,148 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
       `[Admin] Failed to zip logs for session ${sessionCode}:`,
       err,
     );
+    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+  }
+});
+
+adminRouter.get("/machines/logs/zip", async (c) => {
+  const machineLogDir = path.resolve(
+    process.cwd(),
+    "logs",
+    "machines",
+  );
+  if (!fs.existsSync(machineLogDir)) {
+    return c.json({ error: `No machine logs found.` }, 404);
+  }
+
+  try {
+    const zip = new AdmZip();
+    const files = await fs.promises.readdir(machineLogDir);
+    let addedFilesCount = 0;
+
+    // Get encryption key from environment or use a secure fallback
+    const secret = (
+      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
+    ).trim();
+
+    for (const file of files) {
+      if (file.endsWith(".json") || file.endsWith(".log")) {
+        const filePath = path.join(machineLogDir, file);
+        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+
+        // Encrypt log file content using AES-256-CBC
+        const key = crypto.createHash("sha256").update(secret).digest();
+        const iv = crypto
+          .createHash("sha256")
+          .update(key)
+          .digest()
+          .subarray(0, 16);
+        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+        const encryptedBuffer = Buffer.concat([
+          cipher.update(fileContent, "utf-8"),
+          cipher.final(),
+        ]);
+
+        // Add encrypted buffer as <filename>.enc to ZIP
+        zip.addFile(`${file}.enc`, encryptedBuffer);
+        addedFilesCount++;
+      }
+    }
+
+    if (addedFilesCount === 0) {
+      return c.json({ error: `No log files found in machines directory.` }, 404);
+    }
+
+    const zipBuffer = zip.toBuffer();
+
+    c.header("Content-Type", "application/zip");
+    c.header(
+      "Content-Disposition",
+      `attachment; filename=machine-logs.zip`,
+    );
+    return c.body(zipBuffer);
+  } catch (err: any) {
+    console.error(
+      `[Admin] Failed to zip logs for machines:`,
+      err,
+    );
+    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+  }
+});
+
+adminRouter.get("/logs/zip", async (c) => {
+  const logDir = path.resolve(process.cwd(), "logs");
+  if (!fs.existsSync(logDir)) {
+    return c.json({ error: "No logs found." }, 404);
+  }
+
+  try {
+    const zip = new AdmZip();
+    let addedFilesCount = 0;
+
+    const secret = (
+      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
+    ).trim();
+
+    async function walkAndEncrypt(currentDir: string, relativePath: string = "") {
+      const entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const entryRelativePath = relativePath
+          ? path.join(relativePath, entry.name)
+          : entry.name;
+        const entryFullPath = path.join(currentDir, entry.name);
+
+        if (entry.isDirectory()) {
+          await walkAndEncrypt(entryFullPath, entryRelativePath);
+        } else if (entry.isFile()) {
+          if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
+            const isTargetLog = entryRelativePath.startsWith("sessions" + path.sep) ||
+                                entryRelativePath.startsWith("machines" + path.sep) ||
+                                entryRelativePath.startsWith("sessions/") ||
+                                entryRelativePath.startsWith("machines/");
+
+            if (isTargetLog) {
+              const fileContent = await fs.promises.readFile(entryFullPath, "utf-8");
+
+              // Encrypt log file content using AES-256-CBC
+              const key = crypto.createHash("sha256").update(secret).digest();
+              const iv = crypto
+                .createHash("sha256")
+                .update(key)
+                .digest()
+                .subarray(0, 16);
+              const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+              const encryptedBuffer = Buffer.concat([
+                cipher.update(fileContent, "utf-8"),
+                cipher.final(),
+              ]);
+
+              // Standardize path separator to '/' for ZIP compatibility
+              const zipPath = `${entryRelativePath}.enc`.replace(/\\/g, "/");
+              zip.addFile(zipPath, encryptedBuffer);
+              addedFilesCount++;
+            }
+          }
+        }
+      }
+    }
+
+    await walkAndEncrypt(logDir);
+
+    if (addedFilesCount === 0) {
+      return c.json({ error: "No log files found." }, 404);
+    }
+
+    const zipBuffer = zip.toBuffer();
+
+    c.header("Content-Type", "application/zip");
+    c.header(
+      "Content-Disposition",
+      `attachment; filename=all-logs.zip`,
+    );
+    return c.body(zipBuffer);
+  } catch (err: any) {
+    console.error(`[Admin] Failed to zip all logs:`, err);
     return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
   }
 });

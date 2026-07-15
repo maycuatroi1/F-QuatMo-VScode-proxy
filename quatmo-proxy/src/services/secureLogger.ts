@@ -16,6 +16,10 @@ import path from "path";
 const ALGORITHM = "aes-256-gcm";
 const LOG_ENCRYPT_KEY = (process.env.LOG_ENCRYPT_KEY || "").trim();
 
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^a-zA-Z0-9\-_]/g, "");
+}
+
 function deriveKey(secret: string): Buffer {
   return crypto.createHash("sha256").update(secret).digest();
 }
@@ -76,17 +80,39 @@ export async function logSession(
   studentId: string,
   record: object
 ) {
+  const safeSessionCode = sanitizeFilename(sessionCode || "DEFAULT").toUpperCase();
+  const safeStudentId = sanitizeFilename(studentId || "DEFAULT_USER").toUpperCase();
   const sessionLogDir = path.resolve(
     process.cwd(),
     "logs",
     "sessions",
-    sessionCode
+    safeSessionCode
   );
-  const sessionLogPath = path.resolve(sessionLogDir, `${studentId}.log`);
+  const sessionLogPath = path.resolve(sessionLogDir, `${safeStudentId}.log`);
   try {
     await appendEncryptedLine(sessionLogPath, record);
   } catch (err) {
     console.error("[SecureLogger] Failed to write session log:", err);
+  }
+}
+
+// ─── Machine log ─────────────────────────────────────────────────────────────
+
+export async function logMachine(
+  machineId: string,
+  record: object
+) {
+  const safeMachineId = sanitizeFilename(machineId || "DEFAULT_USER").toUpperCase();
+  const machineLogDir = path.resolve(
+    process.cwd(),
+    "logs",
+    "machines"
+  );
+  const machineLogPath = path.resolve(machineLogDir, `${safeMachineId}.log`);
+  try {
+    await appendEncryptedLine(machineLogPath, record);
+  } catch (err) {
+    console.error("[SecureLogger] Failed to write machine log:", err);
   }
 }
 

@@ -64,6 +64,8 @@ export const EXECUTIVE_WEIGHTS: Record<string, number> = {
   c10: 0.65, // zero_own_test_activity
 };
 
+const WINDOW_WEIGHTS = [0.1, 0.15, 0.2, 0.25, 0.3];
+
 /**
  * Calculates the SignalScore for a list of weighted activation values.
  * Formula: min(1, v_1 + 0.35 * v_2 + 0.15 * sum(v_j for j >= 3))
@@ -79,6 +81,75 @@ export function calculateSignalScore(values: number[]): number {
     sumRest += sorted[i];
   }
   return Math.min(1.0, v1 + 0.35 * v2 + 0.15 * sumRest);
+}
+
+export function calculateWindowScore(scores: number[]): number {
+  const validScores = scores
+    .filter((score) => Number.isFinite(score))
+    .slice(-WINDOW_WEIGHTS.length);
+  if (validScores.length === 0) return 0;
+
+  const weights = WINDOW_WEIGHTS.slice(WINDOW_WEIGHTS.length - validScores.length);
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  const weightedSum = validScores.reduce(
+    (sum, score, index) => sum + Math.max(0, Math.min(1, score)) * weights[index],
+    0,
+  );
+
+  return weightedSum / totalWeight;
+}
+
+export function deriveIemLabel(
+  instrumentalScore: number,
+  executiveScore: number,
+): "instrumental" | "executive" | "mixed" | "ambiguous" {
+  const EVIDENCE_THRESHOLD = 0.2;
+  const MIXED_THRESHOLD = 0.25;
+  const DOMINANCE_MARGIN = 0.1;
+  const strongestSignal = Math.max(instrumentalScore, executiveScore);
+  const delta = instrumentalScore - executiveScore;
+
+  if (strongestSignal < EVIDENCE_THRESHOLD) {
+    return "ambiguous";
+  }
+
+  if (
+    instrumentalScore >= MIXED_THRESHOLD &&
+    executiveScore >= MIXED_THRESHOLD &&
+    Math.abs(delta) < DOMINANCE_MARGIN
+  ) {
+    return "mixed";
+  }
+
+  if (Math.abs(delta) >= DOMINANCE_MARGIN) {
+    return delta > 0 ? "instrumental" : "executive";
+  }
+
+  return "ambiguous";
+}
+
+export function calculateIemConfidence(
+  label: "instrumental" | "executive" | "mixed" | "ambiguous",
+  instrumentalScore: number,
+  executiveScore: number,
+): number {
+  const strongestSignal = Math.max(instrumentalScore, executiveScore);
+  const weakestSignal = Math.min(instrumentalScore, executiveScore);
+  const separation = Math.abs(instrumentalScore - executiveScore);
+
+  if (label === "ambiguous") {
+    return Math.max(0, Math.min(1, 1 - strongestSignal / 0.2));
+  }
+
+  if (label === "mixed") {
+    const evidence = Math.min(1, weakestSignal / 0.5);
+    const balance = Math.max(0, 1 - separation / 0.1);
+    return Math.min(1, evidence * 0.7 + balance * 0.3);
+  }
+
+  const evidence = Math.min(1, strongestSignal / 0.6);
+  const dominance = Math.min(1, separation / 0.35);
+  return Math.min(1, evidence * 0.55 + dominance * 0.45);
 }
 
 /**
