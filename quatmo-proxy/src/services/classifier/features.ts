@@ -64,7 +64,11 @@ export const EXECUTIVE_WEIGHTS: Record<string, number> = {
   c10: 0.65, // zero_own_test_activity
 };
 
-const WINDOW_WEIGHTS = [0.1, 0.15, 0.2, 0.25, 0.3];
+export const IEM_WINDOW_SIZE = 5;
+
+export const IEM_HIGH_THRESHOLD = 0.55;
+export const IEM_MID_THRESHOLD = 0.45;
+export const IEM_MARGIN_THRESHOLD = 0.15;
 
 /**
  * Calculates the SignalScore for a list of weighted activation values.
@@ -83,46 +87,44 @@ export function calculateSignalScore(values: number[]): number {
   return Math.min(1.0, v1 + 0.35 * v2 + 0.15 * sumRest);
 }
 
-export function calculateWindowScore(scores: number[]): number {
+export function calculateSessionSignalScore(scores: number[]): number {
   const validScores = scores
     .filter((score) => Number.isFinite(score))
-    .slice(-WINDOW_WEIGHTS.length);
+    .slice(-IEM_WINDOW_SIZE);
   if (validScores.length === 0) return 0;
 
-  const weights = WINDOW_WEIGHTS.slice(WINDOW_WEIGHTS.length - validScores.length);
-  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-  const weightedSum = validScores.reduce(
-    (sum, score, index) => sum + Math.max(0, Math.min(1, score)) * weights[index],
-    0,
+  return calculateSignalScore(
+    validScores.map((score) => Math.max(0, Math.min(1, score))),
   );
-
-  return weightedSum / totalWeight;
 }
 
 export function deriveIemLabel(
   instrumentalScore: number,
   executiveScore: number,
 ): "instrumental" | "executive" | "mixed" | "ambiguous" {
-  const EVIDENCE_THRESHOLD = 0.2;
-  const MIXED_THRESHOLD = 0.25;
-  const DOMINANCE_MARGIN = 0.1;
-  const strongestSignal = Math.max(instrumentalScore, executiveScore);
   const delta = instrumentalScore - executiveScore;
 
-  if (strongestSignal < EVIDENCE_THRESHOLD) {
-    return "ambiguous";
+  if (
+    instrumentalScore >= IEM_HIGH_THRESHOLD &&
+    executiveScore < IEM_MID_THRESHOLD &&
+    delta >= IEM_MARGIN_THRESHOLD
+  ) {
+    return "instrumental";
   }
 
   if (
-    instrumentalScore >= MIXED_THRESHOLD &&
-    executiveScore >= MIXED_THRESHOLD &&
-    Math.abs(delta) < DOMINANCE_MARGIN
+    executiveScore >= IEM_HIGH_THRESHOLD &&
+    instrumentalScore < IEM_MID_THRESHOLD &&
+    -delta >= IEM_MARGIN_THRESHOLD
   ) {
-    return "mixed";
+    return "executive";
   }
 
-  if (Math.abs(delta) >= DOMINANCE_MARGIN) {
-    return delta > 0 ? "instrumental" : "executive";
+  if (
+    instrumentalScore >= IEM_MID_THRESHOLD &&
+    executiveScore >= IEM_MID_THRESHOLD
+  ) {
+    return "mixed";
   }
 
   return "ambiguous";
@@ -138,17 +140,18 @@ export function calculateIemConfidence(
   const separation = Math.abs(instrumentalScore - executiveScore);
 
   if (label === "ambiguous") {
-    return Math.max(0, Math.min(1, 1 - strongestSignal / 0.2));
+    return Math.max(
+      0,
+      Math.min(1, 1 - strongestSignal / IEM_MID_THRESHOLD),
+    );
   }
 
   if (label === "mixed") {
-    const evidence = Math.min(1, weakestSignal / 0.5);
-    const balance = Math.max(0, 1 - separation / 0.1);
-    return Math.min(1, evidence * 0.7 + balance * 0.3);
+    return Math.min(1, weakestSignal / IEM_MID_THRESHOLD);
   }
 
-  const evidence = Math.min(1, strongestSignal / 0.6);
-  const dominance = Math.min(1, separation / 0.35);
+  const evidence = Math.min(1, strongestSignal / IEM_HIGH_THRESHOLD);
+  const dominance = Math.min(1, separation / IEM_MARGIN_THRESHOLD);
   return Math.min(1, evidence * 0.55 + dominance * 0.45);
 }
 
@@ -179,6 +182,7 @@ export function calculateProgrammaticFeatures(
   clientContext: ClientContext | null,
   lastTurn: TurnLog | null,
   timeDeltaSeconds: number,
+  recentTurns: TurnLog[] = [],
 ): Record<string, number> {
   const features: Record<string, number> = {};
 
@@ -209,13 +213,20 @@ export function calculateProgrammaticFeatures(
     /\bviết hộ code\b/i,
     /\bsửa hộ code\b/i,
   ];
-  let keywordMatchCount = 0;
-  for (const rx of delegateKeywords) {
-    if (rx.test(prompt)) keywordMatchCount++;
-  }
-  let t10Activation = 0;
-  if (keywordMatchCount > 1) t10Activation = 1.0; // Strong
-  else if (keywordMatchCount === 1) t10Activation = 0.5; // Partial
+  delegateKeywords.push(
+    /\bwrite (?:it|this|the code) for me\b/i,
+    /\bdo (?:it|this|the assignment) for me\b/i,
+    /\bfix (?:it|this|the code) for me\b/i,
+  );
+  const windowPrompts = [
+    ...recentTurns.slice(-(IEM_WINDOW_SIZE - 1)).map((turn) => turn.prompt),
+    prompt,
+  ];
+  const delegatedTurnCount = windowPrompts.filter((turnPrompt) =>
+    delegateKeywords.some((pattern) => pattern.test(turnPrompt)),
+  ).length;
+  const t10Activation =
+    delegatedTurnCount >= 3 ? 1.0 : delegatedTurnCount === 2 ? 0.75 : 0;
   features["t10"] = t10Activation;
 
   // --- Code-diff Features ---
