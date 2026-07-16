@@ -6,10 +6,11 @@ import {
   calculateIemConfidence,
   calculateProgrammaticFeatures,
   calculateSignalScore,
-  calculateWindowScore,
+  calculateSessionSignalScore,
   deriveIemLabel,
   INSTRUMENTAL_WEIGHTS,
   EXECUTIVE_WEIGHTS,
+  IEM_WINDOW_SIZE,
 } from "./features";
 import { sessionStates } from "../sessionStore";
 
@@ -28,7 +29,7 @@ export async function evaluateTurnAndSession(
   try {
     const clientContext = await redisStore.getClientContext(sCode, sId);
     const turns = await redisStore.getTurns(sCode, sId);
-    const priorTurns = turns.slice(-4);
+    const priorTurns = turns.slice(-(IEM_WINDOW_SIZE - 1));
     const lastTurn =
       priorTurns.length > 0 ? priorTurns[priorTurns.length - 1] : null;
 
@@ -41,6 +42,7 @@ export async function evaluateTurnAndSession(
       clientContext,
       lastTurn,
       timeDeltaSeconds,
+      priorTurns,
     );
 
     const codeSnapshot = clientContext?.activeFile?.content || "";
@@ -85,13 +87,13 @@ export async function evaluateTurnAndSession(
       featureVector: combinedFeatures,
     };
 
-    const windowTurns = [...priorTurns, currentTurn].slice(-5);
+    const windowTurns = [...priorTurns, currentTurn].slice(-IEM_WINDOW_SIZE);
     await redisStore.saveTurns(sCode, sId, windowTurns);
 
-    const I_score_S = calculateWindowScore(
+    const I_score_S = calculateSessionSignalScore(
       windowTurns.map((turn) => turn.I_score),
     );
-    const E_score_S = calculateWindowScore(
+    const E_score_S = calculateSessionSignalScore(
       windowTurns.map((turn) => turn.E_score),
     );
     const delta = I_score_S - E_score_S;
@@ -137,7 +139,7 @@ export async function evaluateTurnAndSession(
             iScoreTurn: I_score_Ti,
             eScoreTurn: E_score_Ti,
             windowSize: windowTurns.length,
-            method: "sliding_window_turn_score_average_v2",
+            method: "sliding_window_hierarchical_signal_score_v3",
             summary: `I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)} | Label: ${label}`,
           };
           await fs.promises.writeFile(
