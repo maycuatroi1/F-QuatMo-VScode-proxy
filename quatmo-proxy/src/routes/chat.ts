@@ -973,6 +973,40 @@ chatRouter.post(
     let classifierLabel = currentIemLabel;
     let classifierConfidence = currentIemDecision.confidence;
 
+    if (isUserPrompt && currentIemLabel && currentIemLabel !== "none") {
+      latestClassifications.set(token, {
+        label: currentIemLabel,
+        confidence: currentIemDecision.confidence,
+      });
+      await redisStore
+        .setCachedClassification(
+          token,
+          currentIemLabel,
+          currentIemDecision.confidence,
+        )
+        .catch(() => {});
+
+      if (authMode === "session" && sessionContext) {
+        try {
+          const { sessionStates } = await import("../services/sessionStore");
+          const stateKey = `${sessionContext.sessionCode}:${sessionContext.studentId}`;
+          const state = sessionStates.get(stateKey);
+          if (state) {
+            state.latestClassification = currentIemLabel;
+            state.promptCount = (state.promptCount || 0) + 1;
+            const normLabel = currentIemLabel.toLowerCase();
+            if (normLabel === "instrumental") {
+              state.instrumentalCount = (state.instrumentalCount || 0) + 1;
+            } else if (normLabel === "executive") {
+              state.executiveCount = (state.executiveCount || 0) + 1;
+            } else if (normLabel === "mixed") {
+              state.mixedCount = (state.mixedCount || 0) + 1;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
     const remainingBudget = user.monthlyTokenLimit - user.tokensConsumed;

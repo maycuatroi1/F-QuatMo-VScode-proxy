@@ -39,7 +39,22 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
 
       const now = Math.floor(Date.now() / 1000);
 
-      if (now > payload.sessionEndTime) {
+      // Support global user tokens (persistent account login without active session)
+      if (payload.type === "user" || (!payload.sessionCode && (payload.studentId || payload.userId))) {
+        const uid = payload.studentId || payload.userId || "user";
+        const userSession: UserSession = {
+          keyId: `user-${uid}`,
+          userId: uid,
+          monthlyTokenLimit: 999_999_999,
+          tokensConsumed: 0,
+        };
+        c.set("authMode", "normal");
+        c.set("user", userSession);
+        c.set("token", token);
+        return await next();
+      }
+
+      if (payload.sessionEndTime && now > payload.sessionEndTime) {
         return c.json(
           { error: "Session đã kết thúc. Quyền truy cập AI đã bị khóa." },
           403,

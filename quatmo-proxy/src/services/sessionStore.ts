@@ -26,6 +26,10 @@ export interface StudentSessionState {
   tokensConsumed: number;
   reassigned: boolean;
   latestClassification?: string;
+  instrumentalCount?: number;
+  executiveCount?: number;
+  mixedCount?: number;
+  promptCount?: number;
 }
 
 export interface Group {

@@ -1,9 +1,10 @@
-import { Hono } from "hono";
+import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import { chatRouter } from "./routes/chat";
 import { adminRouter } from "./routes/admin";
 import { sessionAuthRouter } from "./routes/sessionAuth";
+import { authRouter } from "./routes/auth";
 import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
@@ -12,6 +13,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = new Hono();
+
 
 // Global Logger (only enabled in dev or if explicitly requested to maximize CCU)
 if (
@@ -37,6 +39,8 @@ app.route("/admin", adminRouter);
 app.route("/v1/admin", adminRouter);
 app.route("/session", sessionAuthRouter);
 app.route("/v1/session", sessionAuthRouter);
+app.route("/auth", authRouter);
+app.route("/v1/auth", authRouter);
 
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
   return c.json({

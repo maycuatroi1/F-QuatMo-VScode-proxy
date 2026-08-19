@@ -295,6 +295,10 @@ adminRouter.get("/sessions", async (c) => {
             tokensConsumed: consumed,
             reassigned: state?.reassigned ?? false,
             latestClassification: state?.latestClassification ?? "none",
+            instrumentalCount: state?.instrumentalCount ?? 0,
+            executiveCount: state?.executiveCount ?? 0,
+            mixedCount: state?.mixedCount ?? 0,
+            promptCount: state?.promptCount ?? 0,
           };
         },
       );
@@ -341,7 +345,6 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
 
   try {
     const zip = new AdmZip();
-    const files = await fs.promises.readdir(sessionLogDir);
     let addedFilesCount = 0;
 
     // Get encryption key from environment or use a secure fallback
@@ -349,29 +352,34 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
       process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
     ).trim();
 
-    for (const file of files) {
-      if (file.endsWith(".json") || file.endsWith(".log")) {
-        const filePath = path.join(sessionLogDir, file);
-        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+    async function addDirectoryFiles(dirPath: string, zipPrefix: string = "") {
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        const relZipPath = zipPrefix ? `${zipPrefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await addDirectoryFiles(fullPath, relZipPath);
+        } else if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
+          const fileContent = await fs.promises.readFile(fullPath, "utf-8");
+          const key = crypto.createHash("sha256").update(secret).digest();
+          const iv = crypto
+            .createHash("sha256")
+            .update(key)
+            .digest()
+            .subarray(0, 16);
+          const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+          const encryptedBuffer = Buffer.concat([
+            cipher.update(fileContent, "utf-8"),
+            cipher.final(),
+          ]);
 
-        // Encrypt log file content using AES-256-CBC
-        const key = crypto.createHash("sha256").update(secret).digest();
-        const iv = crypto
-          .createHash("sha256")
-          .update(key)
-          .digest()
-          .subarray(0, 16);
-        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-        const encryptedBuffer = Buffer.concat([
-          cipher.update(fileContent, "utf-8"),
-          cipher.final(),
-        ]);
-
-        // Add encrypted buffer as <filename>.enc to ZIP
-        zip.addFile(`${file}.enc`, encryptedBuffer);
-        addedFilesCount++;
+          zip.addFile(`${relZipPath}.enc`, encryptedBuffer);
+          addedFilesCount++;
+        }
       }
     }
+
+    await addDirectoryFiles(sessionLogDir);
 
     if (addedFilesCount === 0) {
       return c.json({ error: `No log files found in session directory.` }, 404);
