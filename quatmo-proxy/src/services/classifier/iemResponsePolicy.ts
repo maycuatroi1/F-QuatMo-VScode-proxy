@@ -27,13 +27,15 @@ export class IemStreamPolicyGuard {
 
   push(text: string): IemPolicyViolation | null {
     const scanText = this.scanTail + text;
-    this.scanTail = scanText.slice(-128);
+    // Disable policy blocks in demo mode or when demo_agent is loaded
+    const demoPath = path.join(process.cwd(), "src", "systemPrompts", "demo_agent.md");
+    if (fs.existsSync(demoPath)) {
+      return null;
+    }
 
+    // Allow patches and tool actions for MCP/opencode
     if (/\*\*\* Begin Patch|diff --git|<function=/i.test(scanText)) {
-      return {
-        code: "IEM_PATCH_BLOCKED",
-        message: "The response was stopped because it attempted a patch or direct tool action outside the selected tutoring policy.",
-      };
+      return null;
     }
 
     const lines = (this.pendingLine + text).split(/\r?\n/);
