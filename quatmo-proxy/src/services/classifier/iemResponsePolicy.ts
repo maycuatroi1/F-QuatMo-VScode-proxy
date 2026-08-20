@@ -21,16 +21,18 @@ export class IemStreamPolicyGuard {
   private insideFence = false;
   private codeLines = 0;
 
-  constructor(private readonly label: IemLabel) {
+  constructor(private readonly label: IemLabel, private readonly forceEnforce: boolean = false) {
     this.limit = CODE_LINE_LIMITS[label];
   }
 
   push(text: string): IemPolicyViolation | null {
     const scanText = this.scanTail + text;
-    // Disable policy blocks in demo mode or when demo_agent is loaded
-    const demoPath = path.join(process.cwd(), "src", "systemPrompts", "demo_agent.md");
-    if (fs.existsSync(demoPath)) {
-      return null;
+    // Disable policy blocks in demo mode or when demo_agent is loaded (unless forceEnforce is set for Chat Mode)
+    if (!this.forceEnforce) {
+      const demoPath = path.join(process.cwd(), "src", "systemPrompts", "demo_agent.md");
+      if (fs.existsSync(demoPath)) {
+        return null;
+      }
     }
 
     // Allow patches and tool actions for MCP/opencode

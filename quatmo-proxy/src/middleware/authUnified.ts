@@ -61,10 +61,12 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         );
       }
 
-      // isTokenAIHasTime
-      const aiExpirationTime = payload.aiValidityMinutes === -1
-        ? payload.loginTime + 24 * 60 * 60
-        : payload.loginTime + payload.aiValidityMinutes * 60;
+      // isTokenAIHasTime - default to 24h (1440 mins) if aiValidityMinutes is missing, 0, or <= 0
+      const validityMins =
+        payload.aiValidityMinutes && payload.aiValidityMinutes > 0
+          ? payload.aiValidityMinutes
+          : 1440; // 24 hours
+      const aiExpirationTime = payload.loginTime + validityMins * 60;
       if (now > aiExpirationTime) {
         return c.json(
           {

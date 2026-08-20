@@ -150,20 +150,10 @@ adminRouter.post("/sessions", async (c) => {
     assignedGroups?: string[];
   };
 
-  if (
-    !durationMinutes ||
-    !aiOption ||
-    aiValidityMinutes === undefined ||
-    !defaultTokenBudget
-  ) {
-    return c.json(
-      {
-        error:
-          "Missing required fields: durationMinutes, aiOption, aiValidityMinutes, defaultTokenBudget",
-      },
-      400,
-    );
-  }
+  const finalDuration = (durationMinutes && durationMinutes > 0) ? durationMinutes : 1440;
+  const finalAiOption = aiOption || "agent";
+  const finalAiValidity = (aiValidityMinutes && aiValidityMinutes > 0) ? aiValidityMinutes : finalDuration;
+  const finalBudget = defaultTokenBudget || 100000000;
 
   let sessionCode = "";
   do {
@@ -189,10 +179,10 @@ adminRouter.post("/sessions", async (c) => {
   const newSession: Session = {
     sessionCode,
     startTime: Math.floor(Date.now() / 1000),
-    durationMinutes,
-    aiOption,
-    aiValidityMinutes,
-    defaultTokenBudget,
+    durationMinutes: finalDuration,
+    aiOption: finalAiOption,
+    aiValidityMinutes: finalAiValidity,
+    defaultTokenBudget: finalBudget,
     allowedStudentIds,
     assignedGroups: groupsList,
     createdAt: Date.now(),

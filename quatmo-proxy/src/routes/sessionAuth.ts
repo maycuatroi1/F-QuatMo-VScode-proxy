@@ -65,14 +65,10 @@ sessionAuthRouter.get("/status", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime =
-    session.durationMinutes === -1
-      ? session.startTime + 24 * 60 * 60
-      : session.startTime + session.durationMinutes * 60;
-  const aiExpirationTime =
-    session.aiValidityMinutes === -1
-      ? payload.loginTime + 24 * 60 * 60
-      : payload.loginTime + session.aiValidityMinutes * 60;
+  const durMins = (session.durationMinutes && session.durationMinutes > 0) ? session.durationMinutes : 1440;
+  const valMins = (session.aiValidityMinutes && session.aiValidityMinutes > 0) ? session.aiValidityMinutes : durMins;
+  const sessionEndTime = session.startTime + durMins * 60;
+  const aiExpirationTime = payload.loginTime + valMins * 60;
   const sessionRemainingSeconds = Math.max(0, sessionEndTime - now);
   const aiRemainingSeconds = Math.max(0, aiExpirationTime - now);
 
@@ -80,18 +76,12 @@ sessionAuthRouter.get("/status", async (c) => {
     success: true,
     studentId,
     sessionCode,
-    aiOption: session.aiOption,
+    aiOption: session.aiOption || "agent",
     tokenBudget: session.defaultTokenBudget,
     tokensConsumed: consumed,
     tokensRemaining: Math.max(0, session.defaultTokenBudget - consumed),
-    sessionRemainingMinutes:
-      session.durationMinutes === -1
-        ? -1
-        : Math.ceil(sessionRemainingSeconds / 60),
-    aiRemainingMinutes:
-      session.aiValidityMinutes === -1
-        ? -1
-        : Math.ceil(aiRemainingSeconds / 60),
+    sessionRemainingMinutes: Math.ceil(sessionRemainingSeconds / 60),
+    aiRemainingMinutes: Math.ceil(aiRemainingSeconds / 60),
   });
 });
 
@@ -183,10 +173,9 @@ sessionAuthRouter.post("/login", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime =
-    session.durationMinutes === -1
-      ? session.startTime + 24 * 60 * 60
-      : session.startTime + session.durationMinutes * 60;
+  const durMins = (session.durationMinutes && session.durationMinutes > 0) ? session.durationMinutes : 1440;
+  const valMins = (session.aiValidityMinutes && session.aiValidityMinutes > 0) ? session.aiValidityMinutes : durMins;
+  const sessionEndTime = session.startTime + durMins * 60;
   const remainingSeconds = sessionEndTime - now;
 
   if (remainingSeconds <= 0) {
@@ -251,8 +240,8 @@ sessionAuthRouter.post("/login", async (c) => {
   const payload = {
     studentId,
     sessionCode,
-    aiOption: session.aiOption,
-    aiValidityMinutes: session.aiValidityMinutes,
+    aiOption: session.aiOption || "agent",
+    aiValidityMinutes: valMins,
     loginTime: state.loginTimestamp,
     sessionEndTime,
     exp: sessionEndTime,

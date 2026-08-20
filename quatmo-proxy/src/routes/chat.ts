@@ -890,10 +890,25 @@ chatRouter.post(
         );
       }
     }
+    const isChatMode =
+      c.req.header("x-quatmo-mode") === "chat" ||
+      body.quatmo_mode === "chat" ||
+      !body.tools ||
+      (Array.isArray(body.tools) && body.tools.length === 0);
+
+    if (isChatMode && body.tools) {
+      delete body.tools;
+    }
+
     if (body.messages && Array.isArray(body.messages)) {
-      const warningText =
-        "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
-      const isDemoAgent = fs.existsSync(path.join(process.cwd(), "src", "systemPrompts", "demo_agent.md"));
+      const warningText = isChatMode
+        ? ""
+        : "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
+      const isDemoAgent =
+        !isChatMode &&
+        fs.existsSync(
+          path.join(process.cwd(), "src", "systemPrompts", "demo_agent.md"),
+        );
       const runtimePolicy = isDemoAgent
         ? ""
         : `\n\nRUNTIME IEM POLICY: The current request is classified as ${currentIemLabel.toUpperCase()}. ` +
@@ -1348,7 +1363,9 @@ chatRouter.post(
       let accumulatedDeltaText = "";
       let hasReasoningStarted = false;
       let hasContentStarted = false;
-      const iemPolicyGuard = new IemStreamPolicyGuard(currentIemLabel);
+      const isChatMode =
+        c.req.header("x-quatmo-mode") === "chat" || body.quatmo_mode === "chat";
+      const iemPolicyGuard = new IemStreamPolicyGuard(currentIemLabel, isChatMode);
 
       let streamToolCalls: any[] = [];
       let hasAnyToolCalls = false;
