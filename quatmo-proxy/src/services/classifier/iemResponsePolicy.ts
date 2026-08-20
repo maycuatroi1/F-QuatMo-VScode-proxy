@@ -35,8 +35,13 @@ export class IemStreamPolicyGuard {
       }
     }
 
-    // Allow patches and tool actions for MCP/opencode
-    if (/\*\*\* Begin Patch|diff --git|<function=/i.test(scanText)) {
+    // In Chat mode (forceEnforce = true), block any attempt to output patches, diffs, or tool calls
+    if (this.forceEnforce) {
+      if (/\*\*\* Begin Patch|diff --git|<function=|<tool_call>/i.test(scanText)) {
+        return toolCallViolation();
+      }
+    } else if (/\*\*\* Begin Patch|diff --git|<function=/i.test(scanText)) {
+      // Allow patches and tool actions for MCP/opencode in Code mode
       return null;
     }
 
