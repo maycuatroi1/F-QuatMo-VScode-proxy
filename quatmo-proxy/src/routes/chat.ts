@@ -917,6 +917,19 @@ chatRouter.post(
           }
           return copy;
         });
+      } else {
+        // Sanitize conversation history from past Chat mode turns to remove tutor refusal text
+        body.messages = body.messages.map((m: any) => {
+          if (!m || typeof m !== "object") return m;
+          if (m.role === "assistant" && typeof m.content === "string") {
+            let content = m.content;
+            content = content.replace(/I cannot write, patch, or apply the solution for you[\s\S]*$/gi, "");
+            content = content.replace(/The response was stopped because Executive Mode[\s\S]*$/gi, "");
+            content = content.replace(/As (?:an? )?AI tutor[\s\S]*$/gi, "");
+            return { ...m, content: content.trim() || "Understood." };
+          }
+          return m;
+        });
       }
 
       const warningText = isChatMode
@@ -999,7 +1012,7 @@ chatRouter.post(
     let classifierLabel = currentIemLabel;
     let classifierConfidence = currentIemDecision.confidence;
 
-    if (isUserPrompt && currentIemLabel && currentIemLabel !== "none") {
+    if (isUserPrompt && currentIemLabel) {
       latestClassifications.set(token, {
         label: currentIemLabel,
         confidence: currentIemDecision.confidence,

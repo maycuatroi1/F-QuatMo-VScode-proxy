@@ -54,7 +54,7 @@ adminRouter.use("*", async (c, next) => {
     }
 
     try {
-      const decoded = await verify(token, getJwtSecret());
+      const decoded = await verify(token, getJwtSecret(), "HS256" as any);
       if (decoded && (decoded.role === "admin" || decoded.username)) {
         await next();
         return;
@@ -345,7 +345,7 @@ adminRouter.get("/sessions", async (c) => {
   return c.json({ success: true, sessions: sessionList });
 });
 
-adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
+const handleSessionLogsZip = async (c: any) => {
   const sessionCode = sanitizeFilename(c.req.param("sessionCode")).toUpperCase();
   const session = sessions.get(sessionCode);
 
@@ -370,7 +370,6 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
     const zip = new AdmZip();
     let addedFilesCount = 0;
 
-    // Get encryption key from environment or use a secure fallback
     const secret = (
       process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
     ).trim();
@@ -382,8 +381,8 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
         const relZipPath = zipPrefix ? `${zipPrefix}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           await addDirectoryFiles(fullPath, relZipPath);
-        } else if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
-          const fileContent = await fs.promises.readFile(fullPath, "utf-8");
+        } else if (entry.isFile() && !entry.name.startsWith(".")) {
+          const fileContent = await fs.promises.readFile(fullPath);
           const key = crypto.createHash("sha256").update(secret).digest();
           const iv = crypto
             .createHash("sha256")
@@ -392,7 +391,7 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
             .subarray(0, 16);
           const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
           const encryptedBuffer = Buffer.concat([
-            cipher.update(fileContent, "utf-8"),
+            cipher.update(fileContent),
             cipher.final(),
           ]);
 
@@ -423,9 +422,12 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
     );
     return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
   }
-});
+};
 
-adminRouter.get("/machines/logs/zip", async (c) => {
+adminRouter.get("/sessions/:sessionCode/logs", handleSessionLogsZip);
+adminRouter.get("/sessions/:sessionCode/logs/zip", handleSessionLogsZip);
+
+const handleMachineLogsZip = async (c: any) => {
   const machineLogDir = path.resolve(
     process.cwd(),
     "logs",
@@ -440,32 +442,32 @@ adminRouter.get("/machines/logs/zip", async (c) => {
     const files = await fs.promises.readdir(machineLogDir);
     let addedFilesCount = 0;
 
-    // Get encryption key from environment or use a secure fallback
     const secret = (
       process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
     ).trim();
 
     for (const file of files) {
-      if (file.endsWith(".json") || file.endsWith(".log")) {
+      if (!file.startsWith(".")) {
         const filePath = path.join(machineLogDir, file);
-        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+        const stat = await fs.promises.stat(filePath);
+        if (stat.isFile()) {
+          const fileContent = await fs.promises.readFile(filePath);
 
-        // Encrypt log file content using AES-256-CBC
-        const key = crypto.createHash("sha256").update(secret).digest();
-        const iv = crypto
-          .createHash("sha256")
-          .update(key)
-          .digest()
-          .subarray(0, 16);
-        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-        const encryptedBuffer = Buffer.concat([
-          cipher.update(fileContent, "utf-8"),
-          cipher.final(),
-        ]);
+          const key = crypto.createHash("sha256").update(secret).digest();
+          const iv = crypto
+            .createHash("sha256")
+            .update(key)
+            .digest()
+            .subarray(0, 16);
+          const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+          const encryptedBuffer = Buffer.concat([
+            cipher.update(fileContent),
+            cipher.final(),
+          ]);
 
-        // Add encrypted buffer as <filename>.enc to ZIP
-        zip.addFile(`${file}.enc`, encryptedBuffer);
-        addedFilesCount++;
+          zip.addFile(`${file}.enc`, encryptedBuffer);
+          addedFilesCount++;
+        }
       }
     }
 
@@ -488,9 +490,12 @@ adminRouter.get("/machines/logs/zip", async (c) => {
     );
     return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
   }
-});
+};
 
-adminRouter.get("/logs/zip", async (c) => {
+adminRouter.get("/logs/download-machine-logs", handleMachineLogsZip);
+adminRouter.get("/machines/logs/zip", handleMachineLogsZip);
+
+const handleAllLogsZip = async (c: any) => {
   const logDir = path.resolve(process.cwd(), "logs");
   if (!fs.existsSync(logDir)) {
     return c.json({ error: "No logs found." }, 404);
@@ -514,34 +519,31 @@ adminRouter.get("/logs/zip", async (c) => {
 
         if (entry.isDirectory()) {
           await walkAndEncrypt(entryFullPath, entryRelativePath);
-        } else if (entry.isFile()) {
-          if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
-            const isTargetLog = entryRelativePath.startsWith("sessions" + path.sep) ||
-                                entryRelativePath.startsWith("machines" + path.sep) ||
-                                entryRelativePath.startsWith("sessions/") ||
-                                entryRelativePath.startsWith("machines/");
+        } else if (entry.isFile() && !entry.name.startsWith(".")) {
+          const isTargetLog = entryRelativePath.startsWith("sessions" + path.sep) ||
+                              entryRelativePath.startsWith("machines" + path.sep) ||
+                              entryRelativePath.startsWith("sessions/") ||
+                              entryRelativePath.startsWith("machines/") ||
+                              entryRelativePath === "global.log";
 
-            if (isTargetLog) {
-              const fileContent = await fs.promises.readFile(entryFullPath, "utf-8");
+          if (isTargetLog) {
+            const fileContent = await fs.promises.readFile(entryFullPath);
 
-              // Encrypt log file content using AES-256-CBC
-              const key = crypto.createHash("sha256").update(secret).digest();
-              const iv = crypto
-                .createHash("sha256")
-                .update(key)
-                .digest()
-                .subarray(0, 16);
-              const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-              const encryptedBuffer = Buffer.concat([
-                cipher.update(fileContent, "utf-8"),
-                cipher.final(),
-              ]);
+            const key = crypto.createHash("sha256").update(secret).digest();
+            const iv = crypto
+              .createHash("sha256")
+              .update(key)
+              .digest()
+              .subarray(0, 16);
+            const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+            const encryptedBuffer = Buffer.concat([
+              cipher.update(fileContent),
+              cipher.final(),
+            ]);
 
-              // Standardize path separator to '/' for ZIP compatibility
-              const zipPath = `${entryRelativePath}.enc`.replace(/\\/g, "/");
-              zip.addFile(zipPath, encryptedBuffer);
-              addedFilesCount++;
-            }
+            const zipPath = `${entryRelativePath}.enc`.replace(/\\/g, "/");
+            zip.addFile(zipPath, encryptedBuffer);
+            addedFilesCount++;
           }
         }
       }
@@ -565,7 +567,10 @@ adminRouter.get("/logs/zip", async (c) => {
     console.error(`[Admin] Failed to zip all logs:`, err);
     return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
   }
-});
+};
+
+adminRouter.get("/logs/download-all", handleAllLogsZip);
+adminRouter.get("/logs/zip", handleAllLogsZip);
 
 function syncGroupWithActiveSessions(groupName: string, deletedGroupUserIds?: string[]) {
   const nowSec = Math.floor(Date.now() / 1000);
@@ -585,7 +590,7 @@ function syncGroupWithActiveSessions(groupName: string, deletedGroupUserIds?: st
       }
 
       const updatedAllowedIds = new Set<string>();
-      for (const gName of session.assignedGroups) {
+      for (const gName of session.assignedGroups || []) {
         const g = studentGroups.get(gName);
         if (g && Array.isArray(g.userIds)) {
           g.userIds.forEach((uid) => updatedAllowedIds.add(uid.toUpperCase()));
