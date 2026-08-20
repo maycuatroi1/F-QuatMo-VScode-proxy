@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { getProxyApiKey } from "../services/proxyKey";
 import { getAdminUsername, getAdminPassword } from "../services/adminCredentials";
 import { redis } from "../services/redis";
-import { sign } from "hono/jwt";
+import { sign, verify } from "hono/jwt";
 import { getJwtSecret } from "../services/jwtKey";
 import AdmZip from "adm-zip";
 import path from "path";
@@ -26,7 +26,7 @@ import {
 const adminRouter = new Hono();
 
 // ─── FLOW ────────────────────────────────────────────────────────────────────
-//  Middleware bảo vệ các API dữ liệu Admin chỉ bằng PROXY_API_KEY
+//  Middleware bảo vệ các API dữ liệu Admin bằng PROXY_API_KEY hoặc Admin JWT Token
 // ─────────────────────────────────────────────────────────────────────────────
 adminRouter.use("*", async (c, next) => {
   const path = c.req.path;
@@ -36,16 +36,32 @@ adminRouter.use("*", async (c, next) => {
     return;
   }
 
-  const authHeader = c.req.header("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return c.json({ error: "Missing or invalid Admin API Key" }, 401);
-  }
-
-  const token = authHeader.substring(7).trim();
   const masterKey = getProxyApiKey();
-  if (token === masterKey) {
+  const xApiKey = c.req.header("x-api-key") || c.req.header("X-API-Key");
+
+  if (xApiKey && xApiKey.trim() === masterKey) {
     await next();
     return;
+  }
+
+  const authHeader = c.req.header("Authorization");
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.substring(7).trim();
+
+    if (token === masterKey) {
+      await next();
+      return;
+    }
+
+    try {
+      const decoded = await verify(token, getJwtSecret());
+      if (decoded && (decoded.role === "admin" || decoded.username)) {
+        await next();
+        return;
+      }
+    } catch {
+      // Invalid JWT
+    }
   }
 
   return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
@@ -120,28 +136,24 @@ adminRouter.get("/students", async (c) => {
 
 adminRouter.post("/sessions", async (c) => {
   const body = await c.req.json();
-  const { durationMinutes, aiOption, aiValidityMinutes, defaultTokenBudget } =
-    body as {
-      durationMinutes?: number;
-      aiOption?: "chatbot" | "agent" | "none";
-      aiValidityMinutes?: number;
-      defaultTokenBudget?: number;
-    };
+  const {
+    durationMinutes,
+    aiOption,
+    aiValidityMinutes,
+    defaultTokenBudget,
+    assignedGroups,
+  } = body as {
+    durationMinutes?: number;
+    aiOption?: "chatbot" | "agent" | "none";
+    aiValidityMinutes?: number;
+    defaultTokenBudget?: number;
+    assignedGroups?: string[];
+  };
 
-  if (
-    !durationMinutes ||
-    !aiOption ||
-    aiValidityMinutes === undefined ||
-    !defaultTokenBudget
-  ) {
-    return c.json(
-      {
-        error:
-          "Missing required fields: durationMinutes, aiOption, aiValidityMinutes, defaultTokenBudget",
-      },
-      400,
-    );
-  }
+  const finalDuration = (durationMinutes && durationMinutes > 0) ? durationMinutes : 1440;
+  const finalAiOption = aiOption || "agent";
+  const finalAiValidity = (aiValidityMinutes && aiValidityMinutes > 0) ? aiValidityMinutes : finalDuration;
+  const finalBudget = defaultTokenBudget || 100000000;
 
   let sessionCode = "";
   do {
@@ -155,14 +167,24 @@ adminRouter.post("/sessions", async (c) => {
     }
   } while (!sessionCode);
 
+  const groupsList = Array.isArray(assignedGroups) ? assignedGroups : [];
+  const allowedStudentIds = new Set<string>();
+  for (const gName of groupsList) {
+    const g = studentGroups.get(gName);
+    if (g && Array.isArray(g.userIds)) {
+      g.userIds.forEach((uid) => allowedStudentIds.add(uid.toUpperCase()));
+    }
+  }
+
   const newSession: Session = {
     sessionCode,
     startTime: Math.floor(Date.now() / 1000),
-    durationMinutes,
-    aiOption,
-    aiValidityMinutes,
-    defaultTokenBudget,
-    allowedStudentIds: new Set<string>(),
+    durationMinutes: finalDuration,
+    aiOption: finalAiOption,
+    aiValidityMinutes: finalAiValidity,
+    defaultTokenBudget: finalBudget,
+    allowedStudentIds,
+    assignedGroups: groupsList,
     createdAt: Date.now(),
   };
 
@@ -170,7 +192,7 @@ adminRouter.post("/sessions", async (c) => {
 
   return c.json({
     success: true,
-    session: { ...newSession, allowedStudentIds: [] },
+    session: { ...newSession, allowedStudentIds: Array.from(allowedStudentIds) },
   });
 });
 
@@ -295,6 +317,10 @@ adminRouter.get("/sessions", async (c) => {
             tokensConsumed: consumed,
             reassigned: state?.reassigned ?? false,
             latestClassification: state?.latestClassification ?? "none",
+            instrumentalCount: state?.instrumentalCount ?? 0,
+            executiveCount: state?.executiveCount ?? 0,
+            mixedCount: state?.mixedCount ?? 0,
+            promptCount: state?.promptCount ?? 0,
           };
         },
       );
@@ -315,6 +341,7 @@ adminRouter.get("/sessions", async (c) => {
   );
 
   const sessionList = await Promise.all(sessionPromises);
+  sessionList.sort((a, b) => (b.createdAt || b.startTime * 1000) - (a.createdAt || a.startTime * 1000));
   return c.json({ success: true, sessions: sessionList });
 });
 
@@ -341,7 +368,6 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
 
   try {
     const zip = new AdmZip();
-    const files = await fs.promises.readdir(sessionLogDir);
     let addedFilesCount = 0;
 
     // Get encryption key from environment or use a secure fallback
@@ -349,29 +375,34 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
       process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
     ).trim();
 
-    for (const file of files) {
-      if (file.endsWith(".json") || file.endsWith(".log")) {
-        const filePath = path.join(sessionLogDir, file);
-        const fileContent = await fs.promises.readFile(filePath, "utf-8");
+    async function addDirectoryFiles(dirPath: string, zipPrefix: string = "") {
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dirPath, entry.name);
+        const relZipPath = zipPrefix ? `${zipPrefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await addDirectoryFiles(fullPath, relZipPath);
+        } else if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
+          const fileContent = await fs.promises.readFile(fullPath, "utf-8");
+          const key = crypto.createHash("sha256").update(secret).digest();
+          const iv = crypto
+            .createHash("sha256")
+            .update(key)
+            .digest()
+            .subarray(0, 16);
+          const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+          const encryptedBuffer = Buffer.concat([
+            cipher.update(fileContent, "utf-8"),
+            cipher.final(),
+          ]);
 
-        // Encrypt log file content using AES-256-CBC
-        const key = crypto.createHash("sha256").update(secret).digest();
-        const iv = crypto
-          .createHash("sha256")
-          .update(key)
-          .digest()
-          .subarray(0, 16);
-        const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-        const encryptedBuffer = Buffer.concat([
-          cipher.update(fileContent, "utf-8"),
-          cipher.final(),
-        ]);
-
-        // Add encrypted buffer as <filename>.enc to ZIP
-        zip.addFile(`${file}.enc`, encryptedBuffer);
-        addedFilesCount++;
+          zip.addFile(`${relZipPath}.enc`, encryptedBuffer);
+          addedFilesCount++;
+        }
       }
     }
+
+    await addDirectoryFiles(sessionLogDir);
 
     if (addedFilesCount === 0) {
       return c.json({ error: `No log files found in session directory.` }, 404);
@@ -536,6 +567,75 @@ adminRouter.get("/logs/zip", async (c) => {
   }
 });
 
+function syncGroupWithActiveSessions(groupName: string, deletedGroupUserIds?: string[]) {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  for (const session of sessions.values()) {
+    const isUnlimited = session.durationMinutes === -1 || session.durationMinutes <= 0;
+    const endSec = session.startTime + session.durationMinutes * 60;
+    const isActive = isUnlimited || nowSec <= endSec;
+
+    if (!isActive) continue;
+
+    const hasAssignedGroup = session.assignedGroups && session.assignedGroups.includes(groupName);
+
+    if (hasAssignedGroup) {
+      if (!studentGroups.has(groupName)) {
+        session.assignedGroups = (session.assignedGroups || []).filter((g) => g !== groupName);
+      }
+
+      const updatedAllowedIds = new Set<string>();
+      for (const gName of session.assignedGroups) {
+        const g = studentGroups.get(gName);
+        if (g && Array.isArray(g.userIds)) {
+          g.userIds.forEach((uid) => updatedAllowedIds.add(uid.toUpperCase()));
+        }
+      }
+
+      const oldAllowed = new Set(session.allowedStudentIds);
+      session.allowedStudentIds = updatedAllowedIds;
+
+      for (const newId of updatedAllowedIds) {
+        if (!oldAllowed.has(newId)) {
+          const stateKey = `${session.sessionCode}:${newId}`;
+          if (!sessionStates.has(stateKey)) {
+            sessionStates.set(stateKey, {
+              sessionCode: session.sessionCode,
+              studentId: newId,
+              hasLoggedIn: false,
+              loginTimestamp: 0,
+              tokensConsumed: 0,
+              reassigned: false,
+            });
+          }
+        }
+      }
+
+      for (const oldId of oldAllowed) {
+        if (!updatedAllowedIds.has(oldId)) {
+          const stateKey = `${session.sessionCode}:${oldId}`;
+          sessionStates.delete(stateKey);
+        }
+      }
+
+      sessions.set(session.sessionCode, session);
+    } else if (deletedGroupUserIds && deletedGroupUserIds.length > 0) {
+      const deletedSet = new Set(deletedGroupUserIds.map((id) => id.toUpperCase()));
+      let changed = false;
+      for (const studentId of deletedSet) {
+        if (session.allowedStudentIds.has(studentId)) {
+          session.allowedStudentIds.delete(studentId);
+          sessionStates.delete(`${session.sessionCode}:${studentId}`);
+          changed = true;
+        }
+      }
+      if (changed) {
+        sessions.set(session.sessionCode, session);
+      }
+    }
+  }
+}
+
 adminRouter.get("/groups", async (c) => {
   const groupsList = Array.from(studentGroups.values());
   return c.json({ success: true, groups: groupsList });
@@ -559,18 +659,93 @@ adminRouter.post("/groups", async (c) => {
     userIds: members,
   });
 
+  syncGroupWithActiveSessions(groupName);
+
   return c.json({ success: true, message: `Group '${groupName}' saved.` });
 });
 
-adminRouter.delete("/groups/:name", async (c) => {
-  const groupName = c.req.param("name").trim();
-  const existed = studentGroups.delete(groupName);
+adminRouter.post("/groups/:name/students", async (c) => {
+  const groupName = decodeURIComponent(c.req.param("name")).trim();
+  const existingGroup = studentGroups.get(groupName);
 
-  if (!existed) {
+  if (!existingGroup) {
     return c.json({ error: `Group '${groupName}' not found.` }, 404);
   }
 
-  return c.json({ success: true, message: `Group '${groupName}' deleted.` });
+  const body = await c.req.json();
+  const { studentIds } = body as { studentIds?: string[] };
+
+  if (!studentIds || !Array.isArray(studentIds)) {
+    return c.json({ error: "Invalid payload. 'studentIds' array is required." }, 400);
+  }
+
+  const currentMembers = new Set(existingGroup.userIds || []);
+  let addedCount = 0;
+  for (const rawId of studentIds) {
+    const id = rawId.toUpperCase();
+    if (!currentMembers.has(id)) {
+      currentMembers.add(id);
+      addedCount++;
+    }
+  }
+
+  existingGroup.userIds = Array.from(currentMembers);
+  studentGroups.set(groupName, existingGroup);
+
+  syncGroupWithActiveSessions(groupName);
+
+  return c.json({
+    success: true,
+    message: `Added ${addedCount} student(s) to group '${groupName}'.`,
+    group: existingGroup,
+  });
+});
+
+adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
+  const groupName = decodeURIComponent(c.req.param("name")).trim();
+  const studentId = c.req.param("studentId").toUpperCase();
+  const existingGroup = studentGroups.get(groupName);
+
+  if (!existingGroup) {
+    return c.json({ error: `Group '${groupName}' not found.` }, 404);
+  }
+
+  const originalCount = existingGroup.userIds?.length || 0;
+  existingGroup.userIds = (existingGroup.userIds || []).filter(
+    (id) => id.toUpperCase() !== studentId,
+  );
+
+  const removed = originalCount !== existingGroup.userIds.length;
+  studentGroups.set(groupName, existingGroup);
+
+  syncGroupWithActiveSessions(groupName);
+
+  return c.json({
+    success: true,
+    message: removed
+      ? `Removed student ${studentId} from group '${groupName}'.`
+      : `Student ${studentId} was not in group '${groupName}'.`,
+    group: existingGroup,
+  });
+});
+
+adminRouter.delete("/groups/:name", async (c) => {
+  const groupName = decodeURIComponent(c.req.param("name")).trim();
+  const existingGroup = studentGroups.get(groupName);
+
+  if (!existingGroup) {
+    return c.json({ error: `Group '${groupName}' not found.` }, 404);
+  }
+
+  const deletedUserIds = [...(existingGroup.userIds || [])];
+  studentGroups.delete(groupName);
+
+  syncGroupWithActiveSessions(groupName, deletedUserIds);
+
+  return c.json({
+    success: true,
+    message: `Group '${groupName}' deleted and removed from all active sessions.`,
+  });
 });
 
 export { adminRouter };

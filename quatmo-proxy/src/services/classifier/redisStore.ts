@@ -144,6 +144,14 @@ export const redisStore = {
     }
   },
 
+  async setCachedClassification(
+    token: string,
+    label: string,
+    confidence: number,
+  ): Promise<void> {
+    return this.cacheClassification(token, label, confidence);
+  },
+
   async getCachedClassification(
     token: string,
   ): Promise<{ label: string; confidence: number } | null> {

@@ -15,6 +15,7 @@ export interface Session {
   aiValidityMinutes: number;
   defaultTokenBudget: number;
   allowedStudentIds: Set<string>;
+  assignedGroups?: string[];
   createdAt: number;
 }
 
@@ -26,6 +27,10 @@ export interface StudentSessionState {
   tokensConsumed: number;
   reassigned: boolean;
   latestClassification?: string;
+  instrumentalCount?: number;
+  executiveCount?: number;
+  mixedCount?: number;
+  promptCount?: number;
 }
 
 export interface Group {
@@ -56,9 +61,16 @@ db.run(`
     ai_validity_minutes INTEGER NOT NULL,
     default_token_budget INTEGER NOT NULL,
     allowed_student_ids TEXT NOT NULL, -- JSON array
+    assigned_groups TEXT, -- JSON array
     created_at INTEGER NOT NULL
   )
 `);
+
+try {
+  db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT");
+} catch (e) {
+  // Ignore if column already exists
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS session_states (
@@ -96,8 +108,8 @@ const stmtDeleteStudent = db.prepare(`
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, created_at)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $created)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -148,6 +160,7 @@ export class PersistedSessions extends Map<string, Session> {
       $ai_val: value.aiValidityMinutes,
       $budget: value.defaultTokenBudget,
       $students: JSON.stringify(Array.from(value.allowedStudentIds)),
+      $groups: JSON.stringify(value.assignedGroups || []),
       $created: value.createdAt,
     });
     return this;
@@ -222,6 +235,12 @@ try {
 
   const rowsSessions = db.query("SELECT * FROM sessions").all() as any[];
   for (const r of rowsSessions) {
+    let assignedGroups: string[] = [];
+    try {
+      if (r.assigned_groups) assignedGroups = JSON.parse(r.assigned_groups);
+    } catch {
+      assignedGroups = [];
+    }
     Map.prototype.set.call(sessions, r.session_code, {
       sessionCode: r.session_code,
       startTime: r.start_time,
@@ -230,6 +249,7 @@ try {
       aiValidityMinutes: r.ai_validity_minutes,
       defaultTokenBudget: r.default_token_budget,
       allowedStudentIds: new Set(JSON.parse(r.allowed_student_ids)),
+      assignedGroups,
       createdAt: r.created_at,
     });
   }

@@ -39,17 +39,34 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
 
       const now = Math.floor(Date.now() / 1000);
 
-      if (now > payload.sessionEndTime) {
+      // Support global user tokens (persistent account login without active session)
+      if (payload.type === "user" || (!payload.sessionCode && (payload.studentId || payload.userId))) {
+        const uid = payload.studentId || payload.userId || "user";
+        const userSession: UserSession = {
+          keyId: `user-${uid}`,
+          userId: uid,
+          monthlyTokenLimit: 999_999_999,
+          tokensConsumed: 0,
+        };
+        c.set("authMode", "normal");
+        c.set("user", userSession);
+        c.set("token", token);
+        return await next();
+      }
+
+      if (payload.sessionEndTime && now > payload.sessionEndTime) {
         return c.json(
           { error: "Session đã kết thúc. Quyền truy cập AI đã bị khóa." },
           403,
         );
       }
 
-      // isTokenAIHasTime
-      const aiExpirationTime = payload.aiValidityMinutes === -1
-        ? payload.loginTime + 24 * 60 * 60
-        : payload.loginTime + payload.aiValidityMinutes * 60;
+      // isTokenAIHasTime - default to 24h (1440 mins) if aiValidityMinutes is missing, 0, or <= 0
+      const validityMins =
+        payload.aiValidityMinutes && payload.aiValidityMinutes > 0
+          ? payload.aiValidityMinutes
+          : 1440; // 24 hours
+      const aiExpirationTime = payload.loginTime + validityMins * 60;
       if (now > aiExpirationTime) {
         return c.json(
           {
