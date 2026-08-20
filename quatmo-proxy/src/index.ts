@@ -35,6 +35,8 @@ app.use(
       "X-API-Key",
       "x-proxy-key",
       "X-Proxy-Key",
+      "x-quatmo-mode",
+      "X-Quatmo-Mode",
       "*",
     ],
     exposeHeaders: ["*"],
@@ -44,10 +46,11 @@ app.use(
 
 // Global OPTIONS preflight handler to guarantee zero preflight failures across all routes
 app.options("*", (c) => {
-  return c.text("", 204);
+  return c.body(null, 204);
 });
 
 // Route mappings
+app.route("/chat", chatRouter);
 app.route("/v1/chat", chatRouter);
 app.route("/admin", adminRouter);
 app.route("/v1/admin", adminRouter);
@@ -56,11 +59,14 @@ app.route("/v1/session", sessionAuthRouter);
 app.route("/auth", authRouter);
 app.route("/v1/auth", authRouter);
 
-app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
+const modelsHandler = (c: any) => {
   return c.json({
     data: [{ id: "gemma4-26b" }],
   });
-});
+};
+
+app.get("/models", unifiedAuthMiddleware(), modelsHandler);
+app.get("/v1/models", unifiedAuthMiddleware(), modelsHandler);
 
 // Health check endpoint
 app.get("/health", (c) =>

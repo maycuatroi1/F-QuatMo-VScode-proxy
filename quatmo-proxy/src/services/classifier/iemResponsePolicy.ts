@@ -1,4 +1,6 @@
 import type { IemLabel } from "./currentPromptClassifier";
+import fs from "fs";
+import path from "path";
 
 export interface IemPolicyViolation {
   code: "IEM_CODE_LIMIT" | "IEM_PATCH_BLOCKED" | "IEM_TOOL_BLOCKED";
