@@ -185,6 +185,14 @@ try { db.run("ALTER TABLE student_groups ADD COLUMN created_by TEXT DEFAULT 'adm
 try { db.run("ALTER TABLE student_groups ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_groups ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
 
+// High-volume performance indexes
+try { db.run("CREATE INDEX IF NOT EXISTS idx_sessions_created_by ON sessions(created_by)"); } catch (e) {}
+try { db.run("CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)"); } catch (e) {}
+try { db.run("CREATE INDEX IF NOT EXISTS idx_student_accounts_created_by ON student_accounts(created_by)"); } catch (e) {}
+try { db.run("CREATE INDEX IF NOT EXISTS idx_student_groups_created_by ON student_groups(created_by)"); } catch (e) {}
+try { db.run("CREATE INDEX IF NOT EXISTS idx_session_states_code ON session_states(session_code)"); } catch (e) {}
+try { db.run("CREATE INDEX IF NOT EXISTS idx_session_states_student ON session_states(student_id)"); } catch (e) {}
+
 const stmtSaveLecturer = db.prepare(`
   INSERT OR REPLACE INTO lecturer_accounts (username, name, password_hash, status, created_at, created_by, updated_at, updated_by)
   VALUES ($username, $name, $hash, $status, $created_at, $created_by, $updated_at, $updated_by)
