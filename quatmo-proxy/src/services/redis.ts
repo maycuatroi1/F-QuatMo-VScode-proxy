@@ -28,6 +28,12 @@ try {
 
   redis.on("connect", () => {
     console.log("[Redis] Connected successfully to Redis server.");
+    // Synchronize active SQLite sessions into Redis RAM cache upon connection or reconnection.
+    import("./sessionStore").then(({ syncAllDataToRedis }) => {
+      syncAllDataToRedis().catch((err) =>
+        console.error("[Redis] Re-hydration on connect failed:", err),
+      );
+    });
   });
 } catch (e) {
   console.warn(

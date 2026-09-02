@@ -15,6 +15,7 @@ export interface Session {
   aiValidityMinutes: number;
   defaultTokenBudget: number;
   allowedStudentIds: Set<string>;
+  assignedGroups?: string[];
   createdAt: number;
 }
 
@@ -60,9 +61,16 @@ db.run(`
     ai_validity_minutes INTEGER NOT NULL,
     default_token_budget INTEGER NOT NULL,
     allowed_student_ids TEXT NOT NULL, -- JSON array
+    assigned_groups TEXT, -- JSON array
     created_at INTEGER NOT NULL
   )
 `);
+
+try {
+  db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT");
+} catch (e) {
+  // Ignore if column already exists
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS session_states (
@@ -100,8 +108,8 @@ const stmtDeleteStudent = db.prepare(`
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, created_at)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $created)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -152,6 +160,7 @@ export class PersistedSessions extends Map<string, Session> {
       $ai_val: value.aiValidityMinutes,
       $budget: value.defaultTokenBudget,
       $students: JSON.stringify(Array.from(value.allowedStudentIds)),
+      $groups: JSON.stringify(value.assignedGroups || []),
       $created: value.createdAt,
     });
     return this;
@@ -226,6 +235,12 @@ try {
 
   const rowsSessions = db.query("SELECT * FROM sessions").all() as any[];
   for (const r of rowsSessions) {
+    let parsedGroups: string[] = [];
+    try {
+      if (r.assigned_groups) parsedGroups = JSON.parse(r.assigned_groups);
+    } catch {
+      parsedGroups = [];
+    }
     Map.prototype.set.call(sessions, r.session_code, {
       sessionCode: r.session_code,
       startTime: r.start_time,
@@ -234,6 +249,7 @@ try {
       aiValidityMinutes: r.ai_validity_minutes,
       defaultTokenBudget: r.default_token_budget,
       allowedStudentIds: new Set(JSON.parse(r.allowed_student_ids)),
+      assignedGroups: parsedGroups,
       createdAt: r.created_at,
     });
   }
@@ -280,3 +296,51 @@ try {
 } catch (err) {
   console.error("[Db] Error loading from SQLite database:", err);
 }
+
+// Re-populate RAM cache from SQLite after server restart or Redis flush.
+// Ensures active student exam sessions retain token limits and authentication state without forcing re-login.
+export async function syncAllDataToRedis() {
+  const { redis } = await import("./redis");
+  if (!redis || redis.status !== "ready") {
+    console.log("[Db] Redis is not ready yet. Skipping Redis auto-hydration.");
+    return;
+  }
+
+  let hydratedCount = 0;
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  try {
+    for (const session of sessions.values()) {
+      const startSec = session.startTime || Math.floor((session.createdAt || Date.now()) / 1000);
+      const durationSec = session.durationMinutes === -1 ? 86400 * 30 : (session.durationMinutes || 60) * 60;
+      const endSec = startSec + durationSec;
+
+      if (nowSec >= endSec) continue;
+
+      const remainingSec = Math.max(60, endSec - nowSec);
+
+      for (const state of sessionStates.values()) {
+        if (state.sessionCode !== session.sessionCode) continue;
+        if (!state.hasLoggedIn || state.reassigned) continue;
+
+        const redisKey = `session:user:${session.sessionCode}:${state.studentId}`;
+        await redis.hset(redisKey, {
+          studentId: state.studentId,
+          sessionCode: session.sessionCode,
+          hasLoggedIn: "true",
+          tokensConsumed: String(state.tokensConsumed || 0),
+          budget: String(session.defaultTokenBudget || 100000000),
+          latestClassification: state.latestClassification || "none",
+        });
+        await redis.expire(redisKey, remainingSec);
+        hydratedCount++;
+      }
+    }
+    console.log(
+      `[Db] Redis auto-hydration complete. Hydrated ${hydratedCount} active student sessions into Redis.`,
+    );
+  } catch (err: any) {
+    console.error("[Db] Error during Redis auto-hydration:", err?.message || err);
+  }
+}
+

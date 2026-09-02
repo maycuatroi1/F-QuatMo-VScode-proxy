@@ -27,7 +27,7 @@ authRouter.post("/login", async (c) => {
   const account = studentAccounts.get(studentId);
   if (!account) {
     return c.json(
-      { error: "Tài khoản sinh viên không tồn tại trên hệ thống." },
+      { error: "Student account does not exist." },
       403,
     );
   }
@@ -37,7 +37,7 @@ authRouter.post("/login", async (c) => {
     account.passwordHash,
   );
   if (!isPasswordValid) {
-    return c.json({ error: "Mật khẩu không chính xác." }, 403);
+    return c.json({ error: "Incorrect password." }, 403);
   }
 
   const jwtSecret = getJwtSecret();
@@ -75,16 +75,16 @@ authRouter.get("/me", async (c) => {
   try {
     payload = await verify(token, jwtSecret, "HS256" as any);
   } catch {
-    return c.json({ error: "Token không hợp lệ hoặc đã hết hạn." }, 401);
+    return c.json({ error: "Invalid or expired token." }, 401);
   }
 
   if (payload.type !== "user") {
-    return c.json({ error: "Token không phải user token." }, 401);
+    return c.json({ error: "Token is not a valid user token." }, 401);
   }
 
   const account = studentAccounts.get(payload.studentId);
   if (!account) {
-    return c.json({ error: "Tài khoản không còn tồn tại." }, 404);
+    return c.json({ error: "Account no longer exists." }, 404);
   }
 
   return c.json({

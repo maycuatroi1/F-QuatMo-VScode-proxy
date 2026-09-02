@@ -305,7 +305,7 @@ function getUpstreamConfig(
     process.env.CUSTOM_MODEL_NAME || "gemma-4"
   ).trim();
 
-  // Luôn trả về cấu hình của Quạt Mo LLM
+  // Always return Quat Mo LLM configuration
   return {
     url: customUrl,
     key: customKey,
@@ -930,7 +930,7 @@ chatRouter.post(
 
       if (currentAiOption === "none") {
         return c.json(
-          { error: "Tính năng AI bị vô hiệu hóa trong session này." },
+          { error: "AI features are disabled in this session." },
           403,
         );
       }
@@ -939,7 +939,7 @@ chatRouter.post(
           return c.json(
             {
               error:
-                "Chỉ được phép sử dụng Chatbot cơ bản, tính năng Agent đã bị vô hiệu hóa.",
+                "Only basic Chatbot features are allowed; Agent tools are disabled in this session.",
             },
             403,
           );

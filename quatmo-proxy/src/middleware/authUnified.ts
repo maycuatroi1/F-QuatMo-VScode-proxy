@@ -8,10 +8,10 @@ import {
 } from "./auth";
 
 // ─── FLOW ────────────────────────────────────────────────────────────────────
-//  Middleware hợp nhất tự động định tuyến các request xác thực:
-//  - Chế độ session (JWT): Xác thực JWT, kiểm tra thời gian hết hạn session,
-//    kiểm tra thời hạn AI dựa trên giờ login của SV và kiểm tra budget từ Redis.
-//  - Chế độ thường (API Key): Chuyển tiếp cho authMiddleware cũ.
+//  Unified authentication middleware routing requests:
+//  - Session mode (JWT): Validates JWT signature, session expiration,
+//    per-student AI validity limits, and token budgets from Redis/SQLite cache.
+//  - Standard mode (API Key): Delegates to legacy API key auth middleware.
 // ─────────────────────────────────────────────────────────────────────────────
 export const unifiedAuthMiddleware = (): MiddlewareHandler => {
   return async (c, next) => {
@@ -31,7 +31,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
       } catch (err) {
         return c.json(
           {
-            error: "Token session không hợp lệ hoặc đã hết thời gian sử dụng.",
+            error: "Invalid or expired session token.",
           },
           403,
         );
@@ -56,7 +56,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
 
       if (payload.sessionEndTime && now > payload.sessionEndTime) {
         return c.json(
-          { error: "Session đã kết thúc. Quyền truy cập AI đã bị khóa." },
+          { error: "Session has ended. AI access is locked." },
           403,
         );
       }
@@ -69,7 +69,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         return c.json(
           {
             error:
-              "Đã hết thời gian sử dụng AI được phép của bạn trong session này.",
+              "Your allowed AI access duration for this session has expired.",
           },
           403,
         );
@@ -83,23 +83,51 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
       if (redis && redis.status === "ready") {
         try {
           const sessionData = await redis.hgetall(sessionKey);
-          if (!sessionData || Object.keys(sessionData).length === 0) {
-            return c.json(
-              {
-                error:
-                  "Phiên làm việc không tồn tại hoặc đã bị quản trị viên reset.",
-              },
-              403,
-            );
+          if (sessionData && Object.keys(sessionData).length > 0) {
+            budget = parseInt(sessionData.budget || "0", 10);
+            consumed = parseInt(sessionData.consumed || "0", 10);
+          } else {
+            // RAM cache miss after Redis restart or flush.
+            // Verify JWT against SQLite persistent state and lazily re-hydrate Redis key to prevent session disruption.
+            const { sessionStates, sessions } = await import("../services/sessionStore");
+            const stateKey = `${payload.sessionCode}:${payload.studentId}`;
+            const state = sessionStates.get(stateKey);
+            const sessionObj = sessions.get(payload.sessionCode);
+
+            if (!state || !sessionObj || !state.hasLoggedIn || state.reassigned) {
+              return c.json(
+                {
+                  error:
+                    "Session does not exist or has been reset by administrator.",
+                },
+                403,
+              );
+            }
+
+            budget = sessionObj.defaultTokenBudget;
+            consumed = state.tokensConsumed;
+
+            try {
+              const remainingSec = Math.max(60, (payload.sessionEndTime || (now + 3600)) - now);
+              await redis.hset(sessionKey, {
+                studentId: payload.studentId,
+                sessionCode: payload.sessionCode,
+                hasLoggedIn: "true",
+                tokensConsumed: String(consumed),
+                budget: String(budget),
+                latestClassification: state.latestClassification || "none",
+              });
+              await redis.expire(sessionKey, remainingSec);
+            } catch (healErr) {
+              console.error(`[AuthUnified] Auto-heal Redis error for ${sessionKey}:`, healErr);
+            }
           }
-          budget = parseInt(sessionData.budget || "0", 10);
-          consumed = parseInt(sessionData.consumed || "0", 10);
         } catch (err) {
           console.error(
             `[AuthUnified] Redis session fetch error for ${sessionKey}:`,
             err,
           );
-          return c.json({ error: "Lỗi kết nối cơ sở dữ liệu session." }, 500);
+          return c.json({ error: "Session database connection error." }, 500);
         }
       } else {
         const { sessionStates, sessions } =
@@ -108,7 +136,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         const state = sessionStates.get(stateKey);
         const sessionObj = sessions.get(payload.sessionCode);
         if (!state || !sessionObj) {
-          return c.json({ error: "Không tìm thấy thông tin session." }, 403);
+          return c.json({ error: "Session information not found." }, 403);
         }
         budget = sessionObj.defaultTokenBudget;
         consumed = state.tokensConsumed;
@@ -118,7 +146,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         return c.json(
           {
             error:
-              "Tài khoản của bạn đã vượt quá giới hạn token được cấp cho session này.",
+              "Your account has exceeded the token budget for this session.",
           },
           402,
         );

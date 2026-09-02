@@ -31,20 +31,20 @@ sessionAuthRouter.get("/status", async (c) => {
   try {
     payload = await verify(token, jwtSecret, "HS256" as any);
   } catch (err) {
-    return c.json({ error: "Token không hợp lệ hoặc đã hết hạn" }, 401);
+    return c.json({ error: "Invalid or expired token." }, 401);
   }
 
   const { studentId, sessionCode } = payload;
   const session = sessions.get(sessionCode);
   if (!session) {
-    return c.json({ error: "Session không tồn tại." }, 404);
+    return c.json({ error: "Session does not exist." }, 404);
   }
 
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
   if (!state) {
     return c.json(
-      { error: "Không tìm thấy thông tin trạng thái học viên." },
+      { error: "Student session state not found." },
       404,
     );
   }
@@ -140,7 +140,7 @@ sessionAuthRouter.post("/login", async (c) => {
 
   const session = sessions.get(sessionCode);
   if (!session) {
-    return c.json({ error: "Session không tồn tại." }, 404);
+    return c.json({ error: "Session does not exist." }, 404);
   }
 
   const stateKey = `${sessionCode}:${studentId}`;
