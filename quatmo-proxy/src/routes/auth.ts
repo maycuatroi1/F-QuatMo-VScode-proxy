@@ -1,7 +1,17 @@
 import { Hono } from "hono";
 import { sign, verify } from "hono/jwt";
 import { getJwtSecret } from "../services/jwtKey";
-import { studentAccounts } from "../services/sessionStore";
+import {
+  studentAccounts,
+  getStudentAccount,
+  findValidStudentAccount,
+} from "../services/sessionStore";
+import {
+  checkLockout,
+  recordFailedAttempt,
+  recordSuccessfulLogin,
+} from "../services/rateLimiter";
+import { getClientIP } from "./admin";
 
 declare const Bun: any;
 
@@ -23,22 +33,57 @@ authRouter.post("/login", async (c) => {
   }
 
   const studentId = rawStudentId.trim().toUpperCase();
+  const ip = getClientIP(c);
 
-  const account = studentAccounts.get(studentId);
-  if (!account) {
+  const lockout = await checkLockout(ip, studentId);
+  if (lockout.isLocked) {
+    c.header("Retry-After", String(lockout.remainingSeconds));
+    c.header("X-RateLimit-Reset", String(lockout.lockedUntil));
     return c.json(
-      { error: "Student account does not exist." },
-      403,
+      {
+        error: `Too many failed login attempts. Account/IP temporarily locked for security.`,
+        retryAfterSeconds: lockout.remainingSeconds,
+        lockedUntil: lockout.lockedUntil,
+        reason: lockout.reason,
+      },
+      429
     );
   }
 
-  const isPasswordValid = await Bun.password.verify(
-    password,
-    account.passwordHash,
-  );
-  if (!isPasswordValid) {
-    return c.json({ error: "Incorrect password." }, 403);
+  const validAccount = await findValidStudentAccount(studentId, password);
+
+  if (!validAccount) {
+    const hasAnyAccount = Array.from(studentAccounts.values()).some(
+      (a) => a.studentId.toUpperCase() === studentId,
+    );
+    if (hasAnyAccount) {
+      const result = await recordFailedAttempt(ip, studentId);
+      if (result.isNowLocked && result.lockoutInfo) {
+        c.header("Retry-After", String(result.lockoutInfo.remainingSeconds));
+        c.header("X-RateLimit-Reset", String(result.lockoutInfo.lockedUntil));
+        return c.json(
+          {
+            error: `Too many failed login attempts. Account/IP temporarily locked for 15 minutes.`,
+            retryAfterSeconds: result.lockoutInfo.remainingSeconds,
+            lockedUntil: result.lockoutInfo.lockedUntil,
+            reason: result.lockoutInfo.reason,
+          },
+          429
+        );
+      }
+      return c.json(
+        {
+          error: `Incorrect password. (Failed attempts: ${result.attemptsCount}/5)`,
+          failedAttempts: result.attemptsCount,
+          remainingAttempts: Math.max(0, 5 - result.attemptsCount),
+        },
+        403
+      );
+    }
+    return c.json({ error: "Student account does not exist." }, 403);
   }
+
+  await recordSuccessfulLogin(ip, studentId);
 
   const jwtSecret = getJwtSecret();
   const now = Math.floor(Date.now() / 1000);
@@ -46,18 +91,19 @@ authRouter.post("/login", async (c) => {
   // User token: valid for 7 days (persistent login)
   const exp = now + 7 * 24 * 60 * 60;
   const payload = {
-    studentId,
+    studentId: validAccount.studentId,
+    createdBy: validAccount.createdBy || "admin",
     type: "user",
     iat: now,
     exp,
   };
 
-  const token = await sign(payload, jwtSecret);
+  const token = await sign(payload, jwtSecret, "HS256" as any);
 
   return c.json({
     success: true,
     token,
-    studentId,
+    studentId: validAccount.studentId,
   });
 });
 
@@ -82,14 +128,14 @@ authRouter.get("/me", async (c) => {
     return c.json({ error: "Token is not a valid user token." }, 401);
   }
 
-  const account = studentAccounts.get(payload.studentId);
+  const account = getStudentAccount(payload.studentId);
   if (!account) {
     return c.json({ error: "Account no longer exists." }, 404);
   }
 
   return c.json({
     success: true,
-    studentId: payload.studentId,
+    studentId: account.studentId,
   });
 });
 

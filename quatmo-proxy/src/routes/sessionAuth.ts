@@ -11,7 +11,14 @@ import {
   sessions,
   sessionStates,
   type StudentSessionState,
+  verifyPasswordSafely,
 } from "../services/sessionStore";
+import {
+  checkLockout,
+  recordFailedAttempt,
+  recordSuccessfulLogin,
+} from "../services/rateLimiter";
+import { getClientIP } from "./admin";
 
 function sanitizeFilename(str: string): string {
   return str.replace(/[^a-zA-Z0-9_\-]/g, "_");
@@ -109,6 +116,7 @@ sessionAuthRouter.post("/login", async (c) => {
 
   const authHeader = c.req.header("Authorization");
   let bearerStudentId: string | undefined;
+  let bearerCreatedBy: string | undefined;
 
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7).trim();
@@ -116,6 +124,7 @@ sessionAuthRouter.post("/login", async (c) => {
       const payload: any = await verify(token, getJwtSecret(), "HS256" as any);
       if (payload && payload.studentId) {
         bearerStudentId = payload.studentId;
+        bearerCreatedBy = payload.createdBy;
       }
     } catch {
       // Invalid Bearer token
@@ -135,6 +144,23 @@ sessionAuthRouter.post("/login", async (c) => {
     return c.json(
       { error: "Missing Student ID. Please log in with your FPT Student Account first." },
       400,
+    );
+  }
+
+  const ip = getClientIP(c);
+
+  const lockout = await checkLockout(ip, studentId);
+  if (lockout.isLocked) {
+    c.header("Retry-After", String(lockout.remainingSeconds));
+    c.header("X-RateLimit-Reset", String(lockout.lockedUntil));
+    return c.json(
+      {
+        error: `Too many failed login attempts. Account/IP temporarily locked for security.`,
+        retryAfterSeconds: lockout.remainingSeconds,
+        lockedUntil: lockout.lockedUntil,
+        reason: lockout.reason,
+      },
+      429
     );
   }
 
@@ -161,26 +187,60 @@ sessionAuthRouter.post("/login", async (c) => {
     sessions.set(sessionCode, session);
   }
 
-  const account = studentAccounts.get(studentId);
+  const sessionCreator = (session.createdBy || "admin").toLowerCase();
+  const mapKey = `${studentId}:${sessionCreator}`;
+  const account = studentAccounts.get(mapKey);
+
   if (!account) {
     return c.json(
-      { error: "Your student account does not exist on the system." },
+      { error: `Your student account does not exist under instructor @${session.createdBy || "admin"}.` },
       403,
     );
   }
 
-  if (!bearerStudentId) {
+  const bearerMatches =
+    bearerStudentId &&
+    bearerCreatedBy &&
+    bearerCreatedBy.toLowerCase() === sessionCreator;
+
+  if (!bearerMatches) {
     if (!password) {
-      return c.json({ error: "Missing required fields: password" }, 400);
+      return c.json(
+        { error: `This session was created by instructor @${session.createdBy || "admin"}. Please log in with the password provided by @${session.createdBy || "admin"}.` },
+        403,
+      );
     }
-    const isPasswordValid = await Bun.password.verify(
+    const isPasswordValid = await verifyPasswordSafely(
       password,
       account.passwordHash,
     );
     if (!isPasswordValid) {
-      return c.json({ error: "Password is incorrect." }, 403);
+      const result = await recordFailedAttempt(ip, studentId);
+      if (result.isNowLocked && result.lockoutInfo) {
+        c.header("Retry-After", String(result.lockoutInfo.remainingSeconds));
+        c.header("X-RateLimit-Reset", String(result.lockoutInfo.lockedUntil));
+        return c.json(
+          {
+            error: `Too many failed login attempts. Account/IP temporarily locked for 15 minutes.`,
+            retryAfterSeconds: result.lockoutInfo.remainingSeconds,
+            lockedUntil: result.lockoutInfo.lockedUntil,
+            reason: result.lockoutInfo.reason,
+          },
+          429
+        );
+      }
+      return c.json(
+        {
+          error: `Password is incorrect. (Failed attempts: ${result.attemptsCount}/5)`,
+          failedAttempts: result.attemptsCount,
+          remainingAttempts: Math.max(0, 5 - result.attemptsCount),
+        },
+        403
+      );
     }
   }
+
+  await recordSuccessfulLogin(ip, studentId);
 
   const now = Math.floor(Date.now() / 1000);
   const sessionEndTime =

@@ -36,7 +36,6 @@ app.use(
       "X-API-Key",
       "x-proxy-key",
       "X-Proxy-Key",
-      "bypass-tunnel-reminder",
       "*",
     ],
     exposeHeaders: ["*"],

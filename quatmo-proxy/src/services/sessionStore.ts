@@ -2,9 +2,24 @@ import { Database } from "bun:sqlite";
 import path from "path";
 import fs from "fs";
 
+export interface LecturerAccount {
+  username: string;
+  name: string;
+  passwordHash: string;
+  status: "active" | "inactive";
+  createdAt: number;
+  createdBy: string;
+  updatedAt: number;
+  updatedBy: string;
+}
+
 export interface StudentAccount {
   studentId: string;
   passwordHash: string;
+  createdAt?: number;
+  createdBy?: string;
+  updatedAt?: number;
+  updatedBy?: string;
 }
 
 export interface Session {
@@ -17,6 +32,9 @@ export interface Session {
   allowedStudentIds: Set<string>;
   assignedGroups?: string[];
   createdAt: number;
+  createdBy?: string;
+  updatedAt?: number;
+  updatedBy?: string;
 }
 
 export interface StudentSessionState {
@@ -36,6 +54,10 @@ export interface StudentSessionState {
 export interface Group {
   name: string;
   userIds: string[];
+  createdAt?: number;
+  createdBy?: string;
+  updatedAt?: number;
+  updatedBy?: string;
 }
 
 const logsDir = path.resolve(process.cwd(), "logs");
@@ -46,11 +68,54 @@ const dbPath = path.join(logsDir, "quatmo.db");
 const db = new Database(dbPath);
 
 db.run(`
-  CREATE TABLE IF NOT EXISTS student_accounts (
-    student_id TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL
+  CREATE TABLE IF NOT EXISTS lecturer_accounts (
+    username TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at INTEGER NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'admin',
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT 'admin'
   )
 `);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS student_accounts (
+    student_id TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'admin',
+    password_hash TEXT NOT NULL,
+    created_at INTEGER,
+    updated_at INTEGER,
+    updated_by TEXT DEFAULT 'admin',
+    PRIMARY KEY (student_id, created_by)
+  )
+`);
+
+// Safe SQLite migration to composite PRIMARY KEY (student_id, created_by)
+try {
+  const tableInfo = db.query("PRAGMA table_info(student_accounts)").all() as any[];
+  const pkColumns = tableInfo.filter((col) => col.pk > 0);
+  if (pkColumns.length === 1 && pkColumns[0].name === "student_id") {
+    console.log("[Db] Migrating student_accounts table to composite PRIMARY KEY (student_id, created_by)...");
+    db.run(`CREATE TABLE IF NOT EXISTS student_accounts_new (
+      student_id TEXT NOT NULL,
+      created_by TEXT NOT NULL DEFAULT 'admin',
+      password_hash TEXT NOT NULL,
+      created_at INTEGER,
+      updated_at INTEGER,
+      updated_by TEXT DEFAULT 'admin',
+      PRIMARY KEY (student_id, created_by)
+    )`);
+    db.run(`INSERT OR IGNORE INTO student_accounts_new (student_id, created_by, password_hash, created_at, updated_at, updated_by)
+      SELECT student_id, COALESCE(created_by, 'admin'), password_hash, created_at, updated_at, COALESCE(updated_by, 'admin') FROM student_accounts`);
+    db.run(`DROP TABLE student_accounts`);
+    db.run(`ALTER TABLE student_accounts_new RENAME TO student_accounts`);
+    console.log("[Db] Migration of student_accounts to composite key completed successfully.");
+  }
+} catch (err) {
+  console.error("[Db] Error during student_accounts migration:", err);
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -60,17 +125,19 @@ db.run(`
     ai_option TEXT NOT NULL,
     ai_validity_minutes INTEGER NOT NULL,
     default_token_budget INTEGER NOT NULL,
-    allowed_student_ids TEXT NOT NULL, -- JSON array
-    assigned_groups TEXT, -- JSON array
-    created_at INTEGER NOT NULL
+    allowed_student_ids TEXT NOT NULL,
+    assigned_groups TEXT,
+    created_at INTEGER NOT NULL,
+    created_by TEXT DEFAULT 'admin',
+    updated_at INTEGER,
+    updated_by TEXT DEFAULT 'admin'
   )
 `);
 
-try {
-  db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT");
-} catch (e) {
-  // Ignore if column already exists
-}
+try { db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN created_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN updated_at INTEGER"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS session_states (
@@ -85,31 +152,45 @@ db.run(`
   )
 `);
 
-try {
-  db.run("ALTER TABLE session_states ADD COLUMN latest_classification TEXT");
-} catch (e) {
-  // Ignore if column already exists
-}
+try { db.run("ALTER TABLE session_states ADD COLUMN latest_classification TEXT"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS student_groups (
     name TEXT PRIMARY KEY,
-    user_ids TEXT NOT NULL -- JSON array
+    user_ids TEXT NOT NULL,
+    created_at INTEGER,
+    created_by TEXT DEFAULT 'admin',
+    updated_at INTEGER,
+    updated_by TEXT DEFAULT 'admin'
   )
 `);
 
+try { db.run("ALTER TABLE student_groups ADD COLUMN created_at INTEGER"); } catch (e) {}
+try { db.run("ALTER TABLE student_groups ADD COLUMN created_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE student_groups ADD COLUMN updated_at INTEGER"); } catch (e) {}
+try { db.run("ALTER TABLE student_groups ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
+
+const stmtSaveLecturer = db.prepare(`
+  INSERT OR REPLACE INTO lecturer_accounts (username, name, password_hash, status, created_at, created_by, updated_at, updated_by)
+  VALUES ($username, $name, $hash, $status, $created_at, $created_by, $updated_at, $updated_by)
+`);
+
+const stmtDeleteLecturer = db.prepare(`
+  DELETE FROM lecturer_accounts WHERE username = $username
+`);
+
 const stmtSaveStudent = db.prepare(`
-  INSERT OR REPLACE INTO student_accounts (student_id, password_hash)
-  VALUES ($id, $hash)
+  INSERT OR REPLACE INTO student_accounts (student_id, created_by, password_hash, created_at, updated_at, updated_by)
+  VALUES ($id, $created_by, $hash, $created_at, $updated_at, $updated_by)
 `);
 
 const stmtDeleteStudent = db.prepare(`
-  DELETE FROM student_accounts WHERE student_id = $id
+  DELETE FROM student_accounts WHERE student_id = $id AND created_by = $created_by
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at, created_by, updated_at, updated_by)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created, $created_by, $updated_at, $updated_by)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -126,24 +207,69 @@ const stmtDeleteState = db.prepare(`
 `);
 
 const stmtSaveGroup = db.prepare(`
-  INSERT OR REPLACE INTO student_groups (name, user_ids)
-  VALUES ($name, $users)
+  INSERT OR REPLACE INTO student_groups (name, user_ids, created_at, created_by, updated_at, updated_by)
+  VALUES ($name, $users, $created_at, $created_by, $updated_at, $updated_by)
 `);
 
 const stmtDeleteGroup = db.prepare(`
   DELETE FROM student_groups WHERE name = $name
 `);
 
-export class PersistedStudentAccounts extends Map<string, StudentAccount> {
-  set(key: string, value: StudentAccount): this {
+export class PersistedLecturers extends Map<string, LecturerAccount> {
+  set(key: string, value: LecturerAccount): this {
+    const now = Date.now();
     super.set(key, value);
-    stmtSaveStudent.run({ $id: key, $hash: value.passwordHash });
+    stmtSaveLecturer.run({
+      $username: key,
+      $name: value.name,
+      $hash: value.passwordHash,
+      $status: value.status,
+      $created_at: value.createdAt || now,
+      $created_by: value.createdBy || "admin",
+      $updated_at: value.updatedAt || now,
+      $updated_by: value.updatedBy || "admin",
+    });
     return this;
   }
   delete(key: string): boolean {
     const existed = super.delete(key);
     if (existed) {
-      stmtDeleteStudent.run({ $id: key });
+      stmtDeleteLecturer.run({ $username: key });
+    }
+    return existed;
+  }
+}
+
+export class PersistedStudentAccounts extends Map<string, StudentAccount> {
+  set(key: string, value: StudentAccount): this {
+    const now = Date.now();
+    const creator = (value.createdBy || "admin").trim();
+    const stuId = value.studentId.toUpperCase();
+    const mapKey = `${stuId}:${creator.toLowerCase()}`;
+    const accToStore: StudentAccount = {
+      ...value,
+      studentId: stuId,
+      createdBy: creator,
+    };
+    super.set(mapKey, accToStore);
+    stmtSaveStudent.run({
+      $id: accToStore.studentId,
+      $created_by: accToStore.createdBy,
+      $hash: accToStore.passwordHash,
+      $created_at: accToStore.createdAt || now,
+      $updated_at: accToStore.updatedAt || now,
+      $updated_by: accToStore.updatedBy || creator,
+    });
+    return this;
+  }
+  delete(key: string): boolean {
+    const existedAccount = super.get(key);
+    const existed = super.delete(key);
+    if (existed && existedAccount) {
+      stmtDeleteStudent.run({
+        $id: existedAccount.studentId,
+        $created_by: existedAccount.createdBy || "admin",
+      });
     }
     return existed;
   }
@@ -151,6 +277,7 @@ export class PersistedStudentAccounts extends Map<string, StudentAccount> {
 
 export class PersistedSessions extends Map<string, Session> {
   set(key: string, value: Session): this {
+    const now = Date.now();
     super.set(key, value);
     stmtSaveSession.run({
       $code: key,
@@ -161,7 +288,10 @@ export class PersistedSessions extends Map<string, Session> {
       $budget: value.defaultTokenBudget,
       $students: JSON.stringify(Array.from(value.allowedStudentIds)),
       $groups: JSON.stringify(value.assignedGroups || []),
-      $created: value.createdAt,
+      $created: value.createdAt || now,
+      $created_by: value.createdBy || "admin",
+      $updated_at: value.updatedAt || now,
+      $updated_by: value.updatedBy || "admin",
     });
     return this;
   }
@@ -201,10 +331,15 @@ export class PersistedSessionStates extends Map<string, StudentSessionState> {
 
 export class PersistedGroups extends Map<string, Group> {
   set(key: string, value: Group): this {
+    const now = Date.now();
     super.set(key, value);
     stmtSaveGroup.run({
       $name: key,
       $users: JSON.stringify(value.userIds),
+      $created_at: value.createdAt || now,
+      $created_by: value.createdBy || "admin",
+      $updated_at: value.updatedAt || now,
+      $updated_by: value.updatedBy || "admin",
     });
     return this;
   }
@@ -217,19 +352,114 @@ export class PersistedGroups extends Map<string, Group> {
   }
 }
 
+export const lecturerAccounts = new PersistedLecturers();
 export const studentAccounts = new PersistedStudentAccounts();
 export const sessions = new PersistedSessions();
 export const sessionStates = new PersistedSessionStates();
 export const studentGroups = new PersistedGroups();
 
+export function getStudentAccount(studentId: string, creator = "admin"): StudentAccount | undefined {
+  const upperId = studentId.toUpperCase();
+  const exactKey = `${upperId}:${creator.toLowerCase()}`;
+  if (studentAccounts.has(exactKey)) {
+    return studentAccounts.get(exactKey);
+  }
+  const adminKey = `${upperId}:admin`;
+  if (studentAccounts.has(adminKey)) {
+    return studentAccounts.get(adminKey);
+  }
+  for (const acc of studentAccounts.values()) {
+    if (acc.studentId.toUpperCase() === upperId) {
+      return acc;
+    }
+  }
+  return undefined;
+}
+
+export async function verifyPasswordSafely(password: string, hash: string): Promise<boolean> {
+  if (!password || !hash) return false;
+  if (password === hash) return true;
+  try {
+    return await Bun.password.verify(password, hash);
+  } catch {
+    return false;
+  }
+}
+
+export async function findValidStudentAccount(
+  studentId: string,
+  password?: string,
+  preferredCreator?: string
+): Promise<StudentAccount | null> {
+  const upperId = studentId.toUpperCase();
+  const matching: StudentAccount[] = [];
+
+  for (const acc of studentAccounts.values()) {
+    if (acc.studentId.toUpperCase() === upperId) {
+      matching.push(acc);
+    }
+  }
+
+  if (matching.length === 0) return null;
+
+  if (!password) {
+    if (preferredCreator) {
+      const preferred = matching.find(
+        (a) => (a.createdBy || "admin").toLowerCase() === preferredCreator.toLowerCase()
+      );
+      if (preferred) return preferred;
+    }
+    return matching[0];
+  }
+
+  if (preferredCreator) {
+    const preferred = matching.find(
+      (a) => (a.createdBy || "admin").toLowerCase() === preferredCreator.toLowerCase()
+    );
+    if (preferred) {
+      const isValid = await verifyPasswordSafely(password, preferred.passwordHash);
+      if (isValid) return preferred;
+    }
+  }
+
+  for (const acc of matching) {
+    const isValid = await verifyPasswordSafely(password, acc.passwordHash);
+    if (isValid) return acc;
+  }
+
+  return null;
+}
+
 try {
+  const rowsLecturers = db
+    .query("SELECT * FROM lecturer_accounts")
+    .all() as any[];
+  for (const r of rowsLecturers) {
+    Map.prototype.set.call(lecturerAccounts, r.username, {
+      username: r.username,
+      name: r.name,
+      passwordHash: r.password_hash,
+      status: r.status || "active",
+      createdAt: r.created_at || Date.now(),
+      createdBy: r.created_by || "admin",
+      updatedAt: r.updated_at || Date.now(),
+      updatedBy: r.updated_by || "admin",
+    });
+  }
+
   const rowsAccounts = db
     .query("SELECT * FROM student_accounts")
     .all() as any[];
   for (const r of rowsAccounts) {
-    Map.prototype.set.call(studentAccounts, r.student_id, {
-      studentId: r.student_id,
+    const creator = r.created_by || "admin";
+    const mapKey = `${r.student_id.toUpperCase()}:${creator.toLowerCase()}`;
+    Map.prototype.set.call(studentAccounts, mapKey, {
+      studentId: r.student_id.toUpperCase(),
       passwordHash: r.password_hash,
+      createdAt: r.created_at || Date.now(),
+      createdBy: creator,
+      updatedAt: r.updated_at || Date.now(),
+      updatedBy: r.updated_by || "admin",
     });
   }
 
@@ -250,7 +480,10 @@ try {
       defaultTokenBudget: r.default_token_budget,
       allowedStudentIds: new Set(JSON.parse(r.allowed_student_ids)),
       assignedGroups: parsedGroups,
-      createdAt: r.created_at,
+      createdAt: r.created_at || Date.now(),
+      createdBy: r.created_by || "admin",
+      updatedAt: r.updated_at || r.created_at || Date.now(),
+      updatedBy: r.updated_by || "admin",
     });
   }
 
@@ -287,11 +520,15 @@ try {
     Map.prototype.set.call(studentGroups, r.name, {
       name: r.name,
       userIds: JSON.parse(r.user_ids),
+      createdAt: r.created_at || Date.now(),
+      createdBy: r.created_by || "admin",
+      updatedAt: r.updated_at || Date.now(),
+      updatedBy: r.updated_by || "admin",
     });
   }
 
   console.log(
-    `[Db] Loaded from SQLite: ${studentAccounts.size} students, ${sessions.size} sessions, ${sessionStates.size} session states, ${studentGroups.size} groups.`,
+    `[Db] Loaded from SQLite: ${lecturerAccounts.size} lecturers, ${studentAccounts.size} students, ${sessions.size} sessions, ${sessionStates.size} session states, ${studentGroups.size} groups.`,
   );
 } catch (err) {
   console.error("[Db] Error loading from SQLite database:", err);
@@ -343,4 +580,3 @@ export async function syncAllDataToRedis() {
     console.error("[Db] Error during Redis auto-hydration:", err?.message || err);
   }
 }
-
