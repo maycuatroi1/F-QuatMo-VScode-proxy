@@ -63,6 +63,11 @@ adminRouter.use("*", async (c, next) => {
   const xApiKey = c.req.header("x-api-key") || c.req.header("X-API-Key");
   const authHeader = c.req.header("Authorization");
 
+  // If x-api-key is supplied, validate it against masterKey
+  if (xApiKey && xApiKey.trim() !== masterKey) {
+    return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
+  }
+
   let caller: { username: string; role: string; name: string } | null = null;
 
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -87,10 +92,8 @@ adminRouter.use("*", async (c, next) => {
   }
 
   // If no valid JWT token in Authorization header, check x-api-key
-  if (!caller) {
-    if (xApiKey && xApiKey.trim() === masterKey) {
-      caller = { username: "admin", role: "admin", name: "Super Admin" };
-    }
+  if (!caller && xApiKey && xApiKey.trim() === masterKey) {
+    caller = { username: "admin", role: "admin", name: "Super Admin" };
   }
 
   if (caller) {
