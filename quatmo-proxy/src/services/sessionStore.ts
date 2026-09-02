@@ -95,34 +95,41 @@ db.run(`
 // Safe SQLite migration to composite PRIMARY KEY (student_id, created_by)
 try {
   const tableInfo = db.query("PRAGMA table_info(student_accounts)").all() as any[];
-  const hasCreatedBy = tableInfo.some((col) => col.name === "created_by");
-  const hasUpdatedBy = tableInfo.some((col) => col.name === "updated_by");
-  const pkColumns = tableInfo.filter((col) => col.pk > 0);
+  if (tableInfo && tableInfo.length > 0) {
+    const colNames = new Set(tableInfo.map((col) => col.name));
+    const pkColumns = tableInfo.filter((col) => col.pk > 0);
 
-  if (pkColumns.length === 1 && pkColumns[0].name === "student_id") {
-    console.log("[Db] Migrating student_accounts table to composite PRIMARY KEY (student_id, created_by)...");
-    db.run(`CREATE TABLE IF NOT EXISTS student_accounts_new (
-      student_id TEXT NOT NULL,
-      created_by TEXT NOT NULL DEFAULT 'admin',
-      password_hash TEXT NOT NULL,
-      created_at INTEGER,
-      updated_at INTEGER,
-      updated_by TEXT DEFAULT 'admin',
-      PRIMARY KEY (student_id, created_by)
-    )`);
-    const createdBySelect = hasCreatedBy ? "COALESCE(created_by, 'admin')" : "'admin'";
-    const updatedBySelect = hasUpdatedBy ? "COALESCE(updated_by, 'admin')" : "'admin'";
-    db.run(`INSERT OR IGNORE INTO student_accounts_new (student_id, created_by, password_hash, created_at, updated_at, updated_by)
-      SELECT student_id, ${createdBySelect}, password_hash, created_at, updated_at, ${updatedBySelect} FROM student_accounts`);
-    db.run(`DROP TABLE student_accounts`);
-    db.run(`ALTER TABLE student_accounts_new RENAME TO student_accounts`);
-    console.log("[Db] Migration of student_accounts to composite key completed successfully.");
+    if (pkColumns.length === 1 || !colNames.has("created_by") || !colNames.has("created_at")) {
+      console.log("[Db] Migrating student_accounts table to composite PRIMARY KEY (student_id, created_by)...");
+      db.run(`CREATE TABLE IF NOT EXISTS student_accounts_new (
+        student_id TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'admin',
+        password_hash TEXT NOT NULL,
+        created_at INTEGER,
+        updated_at INTEGER,
+        updated_by TEXT DEFAULT 'admin',
+        PRIMARY KEY (student_id, created_by)
+      )`);
+
+      const createdBySel = colNames.has("created_by") ? "COALESCE(created_by, 'admin')" : "'admin'";
+      const createdAtSel = colNames.has("created_at") ? "created_at" : "CAST(strftime('%s', 'now') AS INTEGER) * 1000";
+      const updatedAtSel = colNames.has("updated_at") ? "updated_at" : "CAST(strftime('%s', 'now') AS INTEGER) * 1000";
+      const updatedBySel = colNames.has("updated_by") ? "COALESCE(updated_by, 'admin')" : "'admin'";
+
+      db.run(`INSERT OR IGNORE INTO student_accounts_new (student_id, created_by, password_hash, created_at, updated_at, updated_by)
+        SELECT student_id, ${createdBySel}, password_hash, ${createdAtSel}, ${updatedAtSel}, ${updatedBySel} FROM student_accounts`);
+      db.run(`DROP TABLE student_accounts`);
+      db.run(`ALTER TABLE student_accounts_new RENAME TO student_accounts`);
+      console.log("[Db] Migration of student_accounts to composite key completed successfully.");
+    }
   }
 } catch (err) {
   console.error("[Db] Error during student_accounts migration:", err);
 }
 
 try { db.run("ALTER TABLE student_accounts ADD COLUMN created_by TEXT NOT NULL DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN created_at INTEGER"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
 
 db.run(`
