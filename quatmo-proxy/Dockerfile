@@ -13,6 +13,12 @@ RUN bun install --production
 COPY tsconfig.json ./
 COPY src ./src
 
+# Ensure logs directory exists for SQLite database persistence
+RUN mkdir -p /app/logs
+
+# Declare volume for data persistence across container rebuilds/redeploys
+VOLUME ["/app/logs"]
+
 # Expose port
 EXPOSE 3000
 

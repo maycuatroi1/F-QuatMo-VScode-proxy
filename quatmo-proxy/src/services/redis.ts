@@ -9,16 +9,16 @@ let redis: Redis | null = null;
 
 try {
   redis = new Redis(redisUrl, {
-    maxRetriesPerRequest: 3,
-    connectTimeout: 5000,
+    maxRetriesPerRequest: null,
+    connectTimeout: 10000,
     retryStrategy(times: number) {
-      if (times > 3) {
+      const delay = Math.min(times * 200, 2000);
+      if (times % 10 === 0) {
         console.warn(
-          `[Redis] Fail to connect after ${times} attempts. Falling back to local/in-memory memory cache.`,
+          `[Redis] Retrying connection (attempt ${times})...`,
         );
-        return null;
       }
-      return Math.min(times * 100, 2000);
+      return delay;
     },
   });
 
