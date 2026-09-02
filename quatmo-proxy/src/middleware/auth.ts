@@ -1,5 +1,4 @@
 import type { MiddlewareHandler } from "hono";
-import { redis } from "../services/redis";
 import { getProxyApiKey } from "../services/proxyKey";
 
 export interface UserSession {
@@ -8,18 +7,6 @@ export interface UserSession {
   monthlyTokenLimit: number;
   tokensConsumed: number;
 }
-
-const memoryBudgets = new Map<string, UserSession>([
-  [
-    "qp_student_test",
-    {
-      keyId: "test-key-id",
-      userId: "student-1",
-      monthlyTokenLimit: 50000,
-      tokensConsumed: 0,
-    },
-  ],
-]);
 
 export const authMiddleware = (): MiddlewareHandler<{
   Variables: { user: UserSession; token: string };
@@ -35,14 +22,7 @@ export const authMiddleware = (): MiddlewareHandler<{
 
     let session: UserSession | null = null;
 
-    // Upstream API keys not needed in auth verification
-
-    if (
-      token === proxyApiKey ||
-      token === "123456789" ||
-      token.startsWith("sk-") ||
-      token.length > 0
-    ) {
+    if (token === proxyApiKey) {
       session = {
         keyId: "master-key-id",
         userId: "master-user",
@@ -66,36 +46,6 @@ export const authMiddleware = (): MiddlewareHandler<{
       } catch {
         // Invalid JWT
       }
-    } else if (token === "qp_student_test") {
-      if (redis && redis.status === "ready") {
-        try {
-          const cached = await redis.get(`key:auth:${token}`);
-          if (cached) {
-            session = JSON.parse(cached);
-          } else {
-            session = memoryBudgets.get(token) || null;
-            if (session) {
-              await redis.set(
-                `key:auth:${token}`,
-                JSON.stringify(session),
-                "EX",
-                600,
-              );
-            }
-          }
-        } catch (err) {
-          console.error("[Auth] Cache lookup error:", err);
-        }
-      } else {
-        session = memoryBudgets.get(token) || null;
-      }
-    } else if (token === "lmstudio-placeholder-key") {
-      session = {
-        keyId: "lmstudio-local-key",
-        userId: "local-user",
-        monthlyTokenLimit: 999_999_999,
-        tokensConsumed: 0,
-      };
     }
 
     if (!session) {
