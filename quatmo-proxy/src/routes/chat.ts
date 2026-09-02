@@ -7,7 +7,7 @@ import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
 import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
 import { sessions } from "../services/sessionStore";
-import { logSession, logGlobal, logMachine } from "../services/secureLogger";
+import { logSession, logGlobal, logGuest } from "../services/secureLogger";
 import {
   validateUserMessages,
   checkText,
@@ -496,7 +496,7 @@ async function logStudentInteraction(
 
   const logDir = isSession
     ? path.resolve(process.cwd(), "logs", "sessions", safeSessionCode)
-    : path.resolve(process.cwd(), "logs", "machines");
+    : path.resolve(process.cwd(), "logs", "guests");
   const logFilePath = path.resolve(logDir, `${isSession ? safeStudentId : safeLogIdentifier}.json`);
 
   try {
@@ -593,13 +593,13 @@ async function logStudentInteraction(
     if (isSession) {
       await logSession(safeSessionCode, safeStudentId, sessionEntry);
     } else {
-      await logMachine(safeLogIdentifier, sessionEntry);
+      await logGuest(safeLogIdentifier, sessionEntry);
     }
   } catch (err) {
     console.error("[Logger] Failed to write student log:", err);
     logGlobal({
       level: "error",
-      event: isSession ? "session_log_write_failed" : "machine_log_write_failed",
+      event: isSession ? "session_log_write_failed" : "guest_log_write_failed",
       sessionCode,
       studentId,
       machineId,
@@ -643,7 +643,7 @@ async function logStudentError(
 
   const logDir = isSession
     ? path.resolve(process.cwd(), "logs", "sessions", safeSessionCode)
-    : path.resolve(process.cwd(), "logs", "machines");
+    : path.resolve(process.cwd(), "logs", "guests");
   const logFilePath = path.resolve(logDir, `${isSession ? safeStudentId : safeLogIdentifier}.json`);
 
   try {
@@ -687,7 +687,7 @@ async function logStudentError(
     if (isSession) {
       await logSession(safeSessionCode, safeStudentId, newEntry).catch(() => {});
     } else {
-      await logMachine(safeLogIdentifier, newEntry).catch(() => {});
+      await logGuest(safeLogIdentifier, newEntry).catch(() => {});
     }
   } catch (err) {
     console.error("[Logger] Failed to write student error log:", err);

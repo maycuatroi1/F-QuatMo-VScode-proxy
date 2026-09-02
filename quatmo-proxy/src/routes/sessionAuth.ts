@@ -231,9 +231,9 @@ sessionAuthRouter.post("/login", async (c) => {
       }
       return c.json(
         {
-          error: `Password is incorrect. (Failed attempts: ${result.attemptsCount}/5)`,
+          error: `Password is incorrect. (Failed attempts: ${result.attemptsCount}/10)`,
           failedAttempts: result.attemptsCount,
-          remainingAttempts: Math.max(0, 5 - result.attemptsCount),
+          remainingAttempts: Math.max(0, 10 - result.attemptsCount),
         },
         403
       );

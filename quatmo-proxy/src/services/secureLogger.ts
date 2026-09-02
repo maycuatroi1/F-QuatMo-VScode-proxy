@@ -96,23 +96,23 @@ export async function logSession(
   }
 }
 
-// ─── Machine log ─────────────────────────────────────────────────────────────
+// ─── Guest log ──────────────────────────────────────────────────────────────
 
-export async function logMachine(
-  machineId: string,
+export async function logGuest(
+  guestId: string,
   record: object
 ) {
-  const safeMachineId = sanitizeFilename(machineId || "DEFAULT_USER").toUpperCase();
-  const machineLogDir = path.resolve(
+  const safeGuestId = sanitizeFilename(guestId || "DEFAULT_USER").toUpperCase();
+  const guestLogDir = path.resolve(
     process.cwd(),
     "logs",
-    "machines"
+    "guests"
   );
-  const machineLogPath = path.resolve(machineLogDir, `${safeMachineId}.log`);
+  const guestLogPath = path.resolve(guestLogDir, `${safeGuestId}.log`);
   try {
-    await appendEncryptedLine(machineLogPath, record);
+    await appendEncryptedLine(guestLogPath, record);
   } catch (err) {
-    console.error("[SecureLogger] Failed to write machine log:", err);
+    console.error("[SecureLogger] Failed to write guest log:", err);
   }
 }
 

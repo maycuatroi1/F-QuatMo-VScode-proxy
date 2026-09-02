@@ -18,7 +18,7 @@ interface InternalLockoutRecord {
 const ipLocks = new Map<string, InternalLockoutRecord>();
 const accountLocks = new Map<string, InternalLockoutRecord>();
 
-const MAX_ATTEMPTS = 5;
+const MAX_ATTEMPTS = 10;
 const WINDOW_SECONDS = 15 * 60; // 15 minutes window
 const LOCKOUT_SECONDS = 15 * 60; // 15 minutes lockout
 

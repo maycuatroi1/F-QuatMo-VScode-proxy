@@ -73,9 +73,9 @@ authRouter.post("/login", async (c) => {
       }
       return c.json(
         {
-          error: `Incorrect password. (Failed attempts: ${result.attemptsCount}/5)`,
+          error: `Incorrect password. (Failed attempts: ${result.attemptsCount}/10)`,
           failedAttempts: result.attemptsCount,
-          remainingAttempts: Math.max(0, 5 - result.attemptsCount),
+          remainingAttempts: Math.max(0, 10 - result.attemptsCount),
         },
         403
       );
