@@ -117,6 +117,8 @@ sessionAuthRouter.post("/login", async (c) => {
   const authHeader = c.req.header("Authorization");
   let bearerStudentId: string | undefined;
   let bearerCreatedBy: string | undefined;
+  let bearerValidLecturers: string[] | undefined;
+  let bearerIat: number | undefined;
 
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7).trim();
@@ -125,6 +127,14 @@ sessionAuthRouter.post("/login", async (c) => {
       if (payload && payload.studentId) {
         bearerStudentId = payload.studentId;
         bearerCreatedBy = payload.createdBy;
+        bearerIat = payload.iat;
+        if (Array.isArray(payload.validLecturers)) {
+          bearerValidLecturers = payload.validLecturers.map((l: string) =>
+            String(l).toLowerCase(),
+          );
+        } else if (payload.createdBy) {
+          bearerValidLecturers = [String(payload.createdBy).toLowerCase()];
+        }
       }
     } catch {
       // Invalid Bearer token
@@ -189,31 +199,75 @@ sessionAuthRouter.post("/login", async (c) => {
 
   const sessionCreator = (session.createdBy || "admin").toLowerCase();
   const mapKey = `${studentId}:${sessionCreator}`;
-  const account = studentAccounts.get(mapKey);
+  const creatorAccount = studentAccounts.get(mapKey);
+  const adminAccount = studentAccounts.get(`${studentId}:admin`);
+  const account = creatorAccount || adminAccount;
 
   if (!account) {
     return c.json(
-      { error: `Your student account does not exist under instructor @${session.createdBy || "admin"}.` },
+      { error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.` },
       403,
     );
   }
 
-  const bearerMatches =
-    bearerStudentId &&
-    bearerCreatedBy &&
-    bearerCreatedBy.toLowerCase() === sessionCreator;
+  // Check if Bearer token is valid FOR THIS SPECIFIC INSTRUCTOR
+  let bearerMatches = false;
+  if (bearerStudentId && bearerStudentId.trim().toUpperCase() === studentId) {
+    let isLecturerAuthorized = false;
+    if (bearerValidLecturers) {
+      if (creatorAccount) {
+        // Must specifically match this lecturer
+        isLecturerAuthorized = bearerValidLecturers.includes(sessionCreator);
+      } else if (adminAccount) {
+        // Fallback to admin if created by admin
+        isLecturerAuthorized = bearerValidLecturers.includes("admin");
+      }
+    }
+
+    // Check if the lecturer updated the password after the token was issued
+    const tokenIssuedAtMs = (bearerIat || 0) * 1000;
+    const isPasswordStillFresh =
+      !account.updatedAt ||
+      tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
+
+    if (isLecturerAuthorized && isPasswordStillFresh) {
+      bearerMatches = true;
+    }
+  }
 
   if (!bearerMatches) {
     if (!password) {
       return c.json(
-        { error: `This session was created by instructor @${session.createdBy || "admin"}. Please log in with the password provided by @${session.createdBy || "admin"}.` },
+        {
+          error: `This session was created by instructor @${session.createdBy || "admin"}. Please log in with the password provided by @${session.createdBy || "admin"}.`,
+          requirePassword: true,
+        },
         403,
       );
     }
-    const isPasswordValid = await verifyPasswordSafely(
-      password,
-      account.passwordHash,
-    );
+
+    let isPasswordValid = false;
+    const creatorAcc = studentAccounts.get(mapKey);
+    if (creatorAcc) {
+      isPasswordValid = await verifyPasswordSafely(password, creatorAcc.passwordHash);
+    }
+    if (!isPasswordValid) {
+      const adminAcc = studentAccounts.get(`${studentId}:admin`);
+      if (adminAcc) {
+        isPasswordValid = await verifyPasswordSafely(password, adminAcc.passwordHash);
+      }
+    }
+    if (!isPasswordValid && !creatorAcc) {
+      for (const acc of studentAccounts.values()) {
+        if (acc.studentId.toUpperCase() === studentId) {
+          if (await verifyPasswordSafely(password, acc.passwordHash)) {
+            isPasswordValid = true;
+            break;
+          }
+        }
+      }
+    }
+
     if (!isPasswordValid) {
       const result = await recordFailedAttempt(ip, studentId);
       if (result.isNowLocked && result.lockoutInfo) {
@@ -231,7 +285,7 @@ sessionAuthRouter.post("/login", async (c) => {
       }
       return c.json(
         {
-          error: `Password is incorrect. (Failed attempts: ${result.attemptsCount}/10)`,
+          error: `Password is incorrect for instructor @${session.createdBy || "admin"}. (Failed attempts: ${result.attemptsCount}/10)`,
           failedAttempts: result.attemptsCount,
           remainingAttempts: Math.max(0, 10 - result.attemptsCount),
         },

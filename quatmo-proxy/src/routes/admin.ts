@@ -586,30 +586,55 @@ const handleStudentImport = async (c: any) => {
   }
 
   let importedCount = 0;
+  let skippedCount = 0;
   const now = Date.now();
-  const creator = caller.username || "admin";
+  const creator = (caller.username || "admin").trim();
+  const creatorLower = creator.toLowerCase();
+  const seenInBatch = new Set<string>();
+
   const promises = students.map(async (stu) => {
     if (!stu.studentId || !stu.password) return;
-    const passwordHash = await Bun.password.hash(stu.password, "bcrypt");
-    const stuId = stu.studentId.toUpperCase();
-    const mapKey = `${stuId}:${creator.toLowerCase()}`;
+    const stuId = stu.studentId.trim().toUpperCase();
+    if (!stuId) return;
+
+    if (seenInBatch.has(stuId)) {
+      skippedCount++;
+      return;
+    }
+    seenInBatch.add(stuId);
+
+    const mapKey = `${stuId}:${creatorLower}`;
     const existing = studentAccounts.get(mapKey);
 
+    // Validate in isolated scope: if already exists for this lecturer, skip to prevent duplicates/overwriting
+    if (existing) {
+      skippedCount++;
+      return;
+    }
+
+    const passwordHash = await Bun.password.hash(stu.password, "bcrypt");
     studentAccounts.set(mapKey, {
       studentId: stuId,
       passwordHash,
-      createdAt: existing?.createdAt || now,
-      createdBy: existing?.createdBy || creator,
+      createdAt: now,
+      createdBy: creator,
       updatedAt: now,
-      updatedBy: caller.username,
+      updatedBy: caller.username || creator,
     });
     importedCount++;
   });
   await Promise.all(promises);
 
+  let message = `Imported ${importedCount} student account(s).`;
+  if (skippedCount > 0) {
+    message += ` (${skippedCount} already existed and were skipped)`;
+  }
+
   return c.json({
     success: true,
-    message: `Imported ${importedCount} student accounts.`,
+    message,
+    importedCount,
+    skippedCount,
   });
 };
 
@@ -618,10 +643,11 @@ adminRouter.post("/students/import", handleStudentImport);
 
 adminRouter.get("/students", async (c) => {
   const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const callerUser = (caller.username || "admin").toLowerCase();
   const list: any[] = [];
   for (const account of studentAccounts.values()) {
-    const creator = account.createdBy || "admin";
-    if (creator !== caller.username) {
+    const creator = (account.createdBy || "admin").toLowerCase();
+    if (creator !== callerUser) {
       continue;
     }
     list.push({
@@ -690,14 +716,32 @@ adminRouter.post("/sessions", async (c) => {
       if (!groupName) continue;
       groupNames.push(groupName);
 
-      const group = studentGroups.get(groupName);
+      const groupKey = `${groupName}:${caller.username.toLowerCase()}`;
+      let group = studentGroups.get(groupKey);
+      if (!group) {
+        group = studentGroups.get(`${groupName}:admin`);
+      }
+      if (!group) {
+        for (const g of studentGroups.values()) {
+          if (g.name.toLowerCase() === groupName.toLowerCase() && (g.createdBy || "admin").toLowerCase() === caller.username.toLowerCase()) {
+            group = g;
+            break;
+          }
+        }
+      }
+      if (!group) {
+        for (const g of studentGroups.values()) {
+          if (g.name.toLowerCase() === groupName.toLowerCase()) {
+            group = g;
+            break;
+          }
+        }
+      }
+
       if (group && Array.isArray(group.userIds)) {
         for (const uid of group.userIds) {
           const upperId = uid.toUpperCase();
-          const mapKey = `${upperId}:${caller.username.toLowerCase()}`;
-          if (studentAccounts.has(mapKey)) {
-            allowedStudentIds.add(upperId);
-          }
+          allowedStudentIds.add(upperId);
         }
       }
     }
@@ -773,10 +817,6 @@ adminRouter.post("/sessions/:sessionCode/students", async (c) => {
   let addedCount = 0;
   for (const rawId of studentIds) {
     const id = rawId.toUpperCase();
-    const mapKey = `${id}:${caller.username.toLowerCase()}`;
-    if (!studentAccounts.has(mapKey)) {
-      continue;
-    }
     session.allowedStudentIds.add(id);
 
     const stateKey = `${sessionCode}:${id}`;
@@ -842,12 +882,12 @@ adminRouter.post(
 
 adminRouter.get("/sessions", async (c) => {
   const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const callerUser = (caller.username || "admin").toLowerCase();
 
   const allSessions = Array.from(sessions.values());
-  const scopedSessions =
-    caller.role === "lecturer"
-      ? allSessions.filter((s) => (s.createdBy || "admin") === caller.username)
-      : allSessions;
+  const scopedSessions = allSessions.filter(
+    (s) => (s.createdBy || "admin").toLowerCase() === callerUser,
+  );
 
   const sessionPromises = scopedSessions.map(async (session) => {
     const code = session.sessionCode;
@@ -1301,10 +1341,15 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
-  resultSessions.sort((a, b) => b.lastActivity - a.lastActivity);
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const filteredSessions = resultSessions.filter((s) => {
+    const sessionObj = sessions.get(s.sessionCode);
+    return (sessionObj?.createdBy || "admin").toLowerCase() === callerUser;
+  });
+  filteredSessions.sort((a, b) => b.lastActivity - a.lastActivity);
 
   return c.json({
-    sessions: resultSessions,
+    sessions: filteredSessions,
     guestSummary: {
       count: guestLogCount,
       lastActivity: guestLastActivity,
@@ -1765,6 +1810,7 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
 // ─── GROUP ENDPOINTS ─────────────────────────────────────────────────────────
 async function syncGroupWithActiveSessions(
   groupName: string,
+  createdBy: string,
   addedUserIds: string[] = [],
   removedUserIds: string[] = [],
 ) {
@@ -1776,6 +1822,14 @@ async function syncGroupWithActiveSessions(
     if (
       !session.assignedGroups ||
       !session.assignedGroups.includes(groupName)
+    ) {
+      continue;
+    }
+
+    if (
+      createdBy &&
+      createdBy.toLowerCase() !== "admin" &&
+      (session.createdBy || "admin").toLowerCase() !== createdBy.toLowerCase()
     ) {
       continue;
     }
@@ -1829,7 +1883,8 @@ async function syncGroupWithActiveSessions(
       let stillBelongsToOtherGroup = false;
       for (const otherGroupName of session.assignedGroups) {
         if (otherGroupName === groupName) continue;
-        const otherGroup = studentGroups.get(otherGroupName);
+        const otherGroupKey = `${otherGroupName}:${(session.createdBy || "admin").toLowerCase()}`;
+        const otherGroup = studentGroups.get(otherGroupKey) || studentGroups.get(`${otherGroupName}:admin`);
         if (otherGroup && Array.isArray(otherGroup.userIds)) {
           if (otherGroup.userIds.some((id) => id.toUpperCase() === uid)) {
             stillBelongsToOtherGroup = true;
@@ -1856,8 +1911,9 @@ async function syncGroupWithActiveSessions(
 
 adminRouter.get("/groups", async (c) => {
   const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const callerUser = (caller.username || "admin").toLowerCase();
   const groupsList = Array.from(studentGroups.values()).filter((g) => {
-    return (g.createdBy || "admin") === caller.username;
+    return (g.createdBy || "admin").toLowerCase() === callerUser;
   });
 
   return c.json({ success: true, groups: groupsList });
@@ -1878,7 +1934,8 @@ adminRouter.post("/groups", async (c) => {
     : [];
 
   const now = Date.now();
-  const existing = studentGroups.get(groupName);
+  const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
+  const existing = studentGroups.get(mapKey);
 
   const updatedGroup: Group = {
     name: groupName,
@@ -1889,10 +1946,10 @@ adminRouter.post("/groups", async (c) => {
     updatedBy: caller.username,
   };
 
-  studentGroups.set(groupName, updatedGroup);
+  studentGroups.set(mapKey, updatedGroup);
 
   if (members.length > 0) {
-    await syncGroupWithActiveSessions(groupName, members, []);
+    await syncGroupWithActiveSessions(groupName, caller.username, members, []);
   }
 
   return c.json({
@@ -1905,7 +1962,11 @@ adminRouter.post("/groups", async (c) => {
 adminRouter.post("/groups/:name/students", async (c) => {
   const caller = c.get("caller") || { role: "admin", username: "admin" };
   const groupName = decodeURIComponent(c.req.param("name")).trim();
-  const group = studentGroups.get(groupName);
+  const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
+  let group = studentGroups.get(mapKey);
+  if (!group && caller.role === "admin") {
+    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+  }
 
   if (!group) {
     return c.json({ error: `Group '${groupName}' not found.` }, 404);
@@ -1945,10 +2006,11 @@ adminRouter.post("/groups/:name/students", async (c) => {
     updatedBy: caller.username,
   };
 
-  studentGroups.set(groupName, updatedGroup);
+  const targetKey = `${group.name}:${(group.createdBy || caller.username).toLowerCase()}`;
+  studentGroups.set(targetKey, updatedGroup);
 
   if (addedUserIds.length > 0) {
-    await syncGroupWithActiveSessions(groupName, addedUserIds, []);
+    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, addedUserIds, []);
   }
 
   return c.json({
@@ -1965,7 +2027,12 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
     .trim()
     .toUpperCase();
 
-  const group = studentGroups.get(groupName);
+  const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
+  let group = studentGroups.get(mapKey);
+  if (!group && caller.role === "admin") {
+    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+  }
+
   if (!group) {
     return c.json({ error: `Group '${groupName}' not found.` }, 404);
   }
@@ -1981,8 +2048,9 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
     updatedBy: caller.username,
   };
 
-  studentGroups.set(groupName, updatedGroup);
-  await syncGroupWithActiveSessions(groupName, [], [studentId]);
+  const targetKey = `${group.name}:${(group.createdBy || caller.username).toLowerCase()}`;
+  studentGroups.set(targetKey, updatedGroup);
+  await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], [studentId]);
 
   return c.json({
     success: true,
@@ -1992,16 +2060,27 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
 });
 
 adminRouter.delete("/groups/:name", async (c) => {
+  const caller = c.get("caller") || { role: "admin", username: "admin" };
   const groupName = decodeURIComponent(c.req.param("name")).trim();
-  const group = studentGroups.get(groupName);
-  const existed = studentGroups.delete(groupName);
+  const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
+  let group = studentGroups.get(mapKey);
+  if (!group && caller.role === "admin") {
+    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+  }
+
+  if (!group) {
+    return c.json({ error: `Group '${groupName}' not found.` }, 404);
+  }
+
+  const targetKey = `${group.name}:${(group.createdBy || caller.username).toLowerCase()}`;
+  const existed = studentGroups.delete(targetKey);
 
   if (!existed) {
     return c.json({ error: `Group '${groupName}' not found.` }, 404);
   }
 
   if (group && Array.isArray(group.userIds)) {
-    await syncGroupWithActiveSessions(groupName, [], group.userIds);
+    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], group.userIds);
   }
 
   return c.json({ success: true, message: `Group '${groupName}' deleted.` });

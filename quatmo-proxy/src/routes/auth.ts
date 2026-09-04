@@ -5,6 +5,7 @@ import {
   studentAccounts,
   getStudentAccount,
   findValidStudentAccount,
+  findAllValidStudentAccounts,
 } from "../services/sessionStore";
 import {
   checkLockout,
@@ -50,9 +51,9 @@ authRouter.post("/login", async (c) => {
     );
   }
 
-  const validAccount = await findValidStudentAccount(studentId, password);
+  const authResult = await findAllValidStudentAccounts(studentId, password);
 
-  if (!validAccount) {
+  if (!authResult) {
     const hasAnyAccount = Array.from(studentAccounts.values()).some(
       (a) => a.studentId.toUpperCase() === studentId,
     );
@@ -91,8 +92,9 @@ authRouter.post("/login", async (c) => {
   // User token: valid for 7 days (persistent login)
   const exp = now + 7 * 24 * 60 * 60;
   const payload = {
-    studentId: validAccount.studentId,
-    createdBy: validAccount.createdBy || "admin",
+    studentId: authResult.primaryAccount.studentId,
+    createdBy: authResult.primaryAccount.createdBy || "admin",
+    validLecturers: authResult.validLecturers,
     type: "user",
     iat: now,
     exp,
@@ -103,7 +105,7 @@ authRouter.post("/login", async (c) => {
   return c.json({
     success: true,
     token,
-    studentId: validAccount.studentId,
+    studentId: authResult.primaryAccount.studentId,
   });
 });
 
