@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import type { TurnLog } from "./redisStore";
 
 let cachedEvalPrompt = "";
 let lastPromptLoadedTime = 0;
@@ -45,6 +46,7 @@ export async function evaluateTurnSemanticFeatures(
   history: Array<{ role: string; content: string }>,
   codeSnapshots?: Array<{ path: string; content: string; languageId: string }>,
   activeFile?: { path: string; content: string },
+  recentTurns: TurnLog[] = [],
 ): Promise<Record<string, number>> {
   const defaultFeatures: Record<string, number> = {};
 
@@ -104,11 +106,26 @@ export async function evaluateTurnSemanticFeatures(
   try {
     const systemPrompt = await getEvaluationSystemPrompt();
 
-    const formattedHistory = history
-      .map(
-        (msg) => `[${msg.role.toUpperCase()}]: ${msg.content.slice(0, 1000)}`,
-      )
-      .join("\n\n");
+    const formattedHistory =
+      recentTurns.length > 0
+        ? recentTurns
+            .map((turn, index) => {
+              const turnNumber = index + 1;
+              return [
+                `Turn ${turnNumber}:`,
+                `Student Prompt: ${turn.prompt}`,
+                `AI Response: ${turn.response}`,
+                turn.codeSnapshot
+                  ? `Code Snapshot:\n\`\`\`\n${turn.codeSnapshot}\n\`\`\``
+                  : "Code Snapshot: None",
+              ].join("\n");
+            })
+            .join("\n\n")
+        : history
+            .map(
+              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content.slice(0, 1000)}`,
+            )
+            .join("\n\n");
 
     let codeSection = "";
     if (codeSnapshot) {
@@ -135,7 +152,7 @@ export async function evaluateTurnSemanticFeatures(
     }
 
     const payload = [
-      "## CONVERSATION HISTORY",
+      "## RECENT 5-TURN WINDOW HISTORY",
       formattedHistory || "None (First Turn)",
       "\n## CURRENT TURN",
       `Student Prompt: ${prompt}`,

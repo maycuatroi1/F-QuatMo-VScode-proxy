@@ -52,6 +52,9 @@ yarn-error.log*
 pnpm-debug.log*
 bun-debug.log*
 **/tests/
+!quatmo-proxy/tests/
+quatmo-proxy/tests/*
+!quatmo-proxy/tests/iem-policy.test.ts
 .npm
 .eslintcache
 

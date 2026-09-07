@@ -1,3 +1,5 @@
+import * as fs from "fs";
+import * as path from "path";
 import { Hono } from "hono";
 import { sign, verify } from "hono/jwt";
 import { redis } from "../services/redis";
@@ -9,7 +11,18 @@ import {
   sessions,
   sessionStates,
   type StudentSessionState,
+  verifyPasswordSafely,
 } from "../services/sessionStore";
+import {
+  checkLockout,
+  recordFailedAttempt,
+  recordSuccessfulLogin,
+} from "../services/rateLimiter";
+import { getClientIP } from "./admin";
+
+function sanitizeFilename(str: string): string {
+  return str.replace(/[^a-zA-Z0-9_\-]/g, "_");
+}
 
 const sessionAuthRouter = new Hono();
 
@@ -25,20 +38,20 @@ sessionAuthRouter.get("/status", async (c) => {
   try {
     payload = await verify(token, jwtSecret, "HS256" as any);
   } catch (err) {
-    return c.json({ error: "Token không hợp lệ hoặc đã hết hạn" }, 401);
+    return c.json({ error: "Invalid or expired token." }, 401);
   }
 
   const { studentId, sessionCode } = payload;
   const session = sessions.get(sessionCode);
   if (!session) {
-    return c.json({ error: "Session không tồn tại." }, 404);
+    return c.json({ error: "Session does not exist." }, 404);
   }
 
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
   if (!state) {
     return c.json(
-      { error: "Không tìm thấy thông tin trạng thái học viên." },
+      { error: "Student session state not found." },
       404,
     );
   }
@@ -59,8 +72,14 @@ sessionAuthRouter.get("/status", async (c) => {
   }
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime = session.startTime + session.durationMinutes * 60;
-  const aiExpirationTime = payload.loginTime + session.aiValidityMinutes * 60;
+  const sessionEndTime =
+    session.durationMinutes === -1
+      ? session.startTime + 24 * 60 * 60
+      : session.startTime + session.durationMinutes * 60;
+  const aiExpirationTime =
+    session.aiValidityMinutes === -1
+      ? payload.loginTime + 24 * 60 * 60
+      : payload.loginTime + session.aiValidityMinutes * 60;
   const sessionRemainingSeconds = Math.max(0, sessionEndTime - now);
   const aiRemainingSeconds = Math.max(0, aiExpirationTime - now);
 
@@ -72,14 +91,20 @@ sessionAuthRouter.get("/status", async (c) => {
     tokenBudget: session.defaultTokenBudget,
     tokensConsumed: consumed,
     tokensRemaining: Math.max(0, session.defaultTokenBudget - consumed),
-    sessionRemainingMinutes: Math.ceil(sessionRemainingSeconds / 60),
-    aiRemainingMinutes: Math.ceil(aiRemainingSeconds / 60),
+    sessionRemainingMinutes:
+      session.durationMinutes === -1
+        ? -1
+        : Math.ceil(sessionRemainingSeconds / 60),
+    aiRemainingMinutes:
+      session.aiValidityMinutes === -1
+        ? -1
+        : Math.ceil(aiRemainingSeconds / 60),
   });
 });
 
 sessionAuthRouter.post("/login", async (c) => {
-  const body = await c.req.json();
-  const {
+  const body = await c.req.json().catch(() => ({}));
+  let {
     sessionCode: rawSessionCode,
     studentId: rawStudentId,
     password,
@@ -89,57 +114,200 @@ sessionAuthRouter.post("/login", async (c) => {
     password?: string;
   };
 
-  if (!rawSessionCode || !rawStudentId || !password) {
+  const authHeader = c.req.header("Authorization");
+  let bearerStudentId: string | undefined;
+  let bearerCreatedBy: string | undefined;
+  let bearerValidLecturers: string[] | undefined;
+  let bearerIat: number | undefined;
+
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const token = authHeader.substring(7).trim();
+    try {
+      const payload: any = await verify(token, getJwtSecret(), "HS256" as any);
+      if (payload && payload.studentId) {
+        bearerStudentId = payload.studentId;
+        bearerCreatedBy = payload.createdBy;
+        bearerIat = payload.iat;
+        if (Array.isArray(payload.validLecturers)) {
+          bearerValidLecturers = payload.validLecturers.map((l: string) =>
+            String(l).toLowerCase(),
+          );
+        } else if (payload.createdBy) {
+          bearerValidLecturers = [String(payload.createdBy).toLowerCase()];
+        }
+      }
+    } catch {
+      // Invalid Bearer token
+    }
+  }
+
+  const studentId = (rawStudentId || bearerStudentId || "")
+    .trim()
+    .toUpperCase();
+  const sessionCode = (rawSessionCode || "").trim().toUpperCase();
+
+  if (!sessionCode) {
+    return c.json({ error: "Missing required field: sessionCode" }, 400);
+  }
+
+  if (!studentId) {
     return c.json(
-      { error: "Missing required fields: sessionCode, studentId, password" },
+      { error: "Missing Student ID. Please log in with your FPT Student Account first." },
       400,
     );
   }
 
-  const sessionCode = rawSessionCode.trim().toUpperCase();
-  const studentId = rawStudentId.trim().toUpperCase();
+  const ip = getClientIP(c);
+
+  const lockout = await checkLockout(ip, studentId);
+  if (lockout.isLocked) {
+    c.header("Retry-After", String(lockout.remainingSeconds));
+    c.header("X-RateLimit-Reset", String(lockout.lockedUntil));
+    return c.json(
+      {
+        error: `Too many failed login attempts. Account/IP temporarily locked for security.`,
+        retryAfterSeconds: lockout.remainingSeconds,
+        lockedUntil: lockout.lockedUntil,
+        reason: lockout.reason,
+      },
+      429
+    );
+  }
 
   const session = sessions.get(sessionCode);
   if (!session) {
-    return c.json({ error: "Session không tồn tại." }, 404);
+    return c.json({ error: "Session does not exist." }, 404);
   }
 
-  if (!session.allowedStudentIds.has(studentId)) {
+  const stateKey = `${sessionCode}:${studentId}`;
+  const existingState = sessionStates.get(stateKey);
+
+  if (!session.allowedStudentIds.has(studentId) && !existingState) {
     return c.json(
       {
         error:
-          "Sinh viên không nằm trong danh sách được phép tham gia session này.",
+          "You are not allowed to join this session. Please contact your instructor for assistance.",
       },
       403,
     );
   }
 
-  const account = studentAccounts.get(studentId);
+  if (!session.allowedStudentIds.has(studentId) && existingState) {
+    session.allowedStudentIds.add(studentId);
+    sessions.set(sessionCode, session);
+  }
+
+  const sessionCreator = (session.createdBy || "admin").toLowerCase();
+  const mapKey = `${studentId}:${sessionCreator}`;
+  const creatorAccount = studentAccounts.get(mapKey);
+  const adminAccount = studentAccounts.get(`${studentId}:admin`);
+  const account = creatorAccount || adminAccount;
+
   if (!account) {
     return c.json(
-      { error: "Tài khoản sinh viên không tồn tại trên hệ thống." },
+      { error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.` },
       403,
     );
   }
 
-  const isPasswordValid = await Bun.password.verify(
-    password,
-    account.passwordHash,
-  );
-  if (!isPasswordValid) {
-    return c.json({ error: "Mật khẩu tài khoản không chính xác." }, 403);
+  // Check if Bearer token is valid FOR THIS SPECIFIC INSTRUCTOR
+  let bearerMatches = false;
+  if (bearerStudentId && bearerStudentId.trim().toUpperCase() === studentId) {
+    let isLecturerAuthorized = false;
+    if (bearerValidLecturers) {
+      if (creatorAccount) {
+        // Must specifically match this lecturer
+        isLecturerAuthorized = bearerValidLecturers.includes(sessionCreator);
+      } else if (adminAccount) {
+        // Fallback to admin if created by admin
+        isLecturerAuthorized = bearerValidLecturers.includes("admin");
+      }
+    }
+
+    // Check if the lecturer updated the password after the token was issued
+    const tokenIssuedAtMs = (bearerIat || 0) * 1000;
+    const isPasswordStillFresh =
+      !account.updatedAt ||
+      tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
+
+    if (isLecturerAuthorized && isPasswordStillFresh) {
+      bearerMatches = true;
+    }
   }
 
+  if (!bearerMatches) {
+    if (!password) {
+      return c.json(
+        {
+          error: `This session was created by instructor @${session.createdBy || "admin"}. Please log in with the password provided by @${session.createdBy || "admin"}.`,
+          requirePassword: true,
+        },
+        403,
+      );
+    }
+
+    let isPasswordValid = false;
+    const creatorAcc = studentAccounts.get(mapKey);
+    if (creatorAcc) {
+      isPasswordValid = await verifyPasswordSafely(password, creatorAcc.passwordHash);
+    }
+    if (!isPasswordValid) {
+      const adminAcc = studentAccounts.get(`${studentId}:admin`);
+      if (adminAcc) {
+        isPasswordValid = await verifyPasswordSafely(password, adminAcc.passwordHash);
+      }
+    }
+    if (!isPasswordValid && !creatorAcc) {
+      for (const acc of studentAccounts.values()) {
+        if (acc.studentId.toUpperCase() === studentId) {
+          if (await verifyPasswordSafely(password, acc.passwordHash)) {
+            isPasswordValid = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!isPasswordValid) {
+      const result = await recordFailedAttempt(ip, studentId);
+      if (result.isNowLocked && result.lockoutInfo) {
+        c.header("Retry-After", String(result.lockoutInfo.remainingSeconds));
+        c.header("X-RateLimit-Reset", String(result.lockoutInfo.lockedUntil));
+        return c.json(
+          {
+            error: `Too many failed login attempts. Account/IP temporarily locked for 15 minutes.`,
+            retryAfterSeconds: result.lockoutInfo.remainingSeconds,
+            lockedUntil: result.lockoutInfo.lockedUntil,
+            reason: result.lockoutInfo.reason,
+          },
+          429
+        );
+      }
+      return c.json(
+        {
+          error: `Password is incorrect for instructor @${session.createdBy || "admin"}. (Failed attempts: ${result.attemptsCount}/10)`,
+          failedAttempts: result.attemptsCount,
+          remainingAttempts: Math.max(0, 10 - result.attemptsCount),
+        },
+        403
+      );
+    }
+  }
+
+  await recordSuccessfulLogin(ip, studentId);
+
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime = session.startTime + session.durationMinutes * 60;
+  const sessionEndTime =
+    session.durationMinutes === -1
+      ? session.startTime + 24 * 60 * 60
+      : session.startTime + session.durationMinutes * 60;
   const remainingSeconds = sessionEndTime - now;
 
   if (remainingSeconds <= 0) {
-    return c.json({ error: "Session này đã kết thúc." }, 403);
+    return c.json({ error: "Session has ended." }, 403);
   }
 
-  const stateKey = `${sessionCode}:${studentId}`;
-  let state = sessionStates.get(stateKey);
+  let state = existingState;
   if (!state) {
     state = {
       sessionCode,
@@ -156,7 +324,7 @@ sessionAuthRouter.post("/login", async (c) => {
     return c.json(
       {
         error:
-          "Tài khoản đang đăng nhập trên thiết bị khác. Vui lòng liên hệ giám thị hoặc quản trị viên để reset.",
+          "Your account is currently logged in on another device. Please contact your instructor or system administrator to reset.",
       },
       403,
     );
@@ -182,7 +350,10 @@ sessionAuthRouter.post("/login", async (c) => {
         `[Auth] Failed to set Redis session for student ${studentId}:`,
         err,
       );
-      return c.json({ error: "Lỗi kết nối cơ sở dữ liệu RAM (Redis)." }, 500);
+      return c.json(
+        { error: "Failed to connect to RAM database (Redis)." },
+        500,
+      );
     }
   } else {
     console.warn(
@@ -208,6 +379,91 @@ sessionAuthRouter.post("/login", async (c) => {
     token,
     studentId,
     sessionCode,
+  });
+});
+
+sessionAuthRouter.post("/upload-logs", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return c.json({ error: "Missing or invalid authorization token" }, 401);
+  }
+
+  const token = authHeader.substring(7).trim();
+  let tokenPayload: any;
+  try {
+    tokenPayload = await verify(token, getJwtSecret(), "HS256" as any);
+  } catch {
+    return c.json({ error: "Token expired or invalid" }, 401);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "").trim().toUpperCase();
+  const studentId = (body.studentId || tokenPayload.studentId || "").trim().toUpperCase();
+  const files: Array<{ relativePath: string; content: string; encoding?: string }> = body.files || [];
+
+  if (!sessionCode || !studentId) {
+    return c.json({ error: "Missing required sessionCode or studentId" }, 400);
+  }
+
+  const targetDir = path.resolve(
+    process.cwd(),
+    "logs",
+    "sessions",
+    sanitizeFilename(sessionCode),
+    sanitizeFilename(studentId),
+  );
+
+  // Overwrite existing folder if it exists
+  if (fs.existsSync(targetDir)) {
+    try {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    } catch {
+      /* ignore removal error if locked */
+    }
+  }
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  let savedCount = 0;
+  for (const file of files) {
+    if (!file.relativePath || file.content === undefined) {
+      continue;
+    }
+    const safeRelPath = path.normalize(file.relativePath).replace(/^(\.\.[\/\\])+/, "");
+    const destPath = path.join(targetDir, safeRelPath);
+    const destDir = path.dirname(destPath);
+
+    if (!fs.existsSync(destDir)) {
+      fs.mkdirSync(destDir, { recursive: true });
+    }
+
+    if (file.encoding === "base64") {
+      const buffer = Buffer.from(file.content, "base64");
+      fs.writeFileSync(destPath, buffer);
+    } else {
+      fs.writeFileSync(destPath, file.content, "utf-8");
+    }
+    savedCount++;
+  }
+
+  const metaPath = path.join(targetDir, "upload_info.json");
+  const metaData = {
+    studentId,
+    sessionCode,
+    uploadTimestamp: Math.floor(Date.now() / 1000),
+    uploadTimeISO: new Date().toISOString(),
+    filesUploaded: savedCount,
+    ip: c.req.header("x-forwarded-for") || "local",
+  };
+  fs.writeFileSync(metaPath, JSON.stringify(metaData, null, 2), "utf-8");
+
+  console.log(`[Logs] Uploaded ${savedCount} monitoring log file(s) for student ${studentId} in session ${sessionCode}`);
+
+  return c.json({
+    success: true,
+    message: `Successfully uploaded ${savedCount} monitoring log file(s).`,
+    sessionCode,
+    studentId,
+    savedCount,
   });
 });
 

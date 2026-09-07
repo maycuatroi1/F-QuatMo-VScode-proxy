@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  quatmo-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quatmo-proxy
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - REDIS_URL=redis://redis:6379
+      - PROXY_API_KEY=123456789
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=123
+      - JWT_SECRET=super_secret_jwt_signing_key_for_quatmo_proxy_2026
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: quatmo-redis
+    restart: always
+    command: redis-server --appendonly yes --appendfsync everysec --save 60 1
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+    driver: local
