@@ -49,7 +49,11 @@ import {
   type StudentAccount,
 } from "../services/sessionStore";
 
-const adminRouter = new Hono();
+type AdminVariables = {
+  caller?: { username: string; role: string; name: string };
+};
+
+const adminRouter = new Hono<{ Variables: AdminVariables }>();
 
 // ─── FLOW ────────────────────────────────────────────────────────────────────
 //  Middleware protecting Admin data endpoints via PROXY_API_KEY or Admin/Lecturer JWT Token
@@ -955,18 +959,71 @@ adminRouter.get("/sessions", async (c) => {
   return c.json({ success: true, sessions: sessionList });
 });
 
-// ─── LOG DOWNLOAD ENDPOINTS ──────────────────────────────────────────────────
-adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
-  const sessionCode = sanitizeFilename(
-    c.req.param("sessionCode"),
-  ).toUpperCase();
-  const session = sessions.get(sessionCode);
+// ─── LOG DOWNLOAD HELPER & ENDPOINTS ──────────────────────────────────────────
 
-  if (!session) {
-    return c.json(
-      { error: `Session with code ${sessionCode} not found.` },
-      404,
-    );
+async function sendDirectoryZip(
+  dirPath: string,
+  zipFileName: string,
+  c: any,
+  fallbackMsg: string = "No log files found.",
+) {
+  if (!fs.existsSync(dirPath)) {
+    return c.json({ error: fallbackMsg }, 404);
+  }
+
+  try {
+    const zip = new AdmZip();
+    let addedFilesCount = 0;
+
+    async function walkAndAdd(currentDir: string, relativePath: string = "") {
+      const entries = await fs.promises.readdir(currentDir, {
+        withFileTypes: true,
+      });
+      for (const entry of entries) {
+        const entryRelativePath = relativePath
+          ? path.join(relativePath, entry.name)
+          : entry.name;
+        const entryFullPath = path.join(currentDir, entry.name);
+
+        if (entry.isDirectory()) {
+          await walkAndAdd(entryFullPath, entryRelativePath);
+        } else if (entry.isFile()) {
+          try {
+            const fileBuffer = await fs.promises.readFile(entryFullPath);
+            const zipPath = entryRelativePath.replace(/\\/g, "/");
+            zip.addFile(zipPath, fileBuffer);
+            addedFilesCount++;
+          } catch (readErr) {
+            console.error(`[Admin Zip] Failed to read ${entryFullPath}:`, readErr);
+          }
+        }
+      }
+    }
+
+    await walkAndAdd(dirPath);
+
+    if (addedFilesCount === 0) {
+      return c.json({ error: fallbackMsg }, 404);
+    }
+
+    const zipBuffer = zip.toBuffer();
+    c.header("Content-Type", "application/zip");
+    c.header("Content-Disposition", `attachment; filename=${zipFileName}`);
+    c.header("Access-Control-Expose-Headers", "Content-Disposition");
+    return c.body(zipBuffer);
+  } catch (err: any) {
+    console.error(`[Admin] Failed to zip logs for ${dirPath}:`, err);
+    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+  }
+}
+
+// 1. Session logs (supports multiple path aliases)
+const handleSessionLogDownload = async (c: any) => {
+  const sessionCode = sanitizeFilename(
+    c.req.param("sessionCode") || "",
+  ).toUpperCase();
+  if (!sessionCode) {
+    return c.json({ error: "Session code is required." }, 400);
   }
 
   const sessionLogDir = path.resolve(
@@ -976,254 +1033,123 @@ adminRouter.get("/sessions/:sessionCode/logs/zip", async (c) => {
     sessionCode,
   );
 
-  if (!fs.existsSync(sessionLogDir)) {
+  return await sendDirectoryZip(
+    sessionLogDir,
+    `session-${sessionCode}-logs.zip`,
+    c,
+    `No logs found for session ${sessionCode}.`,
+  );
+};
+
+adminRouter.get("/sessions/:sessionCode/logs", handleSessionLogDownload);
+adminRouter.get("/sessions/:sessionCode/logs/zip", handleSessionLogDownload);
+adminRouter.get("/sessions/:sessionCode/download-logs", handleSessionLogDownload);
+
+// 2. All logs archive (supports /logs/download-all, /logs/zip, /logs/download)
+const handleAllLogsDownload = async (c: any) => {
+  const logDir = path.resolve(process.cwd(), "logs");
+  return await sendDirectoryZip(
+    logDir,
+    `all-logs-${Date.now()}.zip`,
+    c,
+    "No server logs found.",
+  );
+};
+
+adminRouter.get("/logs/download-all", handleAllLogsDownload);
+adminRouter.get("/logs/zip", handleAllLogsDownload);
+adminRouter.get("/logs/download", handleAllLogsDownload);
+
+// 3. Guest logs archive
+const handleGuestLogsDownload = async (c: any) => {
+  const guestLogDir = path.resolve(process.cwd(), "logs", "guests");
+  return await sendDirectoryZip(
+    guestLogDir,
+    `guest-logs-${Date.now()}.zip`,
+    c,
+    "No guest logs found.",
+  );
+};
+
+adminRouter.get("/logs/download-guest-logs", handleGuestLogsDownload);
+adminRouter.get("/guests/logs/zip", handleGuestLogsDownload);
+adminRouter.get("/guests/logs", handleGuestLogsDownload);
+
+// 4. Single student / account log download
+adminRouter.get(
+  "/sessions/:sessionCode/accounts/:studentId/download",
+  async (c) => {
+    const sessionCode = sanitizeFilename(c.req.param("sessionCode")).toUpperCase();
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const studentDir = path.resolve(
+      process.cwd(),
+      "logs",
+      "sessions",
+      sessionCode,
+      studentId,
+    );
+    const studentJsonPath = path.resolve(
+      process.cwd(),
+      "logs",
+      "sessions",
+      sessionCode,
+      `${studentId}.json`,
+    );
+
+    // If student has a record directory (exam events, etc.), zip it along with prompt log json
+    if (fs.existsSync(studentDir)) {
+      const zip = new AdmZip();
+      if (fs.existsSync(studentJsonPath)) {
+        zip.addLocalFile(studentJsonPath, "");
+      }
+      zip.addLocalFolder(studentDir, studentId);
+      const buffer = zip.toBuffer();
+      c.header("Content-Type", "application/zip");
+      c.header(
+        "Content-Disposition",
+        `attachment; filename=${sessionCode}_${studentId}_logs.zip`,
+      );
+      c.header("Access-Control-Expose-Headers", "Content-Disposition");
+      return c.body(buffer);
+    } else if (fs.existsSync(studentJsonPath)) {
+      const content = await fs.promises.readFile(studentJsonPath, "utf-8");
+      c.header("Content-Type", "application/json");
+      c.header(
+        "Content-Disposition",
+        `attachment; filename=${sessionCode}_${studentId}_prompts.json`,
+      );
+      c.header("Access-Control-Expose-Headers", "Content-Disposition");
+      return c.text(content);
+    }
+
     return c.json(
-      { error: `No logs directory found for session ${sessionCode}.` },
+      { error: `No logs found for student ${studentId} in session ${sessionCode}.` },
       404,
     );
-  }
+  },
+);
 
-  try {
-    const zip = new AdmZip();
-    let addedFilesCount = 0;
+adminRouter.get("/guests/:guestId/download", async (c) => {
+  const guestId = sanitizeFilename(c.req.param("guestId")).toUpperCase();
+  const guestJsonPath = path.resolve(
+    process.cwd(),
+    "logs",
+    "guests",
+    `${guestId}.json`,
+  );
 
-    const secret = (
-      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
-    ).trim();
-
-    async function walkAndEncrypt(
-      currentDir: string,
-      relativePath: string = "",
-    ) {
-      const entries = await fs.promises.readdir(currentDir, {
-        withFileTypes: true,
-      });
-      for (const entry of entries) {
-        const entryRelativePath = relativePath
-          ? path.join(relativePath, entry.name)
-          : entry.name;
-        const entryFullPath = path.join(currentDir, entry.name);
-
-        if (entry.isDirectory()) {
-          await walkAndEncrypt(entryFullPath, entryRelativePath);
-        } else if (entry.isFile()) {
-          if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
-            const fileContent = await fs.promises.readFile(
-              entryFullPath,
-              "utf-8",
-            );
-
-            const key = crypto.createHash("sha256").update(secret).digest();
-            const iv = crypto
-              .createHash("sha256")
-              .update(key)
-              .digest()
-              .subarray(0, 16);
-            const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-            const encryptedBuffer = Buffer.concat([
-              cipher.update(fileContent, "utf-8"),
-              cipher.final(),
-            ]);
-
-            const zipPath = entryRelativePath.replace(/\\/g, "/");
-            zip.addFile(`${zipPath}.enc`, encryptedBuffer);
-            addedFilesCount++;
-          }
-        }
-      }
-    }
-
-    await walkAndEncrypt(sessionLogDir);
-
-    if (addedFilesCount === 0) {
-      return c.json(
-        { error: `No log files found for session ${sessionCode}.` },
-        404,
-      );
-    }
-
-    const zipBuffer = zip.toBuffer();
-
-    c.header("Content-Type", "application/zip");
+  if (fs.existsSync(guestJsonPath)) {
+    const content = await fs.promises.readFile(guestJsonPath, "utf-8");
+    c.header("Content-Type", "application/json");
     c.header(
       "Content-Disposition",
-      `attachment; filename=session-${sessionCode}-logs.zip`,
+      `attachment; filename=guest_${guestId}_prompts.json`,
     );
-    return c.body(zipBuffer);
-  } catch (err: any) {
-    console.error(
-      `[Admin] Failed to zip logs for session ${sessionCode}:`,
-      err,
-    );
-    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
-  }
-});
-
-adminRouter.get("/sessions/:sessionCode/logs", async (c) => {
-  return adminRouter.fetch(
-    new Request(
-      c.req.url.replace(
-        `/sessions/${c.req.param("sessionCode")}/logs`,
-        `/sessions/${c.req.param("sessionCode")}/logs/zip`,
-      ),
-      c.req.raw,
-    ),
-  );
-});
-
-adminRouter.get("/logs/download-guest-logs", async (c) => {
-  const guestLogDir = path.resolve(process.cwd(), "logs", "guests");
-  if (!fs.existsSync(guestLogDir)) {
-    return c.json({ error: "No guest logs found." }, 404);
+    c.header("Access-Control-Expose-Headers", "Content-Disposition");
+    return c.text(content);
   }
 
-  try {
-    const zip = new AdmZip();
-    let addedFilesCount = 0;
-
-    const secret = (
-      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
-    ).trim();
-
-    async function walkAndEncrypt(
-      currentDir: string,
-      relativePath: string = "",
-    ) {
-      const entries = await fs.promises.readdir(currentDir, {
-        withFileTypes: true,
-      });
-      for (const entry of entries) {
-        const entryRelativePath = relativePath
-          ? path.join(relativePath, entry.name)
-          : entry.name;
-        const entryFullPath = path.join(currentDir, entry.name);
-
-        if (entry.isDirectory()) {
-          await walkAndEncrypt(entryFullPath, entryRelativePath);
-        } else if (entry.isFile()) {
-          if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
-            const fileContent = await fs.promises.readFile(
-              entryFullPath,
-              "utf-8",
-            );
-
-            const key = crypto.createHash("sha256").update(secret).digest();
-            const iv = crypto
-              .createHash("sha256")
-              .update(key)
-              .digest()
-              .subarray(0, 16);
-            const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-            const encryptedBuffer = Buffer.concat([
-              cipher.update(fileContent, "utf-8"),
-              cipher.final(),
-            ]);
-
-            const zipPath = entryRelativePath.replace(/\\/g, "/");
-            zip.addFile(`${zipPath}.enc`, encryptedBuffer);
-            addedFilesCount++;
-          }
-        }
-      }
-    }
-
-    await walkAndEncrypt(guestLogDir);
-
-    if (addedFilesCount === 0) {
-      return c.json({ error: "No guest log files found." }, 404);
-    }
-
-    const zipBuffer = zip.toBuffer();
-
-    c.header("Content-Type", "application/zip");
-    c.header("Content-Disposition", `attachment; filename=guest-logs.zip`);
-    return c.body(zipBuffer);
-  } catch (err: any) {
-    console.error(`[Admin] Failed to zip logs for guests:`, err);
-    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
-  }
-});
-
-adminRouter.get("/logs/zip", async (c) => {
-  const logDir = path.resolve(process.cwd(), "logs");
-  if (!fs.existsSync(logDir)) {
-    return c.json({ error: "No logs found." }, 404);
-  }
-
-  try {
-    const zip = new AdmZip();
-    let addedFilesCount = 0;
-
-    const secret = (
-      process.env.LOG_ENCRYPT_KEY || "quatmo-logs-default-passphrase"
-    ).trim();
-
-    async function walkAndEncrypt(
-      currentDir: string,
-      relativePath: string = "",
-    ) {
-      const entries = await fs.promises.readdir(currentDir, {
-        withFileTypes: true,
-      });
-      for (const entry of entries) {
-        const entryRelativePath = relativePath
-          ? path.join(relativePath, entry.name)
-          : entry.name;
-        const entryFullPath = path.join(currentDir, entry.name);
-
-        if (entry.isDirectory()) {
-          await walkAndEncrypt(entryFullPath, entryRelativePath);
-        } else if (entry.isFile()) {
-          if (entry.name.endsWith(".json") || entry.name.endsWith(".log")) {
-            const isTargetLog =
-              entryRelativePath.startsWith("sessions" + path.sep) ||
-              entryRelativePath.startsWith("guests" + path.sep) ||
-              entryRelativePath.startsWith("machines" + path.sep) ||
-              entryRelativePath.startsWith("guests/") ||
-              entryRelativePath.startsWith("machines/");
-
-            if (isTargetLog) {
-              const fileContent = await fs.promises.readFile(
-                entryFullPath,
-                "utf-8",
-              );
-
-              const key = crypto.createHash("sha256").update(secret).digest();
-              const iv = crypto
-                .createHash("sha256")
-                .update(key)
-                .digest()
-                .subarray(0, 16);
-              const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-              const encryptedBuffer = Buffer.concat([
-                cipher.update(fileContent, "utf-8"),
-                cipher.final(),
-              ]);
-
-              const zipPath = `${entryRelativePath}.enc`.replace(/\\/g, "/");
-              zip.addFile(zipPath, encryptedBuffer);
-              addedFilesCount++;
-            }
-          }
-        }
-      }
-    }
-
-    await walkAndEncrypt(logDir);
-
-    if (addedFilesCount === 0) {
-      return c.json({ error: "No log files found." }, 404);
-    }
-
-    const zipBuffer = zip.toBuffer();
-
-    c.header("Content-Type", "application/zip");
-    c.header("Content-Disposition", `attachment; filename=all-logs.zip`);
-    return c.body(zipBuffer);
-  } catch (err: any) {
-    console.error(`[Admin] Failed to zip all logs:`, err);
-    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
-  }
+  return c.json({ error: `No logs found for guest ${guestId}.` }, 404);
 });
 
 // ─── VISUALIZE LOGS ENDPOINTS ─────────────────────────────────────────────
@@ -1341,8 +1267,11 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
+  const caller = (c.get("caller") as any) || { username: "admin", role: "admin" };
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
   const filteredSessions = resultSessions.filter((s) => {
+    if (callerRole === "admin") return true;
     const sessionObj = sessions.get(s.sessionCode);
     return (sessionObj?.createdBy || "admin").toLowerCase() === callerUser;
   });
