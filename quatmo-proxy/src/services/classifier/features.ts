@@ -104,6 +104,23 @@ export function deriveIemLabel(
 ): "instrumental" | "executive" | "mixed" | "ambiguous" {
   const delta = instrumentalScore - executiveScore;
 
+  // 1. Dominant signal: Leader is >= HIGH (0.55) and separation > 0.20
+  if (instrumentalScore >= IEM_HIGH_THRESHOLD && delta > 0.20) {
+    return "instrumental";
+  }
+  if (executiveScore >= IEM_HIGH_THRESHOLD && -delta > 0.20) {
+    return "executive";
+  }
+
+  // 2. Both signals are strong/active (>= MID 0.45) and competing -> Mixed
+  if (
+    instrumentalScore >= IEM_MID_THRESHOLD &&
+    executiveScore >= IEM_MID_THRESHOLD
+  ) {
+    return "mixed";
+  }
+
+  // 3. Clear single-sided signals where other signal is weak (< MID 0.45)
   if (
     instrumentalScore >= IEM_HIGH_THRESHOLD &&
     executiveScore < IEM_MID_THRESHOLD &&
@@ -111,20 +128,12 @@ export function deriveIemLabel(
   ) {
     return "instrumental";
   }
-
   if (
     executiveScore >= IEM_HIGH_THRESHOLD &&
     instrumentalScore < IEM_MID_THRESHOLD &&
     -delta >= IEM_MARGIN_THRESHOLD
   ) {
     return "executive";
-  }
-
-  if (
-    instrumentalScore >= IEM_MID_THRESHOLD &&
-    executiveScore >= IEM_MID_THRESHOLD
-  ) {
-    return "mixed";
   }
 
   return "ambiguous";

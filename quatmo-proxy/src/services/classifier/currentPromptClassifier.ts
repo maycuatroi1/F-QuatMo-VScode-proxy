@@ -58,17 +58,26 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   const asksExplanation =
     /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|difference between|compare|meaning of|intuition behind)\b/i.test(
       text,
+    ) ||
+    /(?:giải thích|là gì|tại sao|nguyên lý|ý nghĩa|khác nhau thế nào|hoạt động như thế nào)/i.test(
+      text,
     );
 
   // --- Executive Signals ---
   const asksDirectCreation =
-    /\b(write|create|build|implement|generate|rewrite|complete|finish)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm)\b/i.test(
+    /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website)\b/i.test(
       text,
     ) ||
-    /\bwrite (?:me )?(?:a |an |the )?(?:full |complete )?(?:code|script|function|program|solution|implementation)\b/i.test(
+    /\bwrite (?:me )?(?:a |an |the )?(?:full |complete )?(?:code|script|function|program|solution|implementation|app)\b/i.test(
       text,
     ) ||
     /\b(give|provide|send) (?:me )?(?:a |the )?(?:complete |full )?(?:code|script|solution|implementation)\b/i.test(
+      text,
+    ) ||
+    /(?:viết|code|tạo|làm|xây dựng|viết giúp|làm giúp|code giúp|viết hộ|làm hộ|code hộ|giải bài).{0,30}(?:code|hàm|function|chương trình|bài|script|dự án|project|app|web|trang web|thuật toán|giúp tôi|hộ tôi)/i.test(
+      text,
+    ) ||
+    /(?:code cho (?:tôi|tao|mình|em)|viết cho (?:tôi|tao|mình|em)|làm bài này|giải bài này|viết code)/i.test(
       text,
     );
 
@@ -77,6 +86,12 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
       text,
     ) ||
     /\bwhat is the (?:solution|answer|complete code|full solution)\b/i.test(
+      text,
+    ) ||
+    /\b(solve|do) (?:this|the) (?:problem|exercise|assignment|task|question)\b/i.test(
+      text,
+    ) ||
+    /(?:cho (?:tôi|tao|mình|em) (?:code|đáp án|lời giải|kết quả)|đưa code|cho xin code|giải hộ)/i.test(
       text,
     );
 
@@ -87,7 +102,10 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     /\b(make it work|fix it for me|do it for me|solve it for me)\b/i.test(
       text,
     ) ||
-    /\bjust (?:fix|correct|solve) (?:it|this|my code)\b/i.test(text);
+    /\bjust (?:fix|correct|solve) (?:it|this|my code)\b/i.test(text) ||
+    /(?:sửa (?:giúp|hộ|cho)|fix (?:giúp|hộ|cho)|sửa lỗi này|làm cho nó chạy|sửa code)/i.test(
+      text,
+    );
 
   // Instrumental Feature Activations (i1 - i8)
   if (asksExplanation) activate(features, "i1", 0.75);
@@ -95,15 +113,17 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   if (
     /\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide)\b/i.test(
       text,
-    )
+    ) ||
+    /(?:cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text)
   ) {
     activate(features, "i2", 0.75);
   }
 
   if (
-    /\b(why (?:did|is|does)|root cause|what causes|diagnose|understand (?:the )?error|meaning of (?:this )?traceback|exception|stack trace)\b/i.test(
+    (/\b(why (?:did|is|does)|root cause|what causes|diagnose|understand (?:the )?error|meaning of (?:this )?traceback|exception|stack trace)\b/i.test(
       text,
-    ) &&
+    ) ||
+      /(?:tại sao lỗi|nguyên nhân lỗi|lỗi này nghĩa là gì)/i.test(text)) &&
     !delegatesFix
   ) {
     activate(features, "i3", 0.75);
@@ -130,13 +150,17 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   if (
     /\b(architecture|structure|design pattern|how to organize|modularity|database schema|data structure choice)\b/i.test(
       text,
-    )
+    ) ||
+    /(?:kiến trúc|cấu trúc thư mục|thiết kế database)/i.test(text)
   ) {
     activate(features, "i6", 0.75);
   }
 
   if (
     /\b(is this (?:approach|way|idea|logic)|is my (?:approach|thought|solution|understanding)|am i on the right track|am i right|validate (?:my|this)|check my logic)\b/i.test(
+      text,
+    ) ||
+    /(?:logic này đúng không|cách này ổn không|tôi làm thế này có đúng không)/i.test(
       text,
     )
   ) {
@@ -153,12 +177,12 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
 
   // Executive Feature Activations (e1 - e6)
   if (
-    text.length >= 400 &&
-    /\b(requirements?|assignment|task|acceptance criteria|problem statement|input format|output format|sample input)\b/i.test(
+    text.length >= 200 &&
+    /\b(requirements?|assignment|task|acceptance criteria|problem statement|input format|output format|sample input|sample output|test case|bài tập|đề bài|yêu cầu bài)\b/i.test(
       text,
     )
   ) {
-    activate(features, "e1", 0.75);
+    activate(features, "e1", 0.85);
   }
 
   if (asksDirectCreation) activate(features, "e2", 1.0);
@@ -176,14 +200,15 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   if (
     /\b(i am stuck|i'm stuck|cannot do|can't do|do everything|make it work|do it for me|you do it|just do it for me|write it all for me)\b/i.test(
       text,
-    )
+    ) ||
+    /(?:làm hết hộ|giải hết|làm từ a đến z|làm giúp từ đầu)/i.test(text)
   ) {
     activate(features, "e6", 1.0);
   }
 
   const instrumentalScore = scoreFeatures(features, INSTRUMENTAL_WEIGHTS);
   const executiveScore = scoreFeatures(features, EXECUTIVE_WEIGHTS);
-  const hardExecutive = ["e2", "e3", "e4", "e6"].some(
+  const hardExecutive = ["e1", "e2", "e3", "e4", "e6"].some(
     (key) => (features[key] ?? 0) >= 0.75,
   );
 

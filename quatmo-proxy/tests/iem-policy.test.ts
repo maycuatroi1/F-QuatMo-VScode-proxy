@@ -22,6 +22,14 @@ test("conceptual current request selects instrumental mode", () => {
   expect(decision.label).toBe("instrumental");
 });
 
+test("vietnamese executive prompt is accurately classified as executive", () => {
+  const decision1 = classifyCurrentPrompt("Viết code cho tôi bài tập tạo web django này");
+  expect(decision1.label).toBe("executive");
+
+  const decision2 = classifyCurrentPrompt("giải bài này giúp tôi với");
+  expect(decision2.label).toBe("executive");
+});
+
 test("unclear current request fails safely to mixed mode", () => {
   const decision = classifyCurrentPrompt("Help me with Python");
   expect(decision.label).toBe("mixed");
@@ -97,6 +105,8 @@ test("IEM gates use HIGH 0.55, MID 0.45, and MARGIN 0.15", () => {
   expect(deriveIemLabel(0.2, 0.7)).toBe("executive");
   expect(deriveIemLabel(0.7, 0.5)).toBe("mixed");
   expect(deriveIemLabel(0.5, 0.2)).toBe("ambiguous");
+  expect(deriveIemLabel(0.5, 0.9)).toBe("executive");
+  expect(deriveIemLabel(0.9, 0.5)).toBe("instrumental");
 });
 
 test("t10 requires delegation to recur across turns", () => {
