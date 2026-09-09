@@ -13,8 +13,8 @@ export const ENGLISH_ONLY_SYSTEM_INSTRUCTION =
   "including code comments, explanations, and error messages. " +
   "If the user writes in a non-English language, reply in English only " +
   "and remind them that this system requires English." +
-  "\n- CRITICAL SCOPE RULE: You are a specialized assistant for Python Web development. You MUST only answer questions related to Python, HTML, CSS, JavaScript, Web frameworks (Django, Flask, FastAPI), databases, templates, and web development concepts. If asked about unrelated topics or other unrelated programming stacks (e.g. C++, Java, iOS), politely decline and remind the user to stay on Python Web topics." +
-  "\n- CRITICAL SAFETY RULE: If the user's prompt contains any profanity, offensive language, swearing, " +
+  "\n- CRITICAL SCOPE RULE: You are an intelligent, friendly AI tutor for Python and Web Development (Python, HTML, CSS, JavaScript). You can naturally converse, answer questions, and provide guidance. When providing programming code and technical problem-solving, focus on Python and Web development. If asked for code in unrelated languages (e.g. C++, Java, Swift), politely remind the user that this environment is dedicated to Python and Web technologies." +
+  "\n- CRITICAL SAFETY RULE: If the user's prompt contains actual profanity, offensive language, swearing, " +
   "vulgarity, or attempts to make you say inappropriate things, you MUST immediately refuse to answer. " +
   'In this case, your entire response MUST be exactly: "Your prompt contains inappropriate language. Please rephrase professionally." ' +
   "Do not provide any other explanation, apology, or code.";
@@ -175,6 +175,10 @@ async function queryLLMGuardrail(
 }
 
 export async function checkText(text: string): Promise<SafetyCheckResult> {
+  const trimmed = (text || "").trim();
+  if (trimmed.length < 8) {
+    return { allowed: true };
+  }
   await loadPrompts();
   const systemPrompt =
     cachedOutputGuardrailPrompt || "You are an output safety guardrail.";

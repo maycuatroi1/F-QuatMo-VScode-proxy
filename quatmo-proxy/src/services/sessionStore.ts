@@ -22,6 +22,13 @@ export interface StudentAccount {
   updatedBy?: string;
 }
 
+export interface ExamQuestion {
+  id: string;
+  title: string;
+  content: string;
+  questionPrompt: string;
+}
+
 export interface Session {
   sessionCode: string;
   startTime: number;
@@ -31,6 +38,9 @@ export interface Session {
   defaultTokenBudget: number;
   allowedStudentIds: Set<string>;
   assignedGroups?: string[];
+  sessionType?: "basic" | "exam";
+  sessionPrompt?: string;
+  examQuestions?: ExamQuestion[];
   createdAt: number;
   createdBy?: string;
   updatedAt?: number;
@@ -142,6 +152,9 @@ db.run(`
     default_token_budget INTEGER NOT NULL,
     allowed_student_ids TEXT NOT NULL,
     assigned_groups TEXT,
+    session_type TEXT DEFAULT 'basic',
+    session_prompt TEXT DEFAULT '',
+    exam_questions TEXT DEFAULT '[]',
     created_at INTEGER NOT NULL,
     created_by TEXT DEFAULT 'admin',
     updated_at INTEGER,
@@ -150,6 +163,9 @@ db.run(`
 `);
 
 try { db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN session_type TEXT DEFAULT 'basic'"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN session_prompt TEXT DEFAULT ''"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN exam_questions TEXT DEFAULT '[]'"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN created_by TEXT DEFAULT 'admin'"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
@@ -248,8 +264,8 @@ const stmtDeleteStudent = db.prepare(`
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at, created_by, updated_at, updated_by)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created, $created_by, $updated_at, $updated_by)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, session_type, session_prompt, exam_questions, created_at, created_by, updated_at, updated_by)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $session_type, $session_prompt, $exam_questions, $created, $created_by, $updated_at, $updated_by)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -347,6 +363,9 @@ export class PersistedSessions extends Map<string, Session> {
       $budget: value.defaultTokenBudget,
       $students: JSON.stringify(Array.from(value.allowedStudentIds)),
       $groups: JSON.stringify(value.assignedGroups || []),
+      $session_type: value.sessionType || "basic",
+      $session_prompt: value.sessionPrompt || "",
+      $exam_questions: JSON.stringify(value.examQuestions || []),
       $created: value.createdAt || now,
       $created_by: value.createdBy || "admin",
       $updated_at: value.updatedAt || now,
@@ -612,6 +631,12 @@ try {
     } catch {
       parsedGroups = [];
     }
+    let parsedQuestions: ExamQuestion[] = [];
+    try {
+      if (r.exam_questions) parsedQuestions = JSON.parse(r.exam_questions);
+    } catch {
+      parsedQuestions = [];
+    }
     Map.prototype.set.call(sessions, r.session_code, {
       sessionCode: r.session_code,
       startTime: r.start_time,
@@ -621,6 +646,9 @@ try {
       defaultTokenBudget: r.default_token_budget,
       allowedStudentIds: new Set(JSON.parse(r.allowed_student_ids)),
       assignedGroups: parsedGroups,
+      sessionType: r.session_type || "basic",
+      sessionPrompt: r.session_prompt || "",
+      examQuestions: parsedQuestions,
       createdAt: r.created_at || Date.now(),
       createdBy: r.created_by || "admin",
       updatedAt: r.updated_at || r.created_at || Date.now(),

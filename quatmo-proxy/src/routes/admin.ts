@@ -307,6 +307,9 @@ adminRouter.get("/lecturers/:username/details", async (c) => {
       aiOption: s.aiOption,
       allowedStudentCount: s.allowedStudentIds.size,
       assignedGroups: s.assignedGroups || [],
+      sessionType: s.sessionType || "basic",
+      sessionPrompt: s.sessionPrompt || "",
+      examQuestions: s.examQuestions || [],
       createdAt: s.createdAt,
     }));
 
@@ -676,12 +679,18 @@ adminRouter.post("/sessions", async (c) => {
     aiValidityMinutes,
     defaultTokenBudget,
     assignedGroups,
+    sessionType,
+    sessionPrompt,
+    examQuestions,
   } = body as {
     durationMinutes?: number;
     aiOption?: "chatbot" | "agent" | "none";
     aiValidityMinutes?: number;
     defaultTokenBudget?: number;
     assignedGroups?: string[];
+    sessionType?: "basic" | "exam";
+    sessionPrompt?: string;
+    examQuestions?: any[];
   };
 
   if (
@@ -766,6 +775,9 @@ adminRouter.post("/sessions", async (c) => {
     defaultTokenBudget,
     allowedStudentIds,
     assignedGroups: groupNames,
+    sessionType: sessionType || "basic",
+    sessionPrompt: sessionPrompt || "",
+    examQuestions: Array.isArray(examQuestions) ? examQuestions : [],
     createdAt: now,
     createdBy: caller.username,
     updatedAt: now,
@@ -797,6 +809,51 @@ adminRouter.post("/sessions", async (c) => {
       ...newSession,
       allowedStudentIds: Array.from(allowedStudentIds),
       assignedGroups: groupNames,
+    },
+  });
+});
+
+adminRouter.patch("/sessions/:sessionCode", async (c) => {
+  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
+
+  const body = await c.req.json();
+  const {
+    durationMinutes,
+    aiOption,
+    aiValidityMinutes,
+    defaultTokenBudget,
+    sessionType,
+    sessionPrompt,
+    examQuestions,
+  } = body as any;
+
+  if (typeof durationMinutes === "number") session.durationMinutes = durationMinutes;
+  if (typeof aiOption === "string") session.aiOption = aiOption;
+  if (typeof aiValidityMinutes === "number") session.aiValidityMinutes = aiValidityMinutes;
+  if (typeof defaultTokenBudget === "number") session.defaultTokenBudget = defaultTokenBudget;
+  if (sessionType === "basic" || sessionType === "exam") session.sessionType = sessionType;
+  if (typeof sessionPrompt === "string") session.sessionPrompt = sessionPrompt;
+  if (Array.isArray(examQuestions)) session.examQuestions = examQuestions;
+
+  session.updatedAt = Date.now();
+  session.updatedBy = caller.username;
+  sessions.set(sessionCode, session);
+
+  return c.json({
+    success: true,
+    message: `Session ${sessionCode} updated successfully.`,
+    session: {
+      ...session,
+      allowedStudentIds: Array.from(session.allowedStudentIds),
     },
   });
 });
@@ -952,6 +1009,9 @@ adminRouter.get("/sessions", async (c) => {
       aiValidityMinutes: session.aiValidityMinutes,
       defaultTokenBudget: session.defaultTokenBudget,
       assignedGroups: session.assignedGroups || [],
+      sessionType: session.sessionType || "basic",
+      sessionPrompt: session.sessionPrompt || "",
+      examQuestions: session.examQuestions || [],
       createdAt: session.createdAt || session.startTime * 1000,
       createdBy: session.createdBy || "admin",
       updatedAt: session.updatedAt || session.createdAt || Date.now(),
