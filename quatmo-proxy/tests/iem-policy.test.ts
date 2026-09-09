@@ -120,3 +120,89 @@ test("t10 requires delegation to recur across turns", () => {
 
   expect(features.t10).toBe(0.75);
 });
+
+test("c10 drops to 0 when student runs test or script in terminal", () => {
+  const features = calculateProgrammaticFeatures(
+    "how do I fix the loop condition?",
+    "",
+    {
+      recentTerminal: {
+        lastCommand: "python test_solution.py",
+        output: "Ran 3 tests in 0.002s\nOK\n[Process exited with code 0]",
+        timestamp: Date.now(),
+      },
+    },
+    null,
+    30,
+    [],
+  );
+
+  expect(features.c10).toBe(0);
+});
+
+test("c10 activates when multiple turns pass with zero test or execution activity in terminal and prompt", () => {
+  const priorTurns: TurnLog[] = [
+    {
+      timestamp: 1,
+      prompt: "give me code for problem 1",
+      response: "```python\nprint(1)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+    {
+      timestamp: 2,
+      prompt: "now do problem 2",
+      response: "```python\nprint(2)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+    {
+      timestamp: 3,
+      prompt: "now do problem 3",
+      response: "```python\nprint(3)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+  ];
+
+  const featuresWithTelemetry = calculateProgrammaticFeatures(
+    "now solve problem 4",
+    "",
+    {
+      recentTerminal: {
+        output: "ls -la",
+        timestamp: Date.now(),
+      },
+    },
+    priorTurns[2],
+    30,
+    priorTurns,
+  );
+
+  expect(featuresWithTelemetry.c10).toBe(1.0);
+});
+
+test("c10 drops to 0 when prior turn in window had terminal test execution", () => {
+  const priorTurns: TurnLog[] = [
+    {
+      timestamp: 1,
+      prompt: "my test failed",
+      response: "check the base case",
+      terminalOutput: "Traceback (most recent call last):\n  File \"solution.py\", line 10\nAssertionError",
+      lastTerminalCommand: "python solution.py",
+      I_score: 0.5,
+      E_score: 0.2,
+    },
+  ];
+
+  const features = calculateProgrammaticFeatures(
+    "how should I rewrite the base case?",
+    "",
+    null,
+    priorTurns[0],
+    20,
+    priorTurns,
+  );
+
+  expect(features.c10).toBe(0);
+});

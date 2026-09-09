@@ -21,11 +21,14 @@ import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import { redisStore } from "../services/classifier/redisStore";
-import { evaluateTurnAndSession } from "../services/classifier/index";
+import { s3Storage } from "../services/s3Storage";
 import {
-  classifyCurrentPrompt,
-  type IemLabel,
-} from "../services/classifier/currentPromptClassifier";
+  evaluateTurnAndSession,
+  getStudentTopNClassification,
+  type TopNClassificationResult,
+} from "../services/classifier/index";
+import { extractCodeSnapshot } from "../services/classifier/features";
+import type { IemLabel } from "../services/classifier/currentPromptClassifier";
 import {
   getIemPolicyFallback,
   IemStreamPolicyGuard,
@@ -273,11 +276,15 @@ chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
   sessionCode = sessionCode.toUpperCase();
   studentId = studentId.toUpperCase();
 
-  const { activeFile, recentPaste, files } = body;
+  const { activeFile, recentPaste, files, recentTerminal, terminalOutput } = body;
+  const terminalActivity =
+    recentTerminal ||
+    (terminalOutput ? { output: terminalOutput, timestamp: Date.now() } : undefined);
   await redisStore.saveClientContext(sessionCode, studentId, {
     activeFile,
     recentPaste,
     files,
+    recentTerminal: terminalActivity,
   });
   return c.json({ success: true });
 });
@@ -410,14 +417,39 @@ async function logStudentInteraction(
   isSession: boolean = true,
   machineId?: string,
 ) {
+  const userMessages = body?.messages?.filter((m: any) => m.role === "user") || [];
+  const currentUserMsg =
+    userMessages.length > 0
+      ? (typeof userMessages[userMessages.length - 1].content === "string"
+          ? userMessages[userMessages.length - 1].content
+          : JSON.stringify(userMessages[userMessages.length - 1].content))
+          .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+          .trimStart()
+      : "";
+
   const clientContext = await redisStore.getClientContext(
     sessionCode,
     studentId,
   );
-  const codeSnapshot = clientContext?.activeFile?.content || "";
-  const activeFilePath = clientContext?.activeFile?.path || "";
-  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
-  const codeSnapshots = clientContext?.files || [];
+  const extracted = extractCodeSnapshot(body, currentUserMsg);
+  const codeSnapshot = clientContext?.activeFile?.content || extracted.content || "";
+  const activeFilePath = clientContext?.activeFile?.path || extracted.path || "";
+  const activeFileLanguageId = clientContext?.activeFile?.languageId || extracted.languageId || "";
+  const codeSnapshots = clientContext?.files && clientContext.files.length > 0
+    ? clientContext.files
+    : extracted.content
+      ? [{ path: extracted.path, content: extracted.content, languageId: extracted.languageId }]
+      : [];
+
+  const terminalOutput =
+    clientContext?.recentTerminal?.output ||
+    body?.terminalOutput ||
+    body?.recentTerminal?.output ||
+    "";
+  const lastTerminalCommand =
+    clientContext?.recentTerminal?.lastCommand ||
+    body?.recentTerminal?.lastCommand ||
+    "";
 
   // Clean CLASSIFIER_RESULT prefix from completionText
   const cleanCompletion = completionText
@@ -481,13 +513,6 @@ async function logStudentInteraction(
       ? body.messages[body.messages.length - 1]
       : null;
 
-  const userMessages = body.messages.filter((m: any) => m.role === "user");
-  const currentUserMsg =
-    userMessages.length > 0
-      ? userMessages[userMessages.length - 1].content
-          .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
-          .trimStart()
-      : "";
 
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
   const safeSessionCode = sanitizeFilename(sessionCode || "DEFAULT").toUpperCase();
@@ -528,6 +553,12 @@ async function logStudentInteraction(
       lastEntry.activeFilePath = activeFilePath;
       lastEntry.activeFileLanguageId = activeFileLanguageId;
       lastEntry.codeSnapshots = codeSnapshots;
+      if (terminalOutput) {
+        lastEntry.terminalOutput = terminalOutput;
+      }
+      if (lastTerminalCommand) {
+        lastEntry.lastTerminalCommand = lastTerminalCommand;
+      }
       if (
         finalLabel &&
         finalLabel !== "none" &&
@@ -568,6 +599,8 @@ async function logStudentInteraction(
         activeFilePath,
         activeFileLanguageId,
         codeSnapshots,
+        terminalOutput,
+        lastTerminalCommand,
       };
 
       if (toolCalls.length > 0) {
@@ -592,8 +625,14 @@ async function logStudentInteraction(
       isContinuation && lastEntry ? lastEntry : logs[logs.length - 1];
     if (isSession) {
       await logSession(safeSessionCode, safeStudentId, sessionEntry);
+      if (s3Storage.isAvailable()) {
+        void s3Storage.uploadStudentPromptLog(safeSessionCode, safeStudentId, logs);
+      }
     } else {
       await logGuest(safeLogIdentifier, sessionEntry);
+      if (s3Storage.isAvailable()) {
+        void s3Storage.uploadGuestPromptLog(safeLogIdentifier, logs);
+      }
     }
   } catch (err) {
     console.error("[Logger] Failed to write student log:", err);
@@ -620,22 +659,39 @@ async function logStudentError(
   isSession: boolean = true,
   machineId?: string,
 ) {
-  const clientContext = await redisStore
-    .getClientContext(sessionCode, studentId)
-    .catch(() => null);
-  const codeSnapshot = clientContext?.activeFile?.content || "";
-  const activeFilePath = clientContext?.activeFile?.path || "";
-  const activeFileLanguageId = clientContext?.activeFile?.languageId || "";
-  const codeSnapshots = clientContext?.files || [];
-
   const userMessages =
     body?.messages?.filter((m: any) => m.role === "user") || [];
   const currentUserMsg =
     userMessages.length > 0
-      ? userMessages[userMessages.length - 1].content
-          ?.replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
+      ? (typeof userMessages[userMessages.length - 1].content === "string"
+          ? userMessages[userMessages.length - 1].content
+          : JSON.stringify(userMessages[userMessages.length - 1].content))
+          .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
           .trimStart()
       : "";
+
+  const clientContext = await redisStore
+    .getClientContext(sessionCode, studentId)
+    .catch(() => null);
+  const extracted = extractCodeSnapshot(body, currentUserMsg);
+  const codeSnapshot =
+    clientContext?.activeFile?.content || extracted.content || "";
+  const activeFilePath =
+    clientContext?.activeFile?.path || extracted.path || "";
+  const activeFileLanguageId =
+    clientContext?.activeFile?.languageId || extracted.languageId || "";
+  const codeSnapshots =
+    clientContext?.files && clientContext.files.length > 0
+      ? clientContext.files
+      : extracted.content
+        ? [
+            {
+              path: extracted.path,
+              content: extracted.content,
+              languageId: extracted.languageId,
+            },
+          ]
+        : [];
 
   const safeSessionCode = sanitizeFilename(sessionCode || "DEFAULT").toUpperCase();
   const safeStudentId = sanitizeFilename(studentId || "DEFAULT_USER").toUpperCase();
@@ -842,12 +898,57 @@ chatRouter.post(
       ? [...messages].reverse().find(isRealUserMessage)
       : null;
     const policyPrompt = messageText(latestRealUserMessage);
-    const currentIemDecision = classifyCurrentPrompt(policyPrompt);
-    const currentIemLabel = currentIemDecision.label;
+    // Auto-save client context if provided in body or auto-extracted from prompt
+    const extractedCode = extractCodeSnapshot(body, policyPrompt);
+    const terminalActivity =
+      body.recentTerminal ||
+      (body.terminalOutput ? { output: body.terminalOutput, timestamp: Date.now() } : undefined);
+    if (body.activeFile || body.files || terminalActivity) {
+      await redisStore
+        .saveClientContext(finalSessionCode, finalStudentId, {
+          activeFile: body.activeFile,
+          recentPaste: body.recentPaste,
+          files: body.files,
+          recentTerminal: terminalActivity,
+        })
+        .catch(() => {});
+    } else if (extractedCode.content) {
+      const existing = await redisStore
+        .getClientContext(finalSessionCode, finalStudentId)
+        .catch(() => null);
+      if (!existing?.activeFile?.content) {
+        await redisStore
+          .saveClientContext(finalSessionCode, finalStudentId, {
+            activeFile: {
+              path: extractedCode.path,
+              content: extractedCode.content,
+              languageId: extractedCode.languageId,
+            },
+            files: [
+              {
+                path: extractedCode.path,
+                content: extractedCode.content,
+                languageId: extractedCode.languageId,
+              },
+            ],
+          })
+          .catch(() => {});
+      }
+    }
+
     const isUserPrompt = isRealUserMessage(lastMsg);
 
+    // Retrieve active IEM label from student's top-N sliding window classification history
+    const topNDecision = await getStudentTopNClassification(
+      finalSessionCode,
+      finalStudentId,
+      token,
+    );
+    const currentIemLabel: IemLabel = topNDecision.label;
+    const currentIemConfidence: number = topNDecision.confidence;
+
     console.log(
-      `[IEM Preflight] Label: ${currentIemLabel} | I: ${currentIemDecision.instrumentalScore.toFixed(2)} | E: ${currentIemDecision.executiveScore.toFixed(2)} | Confidence: ${currentIemDecision.confidence.toFixed(2)}`,
+      `[IEM Top-N Active Label] Student: ${finalStudentId} (${finalSessionCode}) | Active Label: ${currentIemLabel} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
     );
 
     if (isUserPrompt && messages && Array.isArray(messages)) {
@@ -971,18 +1072,18 @@ chatRouter.post(
     }
 
     let classifierLabel = currentIemLabel;
-    let classifierConfidence = currentIemDecision.confidence;
+    let classifierConfidence = currentIemConfidence;
 
-    if (isUserPrompt && currentIemLabel && currentIemLabel !== "none") {
+    if (isUserPrompt && currentIemLabel) {
       latestClassifications.set(token, {
         label: currentIemLabel,
-        confidence: currentIemDecision.confidence,
+        confidence: currentIemConfidence,
       });
       await redisStore
         .setCachedClassification(
           token,
           currentIemLabel,
-          currentIemDecision.confidence,
+          currentIemConfidence,
         )
         .catch(() => {});
 

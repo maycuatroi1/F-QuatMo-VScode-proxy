@@ -5,6 +5,8 @@ export interface TurnLog {
   prompt: string;
   response: string;
   codeSnapshot?: string;
+  terminalOutput?: string;
+  lastTerminalCommand?: string;
   I_score: number;
   E_score: number;
   featureVector?: Record<string, number>;
@@ -25,6 +27,12 @@ export interface ClientContext {
     text: string;
     timestamp: number;
   };
+  recentTerminal?: {
+    output: string;
+    lastCommand?: string;
+    exitCode?: number;
+    timestamp: number;
+  };
 }
 
 const localClientContexts = new Map<string, ClientContext>();
@@ -42,14 +50,21 @@ export const redisStore = {
   async saveClientContext(
     sessionCode: string,
     studentId: string,
-    context: ClientContext,
+    context: Partial<ClientContext>,
   ): Promise<void> {
     const key = `session:client-context:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
+    const existing = await this.getClientContext(sessionCode, studentId);
+    const merged: ClientContext = {
+      activeFile: context.activeFile ?? existing?.activeFile,
+      files: context.files ?? existing?.files,
+      recentPaste: context.recentPaste ?? existing?.recentPaste,
+      recentTerminal: context.recentTerminal ?? existing?.recentTerminal,
+    };
     if (redis && redis.status === "ready") {
       try {
         await redis.set(
           key,
-          JSON.stringify(context),
+          JSON.stringify(merged),
           "EX",
           CLIENT_CONTEXT_TTL_SEC,
         );
@@ -57,7 +72,7 @@ export const redisStore = {
         console.error("[Classifier Redis] Failed to save client context:", err);
       }
     } else {
-      localClientContexts.set(key, context);
+      localClientContexts.set(key, merged);
       setTimeout(
         () => localClientContexts.delete(key),
         CLIENT_CONTEXT_TTL_SEC * 1000,

@@ -313,7 +313,7 @@ export class PersistedStudentAccounts extends Map<string, StudentAccount> {
     super.set(mapKey, accToStore);
     stmtSaveStudent.run({
       $id: accToStore.studentId,
-      $created_by: accToStore.createdBy,
+      $created_by: accToStore.createdBy || creator,
       $hash: accToStore.passwordHash,
       $created_at: accToStore.createdAt || now,
       $updated_at: accToStore.updatedAt || now,
@@ -402,7 +402,7 @@ export class PersistedGroups extends Map<string, Group> {
     super.set(mapKey, groupToStore);
     stmtSaveGroup.run({
       $name: groupToStore.name,
-      $created_by: groupToStore.createdBy,
+      $created_by: groupToStore.createdBy || creator,
       $users: JSON.stringify(groupToStore.userIds),
       $created_at: groupToStore.createdAt || now,
       $updated_at: groupToStore.updatedAt || now,

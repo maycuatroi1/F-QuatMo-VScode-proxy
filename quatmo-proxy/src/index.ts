@@ -45,7 +45,7 @@ app.use(
 
 // Global OPTIONS preflight handler to guarantee zero preflight failures across all routes
 app.options("*", (c) => {
-  return c.text("", 204);
+  return c.body(null, 204);
 });
 
 // Route mappings

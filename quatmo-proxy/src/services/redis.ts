@@ -9,6 +9,7 @@ let redis: Redis | null = null;
 let lastRedisErrorLog = 0;
 
 try {
+  const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
   redis = new Redis(redisUrl, {
     maxRetriesPerRequest: null,
     connectTimeout: 3000,

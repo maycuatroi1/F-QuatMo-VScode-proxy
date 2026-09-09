@@ -8,11 +8,142 @@ import {
   calculateSignalScore,
   calculateSessionSignalScore,
   deriveIemLabel,
+  blendFeatures,
+  extractCodeSnapshot,
   INSTRUMENTAL_WEIGHTS,
   EXECUTIVE_WEIGHTS,
   IEM_WINDOW_SIZE,
 } from "./features";
 import { sessionStates } from "../sessionStore";
+import type { IemLabel } from "./currentPromptClassifier";
+
+export interface TopNClassificationResult {
+  label: IemLabel;
+  confidence: number;
+  source: string;
+  windowSize?: number;
+  iScoreS?: number;
+  eScoreS?: number;
+}
+
+/**
+ * Retrieves the student's active IEM label derived from their top-N sliding window history.
+ * Does not perform prompt-level regex classification; instead reads from the evaluated
+ * sliding window (turns), sessionStates, token cache, or historical log files.
+ */
+export async function getStudentTopNClassification(
+  sessionCode: string,
+  studentId: string,
+  token?: string,
+): Promise<TopNClassificationResult> {
+  const sCode = (sessionCode || "DEFAULT").toUpperCase();
+  const sId = (studentId || "DEFAULT_USER").toUpperCase();
+  const stateKey = `${sCode}:${sId}`;
+
+  // 1. Derive directly from the top-N window turns in Redis / in-memory store
+  try {
+    const turns = await redisStore.getTurns(sCode, sId);
+    if (turns && turns.length > 0) {
+      const windowTurns = turns.slice(-IEM_WINDOW_SIZE);
+      const I_score_S = calculateSessionSignalScore(
+        windowTurns.map((turn) => turn.I_score),
+      );
+      const E_score_S = calculateSessionSignalScore(
+        windowTurns.map((turn) => turn.E_score),
+      );
+      const rawLabel = deriveIemLabel(I_score_S, E_score_S);
+      const label: IemLabel =
+        rawLabel === "executive" || rawLabel === "instrumental"
+          ? rawLabel
+          : "mixed";
+      const confidence = calculateIemConfidence(label, I_score_S, E_score_S);
+      return {
+        label,
+        confidence,
+        source: `window_turns(${windowTurns.length})`,
+        windowSize: windowTurns.length,
+        iScoreS: I_score_S,
+        eScoreS: E_score_S,
+      };
+    }
+  } catch (err) {
+    console.warn("[Classifier] Failed to get window turns for top-N label:", err);
+  }
+
+  // 2. Check sessionStates (in-memory SQLite persistent map)
+  try {
+    const state = sessionStates.get(stateKey);
+    if (state?.latestClassification && state.latestClassification !== "none") {
+      const norm = state.latestClassification.toLowerCase().trim();
+      if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
+        return {
+          label: norm as IemLabel,
+          confidence: 0.8,
+          source: "session_state",
+        };
+      }
+    }
+  } catch (err) {
+    console.warn("[Classifier] Failed to check sessionStates for top-N label:", err);
+  }
+
+  // 3. Check cached classification in Redis / memory by token
+  if (token) {
+    try {
+      const cached = await redisStore.getCachedClassification(token);
+      if (cached?.label && cached.label !== "none") {
+        const norm = cached.label.toLowerCase().trim();
+        if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
+          return {
+            label: norm as IemLabel,
+            confidence: cached.confidence || 0.8,
+            source: "cached_token",
+          };
+        }
+      }
+    } catch (err) {
+      console.warn("[Classifier] Failed to get cached classification for top-N label:", err);
+    }
+  }
+
+  // 4. Fallback to student's saved JSON log file
+  try {
+    let logFilePath = path.resolve(process.cwd(), "logs", "sessions", sCode, `${sId}.json`);
+    if (!fs.existsSync(logFilePath)) {
+      logFilePath = path.resolve(process.cwd(), "logs", "guests", `${sId}.json`);
+    }
+    if (fs.existsSync(logFilePath)) {
+      const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+      const logs = JSON.parse(fileContent);
+      if (Array.isArray(logs) && logs.length > 0) {
+        for (let i = logs.length - 1; i >= 0; i--) {
+          const entry = logs[i];
+          const c = entry?.classification;
+          const candidate = c?.trendLabel || c?.label || c?.currentLabel;
+          if (candidate && candidate !== "none") {
+            const norm = candidate.toLowerCase().trim();
+            if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
+              return {
+                label: norm as IemLabel,
+                confidence: typeof c?.confidence === "number" ? c.confidence : 0.8,
+                source: "log_history",
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Classifier] Failed to read log file for top-N label:", err);
+  }
+
+  // 5. Default fallback if student has no prior turns
+  return {
+    label: "mixed",
+    confidence: 0.5,
+    source: "default_fallback",
+  };
+}
 
 export async function evaluateTurnAndSession(
   sessionCode: string,
@@ -45,9 +176,14 @@ export async function evaluateTurnAndSession(
       priorTurns,
     );
 
-    const codeSnapshot = clientContext?.activeFile?.content || "";
-    const codeSnapshots = clientContext?.files || [];
-    const activeFile = clientContext?.activeFile;
+    const extracted = extractCodeSnapshot(null, prompt);
+    const codeSnapshot = clientContext?.activeFile?.content || extracted.content || "";
+    const activeFile = clientContext?.activeFile || (extracted.content ? { path: extracted.path, content: extracted.content } : undefined);
+    const codeSnapshots = clientContext?.files && clientContext.files.length > 0
+      ? clientContext.files
+      : activeFile
+        ? [{ path: activeFile.path, content: activeFile.content, languageId: extracted.languageId }]
+        : [];
     const semantic = await evaluateTurnSemanticFeatures(
       prompt,
       response,
@@ -56,12 +192,22 @@ export async function evaluateTurnAndSession(
       codeSnapshots,
       activeFile,
       priorTurns,
+      clientContext?.recentTerminal,
     );
 
-    const combinedFeatures: Record<string, number> = {
-      ...semantic,
-      ...programmatic,
-    };
+    // Blend programmatic and LLM semantic features using per-feature trust weights.
+    // - Features only in programmatic (c6, c7, t9): pass through
+    // - Features only in LLM (i1-i8, e1-e6, r1-r8, t1-t8, c4, c5): pass through
+    // - Features in BOTH (c1-c3, c8-c10, t10): blended = progTrust×prog + (1-progTrust)×llm
+    const disagreements: string[] = [];
+    const combinedFeatures = blendFeatures(semantic, programmatic, (key, prog, llm, blended) => {
+      if (Math.abs(prog - llm) > 0.40) {
+        disagreements.push(`${key}[prog=${prog.toFixed(2)},llm=${llm.toFixed(2)}→${blended.toFixed(2)}]`);
+      }
+    });
+    if (disagreements.length > 0) {
+      console.log(`[Evaluator] Feature disagreements (prog vs LLM): ${disagreements.join(" | ")}`);
+    }
 
     const iTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(INSTRUMENTAL_WEIGHTS)) {
@@ -82,6 +228,8 @@ export async function evaluateTurnAndSession(
       prompt,
       response,
       codeSnapshot,
+      terminalOutput: clientContext?.recentTerminal?.output,
+      lastTerminalCommand: clientContext?.recentTerminal?.lastCommand,
       I_score: I_score_Ti,
       E_score: E_score_Ti,
       featureVector: combinedFeatures,
@@ -119,7 +267,13 @@ export async function evaluateTurnAndSession(
 
     try {
       const logDir = path.resolve(process.cwd(), "logs", "sessions", sCode);
-      const logFilePath = path.resolve(logDir, `${sId}.json`);
+      let logFilePath = path.resolve(logDir, `${sId}.json`);
+      if (!fs.existsSync(logFilePath)) {
+        const guestPath = path.resolve(process.cwd(), "logs", "guests", `${sId}.json`);
+        if (fs.existsSync(guestPath)) {
+          logFilePath = guestPath;
+        }
+      }
       if (fs.existsSync(logFilePath)) {
         const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
         const logs = JSON.parse(fileContent);

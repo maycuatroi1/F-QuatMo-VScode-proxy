@@ -47,6 +47,7 @@ export async function evaluateTurnSemanticFeatures(
   codeSnapshots?: Array<{ path: string; content: string; languageId: string }>,
   activeFile?: { path: string; content: string },
   recentTurns: TurnLog[] = [],
+  recentTerminal?: { output: string; lastCommand?: string; exitCode?: number },
 ): Promise<Record<string, number>> {
   const defaultFeatures: Record<string, number> = {};
 
@@ -81,6 +82,7 @@ export async function evaluateTurnSemanticFeatures(
     "t6",
     "t7",
     "t8",
+    "t10",
     "c1",
     "c2",
     "c3",
@@ -90,35 +92,47 @@ export async function evaluateTurnSemanticFeatures(
     "c9",
     "c10",
   ];
-  for (const k of allKeys) defaultFeatures[k] = 0.0;
-
-  const apiUrl = process.env.CLASSIFIER_API_URL;
-  if (!apiUrl) {
-    console.warn(
-      "[Classifier LLM] CLASSIFIER_API_URL not set. Skipping LLM evaluation.",
-    );
-    return defaultFeatures;
+  for (const k of allKeys) {
+    defaultFeatures[k] = 0;
   }
-
-  const model = process.env.CLASSIFIER_MODEL || "qwen3-coder";
-  const apiKey = process.env.CLASSIFIER_API_KEY?.trim();
 
   try {
     const systemPrompt = await getEvaluationSystemPrompt();
+    const apiUrl =
+      process.env.CLASSIFIER_EVAL_API_URL ||
+      process.env.CLASSIFIER_API_URL ||
+      "https://api.openai.com/v1/chat/completions";
+    const apiKey =
+      process.env.CLASSIFIER_EVAL_API_KEY || process.env.CLASSIFIER_API_KEY || "";
+    const model =
+      process.env.CLASSIFIER_EVAL_MODEL || process.env.CLASSIFIER_MODEL || "gpt-4o-mini";
+
+    if (!apiUrl) {
+      console.warn(
+        "[Classifier LLM] CLASSIFIER_API_URL not set. Skipping LLM evaluation.",
+      );
+      return defaultFeatures;
+    }
 
     const formattedHistory =
       recentTurns.length > 0
         ? recentTurns
-            .map((turn, index) => {
-              const turnNumber = index + 1;
-              return [
+            .map((turn, idx) => {
+              const turnNumber = idx + 1;
+              const turnParts = [
                 `Turn ${turnNumber}:`,
                 `Student Prompt: ${turn.prompt}`,
                 `AI Response: ${turn.response}`,
                 turn.codeSnapshot
                   ? `Code Snapshot:\n\`\`\`\n${turn.codeSnapshot}\n\`\`\``
                   : "Code Snapshot: None",
-              ].join("\n");
+              ];
+              if (turn.terminalOutput) {
+                turnParts.push(
+                  `Terminal Activity: ${turn.lastTerminalCommand ? `(Command: ${turn.lastTerminalCommand}) ` : ""}\n\`\`\`\n${turn.terminalOutput.slice(-500)}\n\`\`\``,
+                );
+              }
+              return turnParts.join("\n");
             })
             .join("\n\n")
         : history
@@ -151,6 +165,20 @@ export async function evaluateTurnSemanticFeatures(
       }
     }
 
+    let terminalSection = "Recent Terminal Activity: None";
+    if (recentTerminal?.output || recentTerminal?.lastCommand) {
+      terminalSection = [
+        "Recent Terminal Activity:",
+        recentTerminal.lastCommand ? `Last Command: ${recentTerminal.lastCommand}` : "",
+        recentTerminal.exitCode !== undefined ? `Exit Code: ${recentTerminal.exitCode}` : "",
+        recentTerminal.output
+          ? `Output:\n\`\`\`\n${recentTerminal.output.slice(-1500)}\n\`\`\``
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     const payload = [
       "## RECENT 5-TURN WINDOW HISTORY",
       formattedHistory || "None (First Turn)",
@@ -158,6 +186,7 @@ export async function evaluateTurnSemanticFeatures(
       `Student Prompt: ${prompt}`,
       `AI Response: ${response}`,
       codeSection,
+      terminalSection,
     ].join("\n\n");
 
     const headers: Record<string, string> = {

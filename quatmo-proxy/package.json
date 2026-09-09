@@ -8,9 +8,12 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "build": "tsc",
-    "test:iem": "npm run build && bun test tests/iem-policy.test.ts"
+    "test:iem": "npm run build && bun test tests/iem-policy.test.ts",
+    "s3:test": "bun bin/s3-tool.ts test",
+    "s3:list": "bun bin/s3-tool.ts list"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1128.0",
     "adm-zip": "^0.5.18",
     "dotenv": "^16.4.5",
     "hono": "^4.10.7",

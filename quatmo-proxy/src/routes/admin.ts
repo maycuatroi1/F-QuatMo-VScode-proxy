@@ -30,6 +30,7 @@ import AdmZip from "adm-zip";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import { s3Storage } from "../services/s3Storage";
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -1240,6 +1241,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
   // Include in-memory sessions that haven't written to disk yet
   for (const [code, sessionObj] of sessions.entries()) {
     if (!scannedCodes.has(code)) {
+      scannedCodes.add(code);
       resultSessions.push({
         sessionCode: code,
         sessionName: code,
@@ -1250,6 +1252,37 @@ adminRouter.get("/visualize/sessions", async (c) => {
           ? sessionObj.allowedStudentIds.size
           : 0,
       });
+    }
+  }
+
+  // Include S3 sessions
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3SessionCodes = await s3Storage.listSessionsFromS3();
+      for (const code of s3SessionCodes) {
+        if (!scannedCodes.has(code)) {
+          scannedCodes.add(code);
+          const students = await s3Storage.listStudentsInSessionFromS3(code);
+          const sessionObj = sessions.get(code);
+          const promptLogCount = students.filter((s) => s.hasPromptLog).length;
+          const eventLogCount = students.filter((s) => s.hasEventLog).length;
+          const lastActivity = Math.max(
+            ...students.map((s) => s.lastActivity || 0),
+            sessionObj?.createdAt || Date.now(),
+          );
+          resultSessions.push({
+            sessionCode: code,
+            sessionName: code,
+            promptLogCount,
+            eventLogCount,
+            lastActivity,
+            studentCount:
+              students.length || (sessionObj?.allowedStudentIds?.size || 0),
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[Visualize] S3 sessions listing error:", err);
     }
   }
 
@@ -1427,6 +1460,36 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     }
   }
 
+  // Include S3 students for this session
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Students =
+        await s3Storage.listStudentsInSessionFromS3(sessionCode);
+      for (const s of s3Students) {
+        const existing = accountMap.get(s.studentId);
+        if (!existing) {
+          accountMap.set(s.studentId, {
+            studentId: s.studentId,
+            hasPromptLog: s.hasPromptLog,
+            hasEventLog: s.hasEventLog,
+            promptTurnsCount: s.hasPromptLog ? 1 : 0,
+            eventCount: s.hasEventLog ? 1 : 0,
+            lastActivity: s.lastActivity || Date.now(),
+            hasErrors: false,
+          });
+        } else {
+          existing.hasPromptLog = existing.hasPromptLog || s.hasPromptLog;
+          existing.hasEventLog = existing.hasEventLog || s.hasEventLog;
+          if (s.lastActivity && s.lastActivity > existing.lastActivity) {
+            existing.lastActivity = s.lastActivity;
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Visualize] S3 students listing error:", err);
+    }
+  }
+
   const accounts = Array.from(accountMap.values());
   accounts.sort((a, b) => {
     const aHas = a.hasPromptLog || a.hasEventLog ? 1 : 0;
@@ -1492,9 +1555,130 @@ adminRouter.get(
       }
     }
 
+    // Check S3 if not found locally
+    if (s3Storage.isAvailable()) {
+      try {
+        const s3Turns = await s3Storage.getStudentPromptLog(
+          sessionCode,
+          studentId,
+        );
+        if (s3Turns && s3Turns.length > 0) {
+          return c.json({ sessionCode, studentId, turns: s3Turns });
+        }
+      } catch (err: any) {
+        console.error("[Visualize] S3 prompt log fetch error:", err);
+      }
+    }
+
     return c.json({ sessionCode, studentId, turns: [] });
   },
 );
+
+async function loadEventLogFromS3(
+  sessionCode: string,
+  studentId: string,
+  reqRecordId?: string,
+) {
+  if (!s3Storage.isAvailable()) return null;
+  try {
+    const s3Records = await s3Storage.listStudentExamRecords(
+      sessionCode,
+      studentId,
+    );
+    if (!s3Records || s3Records.length === 0) return null;
+    const targetRecordId =
+      reqRecordId && s3Records.includes(reqRecordId)
+        ? reqRecordId
+        : s3Records[0];
+
+    const [eventsRaw, aiRaw, metaRaw, zipBuffer] = await Promise.all([
+      s3Storage.getExamRecordArtifact(
+        sessionCode,
+        studentId,
+        targetRecordId,
+        "events.jsonl",
+      ),
+      s3Storage.getExamRecordArtifact(
+        sessionCode,
+        studentId,
+        targetRecordId,
+        "ai_interactions.jsonl",
+      ),
+      s3Storage.getExamRecordArtifact(
+        sessionCode,
+        studentId,
+        targetRecordId,
+        "metadata.json",
+      ),
+      s3Storage.getExamRecordArtifact(
+        sessionCode,
+        studentId,
+        targetRecordId,
+        "snapshot_start.zip",
+      ),
+    ]);
+
+    const coreRecords: any[] = [];
+    const aiRecords: any[] = [];
+    let metadata: any = null;
+    const initialFiles: Record<string, string> = {};
+
+    if (typeof metaRaw === "string") {
+      try {
+        metadata = JSON.parse(metaRaw);
+      } catch {}
+    }
+    if (typeof eventsRaw === "string") {
+      for (const line of eventsRaw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          coreRecords.push(JSON.parse(trimmed));
+        } catch {}
+      }
+    }
+    if (typeof aiRaw === "string") {
+      for (const line of aiRaw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          aiRecords.push(JSON.parse(trimmed));
+        } catch {}
+      }
+    }
+    if (Buffer.isBuffer(zipBuffer)) {
+      try {
+        const zip = new AdmZip(zipBuffer);
+        for (const entry of zip.getEntries()) {
+          if (!entry.isDirectory) {
+            initialFiles[entry.entryName.replace(/\\/g, "/")] =
+              entry.getData().toString("utf-8");
+          }
+        }
+      } catch {}
+    }
+
+    return {
+      sessionCode,
+      studentId,
+      activeRecordDir: targetRecordId,
+      availableRecords: s3Records,
+      metadata: metadata || {
+        examSessionId: targetRecordId,
+        examStartAt: coreRecords[0]?.timestamp || Date.now(),
+        examEndAt:
+          coreRecords[coreRecords.length - 1]?.timestamp ||
+          Date.now(),
+      },
+      coreRecords,
+      aiRecords,
+      initialFiles,
+    };
+  } catch (err: any) {
+    console.error("[Visualize] S3 event log fetch error:", err);
+    return null;
+  }
+}
 
 // 4. Get student event log
 adminRouter.get(
@@ -1513,6 +1697,16 @@ adminRouter.get(
     );
 
     if (!fs.existsSync(studentDir)) {
+      // Check S3 if no local student directory
+      const s3Result = await loadEventLogFromS3(
+        sessionCode,
+        studentId,
+        c.req.query("recordId"),
+      );
+      if (s3Result) {
+        return c.json(s3Result);
+      }
+
       return c.json({
         sessionCode,
         studentId,
@@ -1607,6 +1801,13 @@ adminRouter.get(
         } catch {}
       }
 
+      if (availableRecords.length === 0 && coreRecords.length === 0 && s3Storage.isAvailable()) {
+        const s3Result = await loadEventLogFromS3(sessionCode, studentId, c.req.query("recordId"));
+        if (s3Result) {
+          return c.json(s3Result);
+        }
+      }
+
       return c.json({
         sessionCode,
         studentId,
@@ -1690,6 +1891,23 @@ adminRouter.get("/visualize/guests", async (c) => {
     } catch {}
   }
 
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Guests = await s3Storage.listGuestsFromS3();
+      for (const gid of s3Guests) {
+        if (!guestMap.has(gid)) {
+          guestMap.set(gid, {
+            guestId: gid,
+            turnsCount: 1,
+            lastActivity: Date.now(),
+            hasErrors: false,
+            filePath: "",
+          });
+        }
+      }
+    } catch {}
+  }
+
   const guests = Array.from(guestMap.values()).map((g) => ({
     studentId: g.guestId,
     guestId: g.guestId,
@@ -1747,7 +1965,176 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
     }
   }
 
+  // Check S3 if not found locally
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Turns = await s3Storage.getGuestPromptLog(guestId);
+      if (s3Turns && s3Turns.length > 0) {
+        return c.json({ guestId, turns: s3Turns });
+      }
+    } catch {}
+  }
+
   return c.json({ guestId, turns: [] });
+});
+
+// 7. Upload full exam record for student / session
+adminRouter.post(
+  "/visualize/sessions/:sessionCode/accounts/:studentId/upload-record",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const body = await c.req.json().catch(() => null);
+
+    if (!body || !body.recordId) {
+      return c.json({ error: "Missing recordId in request payload" }, 400);
+    }
+
+    const recordId = sanitizeFilename(body.recordId);
+    const { metadata, events, aiInteractions, snapshotZipBase64 } = body;
+
+    const targetDir = path.resolve(
+      process.cwd(),
+      "logs",
+      "sessions",
+      sessionCode,
+      studentId,
+      "exam_records",
+      recordId,
+    );
+    await fs.promises.mkdir(targetDir, { recursive: true });
+
+    if (metadata) {
+      await fs.promises.writeFile(
+        path.join(targetDir, "metadata.json"),
+        typeof metadata === "string"
+          ? metadata
+          : JSON.stringify(metadata, null, 2),
+        "utf-8",
+      );
+    }
+    if (events) {
+      const content = Array.isArray(events)
+        ? events.map((e) => JSON.stringify(e)).join("\n")
+        : String(events);
+      await fs.promises.writeFile(
+        path.join(targetDir, "events.jsonl"),
+        content,
+        "utf-8",
+      );
+    }
+    if (aiInteractions) {
+      const content = Array.isArray(aiInteractions)
+        ? aiInteractions.map((e) => JSON.stringify(e)).join("\n")
+        : String(aiInteractions);
+      await fs.promises.writeFile(
+        path.join(targetDir, "ai_interactions.jsonl"),
+        content,
+        "utf-8",
+      );
+    }
+    if (snapshotZipBase64) {
+      const buf = Buffer.from(snapshotZipBase64, "base64");
+      await fs.promises.writeFile(
+        path.join(targetDir, "snapshot_start.zip"),
+        buf,
+      );
+    }
+
+    if (s3Storage.isAvailable()) {
+      if (metadata) {
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "metadata.json",
+          typeof metadata === "string"
+            ? metadata
+            : JSON.stringify(metadata, null, 2),
+          "application/json",
+        );
+      }
+      if (events) {
+        const content = Array.isArray(events)
+          ? events.map((e) => JSON.stringify(e)).join("\n")
+          : String(events);
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "events.jsonl",
+          content,
+          "application/x-ndjson",
+        );
+      }
+      if (aiInteractions) {
+        const content = Array.isArray(aiInteractions)
+          ? aiInteractions.map((e) => JSON.stringify(e)).join("\n")
+          : String(aiInteractions);
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "ai_interactions.jsonl",
+          content,
+          "application/x-ndjson",
+        );
+      }
+      if (snapshotZipBase64) {
+        const buf = Buffer.from(snapshotZipBase64, "base64");
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "snapshot_start.zip",
+          buf,
+          "application/zip",
+        );
+      }
+    }
+
+    return c.json({ success: true, sessionCode, studentId, recordId });
+  },
+);
+
+// 8. S3 Storage healthcheck & status
+adminRouter.get("/s3/status", async (c) => {
+  const isAvailable = s3Storage.isAvailable();
+  if (!isAvailable) {
+    return c.json({
+      status: "unconfigured",
+      available: false,
+      message: "S3 credentials are not configured in .env",
+      endpoint: process.env.S3_ENDPOINT || "https://s3-api.iahn.hanoi.vn",
+      bucket: s3Storage.getBucketName(),
+    });
+  }
+
+  try {
+    const sessions = await s3Storage.listSessionsFromS3();
+    const guests = await s3Storage.listGuestsFromS3();
+    return c.json({
+      status: "connected",
+      available: true,
+      endpoint: process.env.S3_ENDPOINT,
+      bucket: s3Storage.getBucketName(),
+      totalSessionsOnS3: sessions.length,
+      sessions,
+      totalGuestsOnS3: guests.length,
+      guests,
+    });
+  } catch (err: any) {
+    return c.json(
+      {
+        status: "error",
+        available: false,
+        error: err?.message || String(err),
+      },
+      500,
+    );
+  }
 });
 
 // ─── GROUP ENDPOINTS ─────────────────────────────────────────────────────────

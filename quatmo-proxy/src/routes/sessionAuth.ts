@@ -18,6 +18,7 @@ import {
   recordFailedAttempt,
   recordSuccessfulLogin,
 } from "../services/rateLimiter";
+import { s3Storage } from "../services/s3Storage";
 import { getClientIP } from "./admin";
 
 function sanitizeFilename(str: string): string {
@@ -413,38 +414,39 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     sanitizeFilename(studentId),
   );
 
-  // Overwrite existing folder if it exists
-  if (fs.existsSync(targetDir)) {
-    try {
-      fs.rmSync(targetDir, { recursive: true, force: true });
-    } catch {
-      /* ignore removal error if locked */
-    }
+  // Overwrite existing folder asynchronously
+  try {
+    await fs.promises.rm(targetDir, { recursive: true, force: true });
+  } catch {
+    /* ignore */
   }
-  fs.mkdirSync(targetDir, { recursive: true });
+  await fs.promises.mkdir(targetDir, { recursive: true });
 
-  let savedCount = 0;
-  for (const file of files) {
-    if (!file.relativePath || file.content === undefined) {
-      continue;
-    }
-    const safeRelPath = path.normalize(file.relativePath).replace(/^(\.\.[\/\\])+/, "");
-    const destPath = path.join(targetDir, safeRelPath);
-    const destDir = path.dirname(destPath);
+  const validFiles = files.filter(
+    (f) => f && f.relativePath && f.content !== undefined,
+  );
 
-    if (!fs.existsSync(destDir)) {
-      fs.mkdirSync(destDir, { recursive: true });
-    }
+  // 1. Asynchronous concurrent local disk writes
+  await Promise.all(
+    validFiles.map(async (file) => {
+      const safeRelPath = path
+        .normalize(file.relativePath)
+        .replace(/^(\.\.[\/\\])+/, "");
+      const destPath = path.join(targetDir, safeRelPath);
+      const destDir = path.dirname(destPath);
+      await fs.promises.mkdir(destDir, { recursive: true });
+      if (file.encoding === "base64") {
+        await fs.promises.writeFile(
+          destPath,
+          Buffer.from(file.content, "base64"),
+        );
+      } else {
+        await fs.promises.writeFile(destPath, file.content, "utf-8");
+      }
+    }),
+  );
 
-    if (file.encoding === "base64") {
-      const buffer = Buffer.from(file.content, "base64");
-      fs.writeFileSync(destPath, buffer);
-    } else {
-      fs.writeFileSync(destPath, file.content, "utf-8");
-    }
-    savedCount++;
-  }
-
+  const savedCount = validFiles.length;
   const metaPath = path.join(targetDir, "upload_info.json");
   const metaData = {
     studentId,
@@ -454,9 +456,60 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     filesUploaded: savedCount,
     ip: c.req.header("x-forwarded-for") || "local",
   };
-  fs.writeFileSync(metaPath, JSON.stringify(metaData, null, 2), "utf-8");
+  await fs.promises.writeFile(
+    metaPath,
+    JSON.stringify(metaData, null, 2),
+    "utf-8",
+  );
 
-  console.log(`[Logs] Uploaded ${savedCount} monitoring log file(s) for student ${studentId} in session ${sessionCode}`);
+  console.log(
+    `[Logs] Uploaded ${savedCount} monitoring log file(s) for student ${studentId} in session ${sessionCode}`,
+  );
+
+  // 2. High-throughput parallel S3 upload with connection pooling
+  if (s3Storage.isAvailable()) {
+    try {
+      // Clean previous exam records for this student in this session
+      await s3Storage.purgeStudentExamRecords(sessionCode, studentId);
+
+      // Upload all files concurrently
+      const s3UploadPromises = validFiles.map((file) => {
+        const safeRelPath = path
+          .normalize(file.relativePath)
+          .replace(/^(\.\.[\/\\])+/, "");
+        const contentPayload =
+          file.encoding === "base64"
+            ? Buffer.from(file.content, "base64")
+            : file.content;
+        return s3Storage.uploadStudentFile(
+          sessionCode,
+          studentId,
+          safeRelPath,
+          contentPayload,
+        );
+      });
+
+      s3UploadPromises.push(
+        s3Storage.uploadStudentFile(
+          sessionCode,
+          studentId,
+          "upload_info.json",
+          JSON.stringify(metaData, null, 2),
+          "application/json",
+        ),
+      );
+
+      await Promise.all(s3UploadPromises);
+      console.log(
+        `[S3 Storage] High-throughput parallel synced ${savedCount} log file(s) for student ${studentId} in session ${sessionCode} to S3`,
+      );
+    } catch (s3Err) {
+      console.error(
+        `[S3 Storage] Failed to sync uploaded logs to S3 for ${sessionCode}/${studentId}:`,
+        s3Err,
+      );
+    }
+  }
 
   return c.json({
     success: true,

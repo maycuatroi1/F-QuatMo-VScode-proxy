@@ -61,7 +61,31 @@ For each feature, choose one of these levels:
 - `t7` (escalation_to_solution): Student starts with conceptual queries but suddenly demands complete code.
 - `t8` (abandon_after_code): Session shows student drops the conversation immediately after receiving a solution block.
 
-### 6. Code-diff Features (c1 - c5, c8 - c10)
+### 6. Recurring Delegation Feature (t10)
+- `t10` (recurring_delegation_pattern): Across the **entire 5-turn window**, does the student **repeatedly** issue prompts whose underlying intent is to transfer the act of coding, fixing, or completing to the AI — rather than engaging themselves?
+
+  This is a **window-level pattern**, not a single-turn signal. Score based on how many turns across the window show delegation intent, regardless of how it is phrased.
+
+  **What delegation looks like** (any phrasing, any language):
+  - Direct work orders: "write this function", "complete the implementation", "give me the full solution", "just write it for me"
+  - Fix-for-me requests: "fix this error", "make it work", "correct my code so it passes"
+  - Passive outsourcing: "can you finish this?", "I need the working version", "output the final code", "just give me something that runs"
+  - Successive turns where the student only pastes AI output back without any original code, then asks for more
+
+  **What is NOT delegation:**
+  - Asking for a hint or explanation even if they include their broken code
+  - Asking AI to review code they wrote themselves
+  - Asking "is my approach correct?" before writing code
+  - One isolated request for a complete solution after sustained conceptual discussion
+
+  **Scoring guide:**
+  - `none`: No delegation pattern — student engaged with hints, asked conceptual questions, or wrote their own code throughout the window.
+  - `weak` (0.25): One turn shows delegation intent; the rest of the window shows genuine engagement.
+  - `partial` (0.50): Two turns show delegation behavior; student made some effort in between.
+  - `clear` (0.75): Three or more turns clearly delegate work to AI; the pattern is established.
+  - `strong` (1.00): Every turn in the window the student directs AI to produce code for them; zero independent effort visible.
+
+### 7. Code-diff Features (c1 - c5, c8 - c10)
 - `c1` (high_student_modification): Student's code snapshot shows massive manual typing/changes compared to AI suggestions.
 - `c2` (incremental_changes): Code has evolved through minor, step-by-step edits over multiple turns.
 - `c3` (structural_divergence): Student's code uses a completely different architecture/algorithm than what AI suggested.
@@ -69,7 +93,7 @@ For each feature, choose one of these levels:
 - `c5` (own_algorithm_signature): Student's code shows custom naming, comments, or structure representing their own style.
 - `c8` (structural_identity): Student's code matches AI suggestions exactly in block structure.
 - `c9` (no_intermediate_edits): Student pasted AI code immediately without any intermediate manual edits.
-- `c10` (zero_test_activity): No logs or evidence that student tested code before requesting next step.
+- `c10` (zero_test_activity): No logs, terminal execution, or evidence that student tested code before requesting next step. If terminal activity or prompt shows the student ran/tested their code (running python scripts, test suites, or execution output), c10 is "none" (not active). Only activate c10 when there is truly zero test or execution activity visible across terminal and prompt.
 
 ## Output Format
 Return EXACTLY a JSON block containing ONLY the features that are active (i.e. activation level is "weak", "partial", "clear", or "strong"). Do NOT include any features with "none" activation level.
@@ -81,4 +105,4 @@ For example, if only i1 and r6 are active, return:
 If no features are active, return an empty JSON object:
 {}
 
-Do not output any explanation, and do not output any markdown formatting outside of the JSON block. Do not output any key other than the 42 defined keys.
+Do not output any explanation, and do not output any markdown formatting outside of the JSON block. Do not output any key other than the 39 defined keys: i1–i8, e1–e6, r1–r8, t1–t8, t10, c1–c5, c8–c10.
