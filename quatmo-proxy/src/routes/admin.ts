@@ -106,7 +106,7 @@ adminRouter.use("*", async (c, next) => {
     }
   }
 
-  // If no valid JWT token in Authorization header, check x-api-key
+  // 2. Secondary fallback: If no valid JWT, validate x-api-key against masterKey
   if (!caller && xApiKey && xApiKey.trim() === masterKey) {
     caller = { username: "admin", role: "admin", name: "Super Admin" };
   }
@@ -117,7 +117,7 @@ adminRouter.use("*", async (c, next) => {
     return;
   }
 
-  return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
+  return c.json({ error: "Unauthorized. Invalid Token or Proxy API Key" }, 401);
 });
 
 // Admin / Lecturer login endpoint validating credentials and returning signed JWT token
@@ -727,7 +727,11 @@ adminRouter.post("/sessions", async (c) => {
       }
       if (!group) {
         for (const g of studentGroups.values()) {
-          if (g.name.toLowerCase() === groupName.toLowerCase() && (g.createdBy || "admin").toLowerCase() === caller.username.toLowerCase()) {
+          if (
+            g.name.toLowerCase() === groupName.toLowerCase() &&
+            (g.createdBy || "admin").toLowerCase() ===
+              caller.username.toLowerCase()
+          ) {
             group = g;
             break;
           }
@@ -994,7 +998,10 @@ async function sendDirectoryZip(
             zip.addFile(zipPath, fileBuffer);
             addedFilesCount++;
           } catch (readErr) {
-            console.error(`[Admin Zip] Failed to read ${entryFullPath}:`, readErr);
+            console.error(
+              `[Admin Zip] Failed to read ${entryFullPath}:`,
+              readErr,
+            );
           }
         }
       }
@@ -1043,7 +1050,10 @@ const handleSessionLogDownload = async (c: any) => {
 
 adminRouter.get("/sessions/:sessionCode/logs", handleSessionLogDownload);
 adminRouter.get("/sessions/:sessionCode/logs/zip", handleSessionLogDownload);
-adminRouter.get("/sessions/:sessionCode/download-logs", handleSessionLogDownload);
+adminRouter.get(
+  "/sessions/:sessionCode/download-logs",
+  handleSessionLogDownload,
+);
 
 // 2. All logs archive (supports /logs/download-all, /logs/zip, /logs/download)
 const handleAllLogsDownload = async (c: any) => {
@@ -1079,7 +1089,9 @@ adminRouter.get("/guests/logs", handleGuestLogsDownload);
 adminRouter.get(
   "/sessions/:sessionCode/accounts/:studentId/download",
   async (c) => {
-    const sessionCode = sanitizeFilename(c.req.param("sessionCode")).toUpperCase();
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
     const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
     const studentDir = path.resolve(
       process.cwd(),
@@ -1123,7 +1135,9 @@ adminRouter.get(
     }
 
     return c.json(
-      { error: `No logs found for student ${studentId} in session ${sessionCode}.` },
+      {
+        error: `No logs found for student ${studentId} in session ${sessionCode}.`,
+      },
       404,
     );
   },
@@ -1267,7 +1281,10 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
-  const caller = (c.get("caller") as any) || { username: "admin", role: "admin" };
+  const caller = (c.get("caller") as any) || {
+    username: "admin",
+    role: "admin",
+  };
   const callerUser = (caller.username || "admin").toLowerCase();
   const callerRole = (caller.role || "admin").toLowerCase();
   const filteredSessions = resultSessions.filter((s) => {
@@ -1606,10 +1623,7 @@ adminRouter.get(
         initialFiles,
       });
     } catch (err: any) {
-      return c.json(
-        { error: `Failed to load event log: ${err.message}` },
-        500,
-      );
+      return c.json({ error: `Failed to load event log: ${err.message}` }, 500);
     }
   },
 );
@@ -1813,7 +1827,9 @@ async function syncGroupWithActiveSessions(
       for (const otherGroupName of session.assignedGroups) {
         if (otherGroupName === groupName) continue;
         const otherGroupKey = `${otherGroupName}:${(session.createdBy || "admin").toLowerCase()}`;
-        const otherGroup = studentGroups.get(otherGroupKey) || studentGroups.get(`${otherGroupName}:admin`);
+        const otherGroup =
+          studentGroups.get(otherGroupKey) ||
+          studentGroups.get(`${otherGroupName}:admin`);
         if (otherGroup && Array.isArray(otherGroup.userIds)) {
           if (otherGroup.userIds.some((id) => id.toUpperCase() === uid)) {
             stillBelongsToOtherGroup = true;
@@ -1894,7 +1910,11 @@ adminRouter.post("/groups/:name/students", async (c) => {
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -1939,7 +1959,12 @@ adminRouter.post("/groups/:name/students", async (c) => {
   studentGroups.set(targetKey, updatedGroup);
 
   if (addedUserIds.length > 0) {
-    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, addedUserIds, []);
+    await syncGroupWithActiveSessions(
+      group.name,
+      group.createdBy || caller.username,
+      addedUserIds,
+      [],
+    );
   }
 
   return c.json({
@@ -1959,7 +1984,11 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -1979,7 +2008,12 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
 
   const targetKey = `${group.name}:${(group.createdBy || caller.username).toLowerCase()}`;
   studentGroups.set(targetKey, updatedGroup);
-  await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], [studentId]);
+  await syncGroupWithActiveSessions(
+    group.name,
+    group.createdBy || caller.username,
+    [],
+    [studentId],
+  );
 
   return c.json({
     success: true,
@@ -1994,7 +2028,11 @@ adminRouter.delete("/groups/:name", async (c) => {
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -2009,7 +2047,12 @@ adminRouter.delete("/groups/:name", async (c) => {
   }
 
   if (group && Array.isArray(group.userIds)) {
-    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], group.userIds);
+    await syncGroupWithActiveSessions(
+      group.name,
+      group.createdBy || caller.username,
+      [],
+      group.userIds,
+    );
   }
 
   return c.json({ success: true, message: `Group '${groupName}' deleted.` });

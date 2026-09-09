@@ -16,6 +16,8 @@ services:
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=123
       - JWT_SECRET=super_secret_jwt_signing_key_for_quatmo_proxy_2026
+      - BUILD_SIGNING_SECRET=fpt_university_fvscode_signing_secret_2026_super_secure
+      - LATEST_FINGERPRINT=${LATEST_FINGERPRINT:-}
     volumes:
       - ./logs:/app/logs
     depends_on:
