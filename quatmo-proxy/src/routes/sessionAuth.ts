@@ -1,9 +1,12 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { sign, verify } from "hono/jwt";
 import { redis } from "../services/redis";
 import { getJwtSecret } from "../services/jwtKey";
+import { registerSseClient } from "../services/eventStream";
+import { getStudentTopNClassification } from "../services/classifier/index";
 
 declare const Bun: any;
 import {
@@ -51,10 +54,7 @@ sessionAuthRouter.get("/status", async (c) => {
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
   if (!state) {
-    return c.json(
-      { error: "Student session state not found." },
-      404,
-    );
+    return c.json({ error: "Student session state not found." }, 404);
   }
 
   let consumed = state.tokensConsumed;
@@ -153,7 +153,10 @@ sessionAuthRouter.post("/login", async (c) => {
 
   if (!studentId) {
     return c.json(
-      { error: "Missing Student ID. Please log in with your FPT Student Account first." },
+      {
+        error:
+          "Missing Student ID. Please log in with your FPT Student Account first.",
+      },
       400,
     );
   }
@@ -171,7 +174,7 @@ sessionAuthRouter.post("/login", async (c) => {
         lockedUntil: lockout.lockedUntil,
         reason: lockout.reason,
       },
-      429
+      429,
     );
   }
 
@@ -206,7 +209,9 @@ sessionAuthRouter.post("/login", async (c) => {
 
   if (!account) {
     return c.json(
-      { error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.` },
+      {
+        error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.`,
+      },
       403,
     );
   }
@@ -228,8 +233,7 @@ sessionAuthRouter.post("/login", async (c) => {
     // Check if the lecturer updated the password after the token was issued
     const tokenIssuedAtMs = (bearerIat || 0) * 1000;
     const isPasswordStillFresh =
-      !account.updatedAt ||
-      tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
+      !account.updatedAt || tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
 
     if (isLecturerAuthorized && isPasswordStillFresh) {
       bearerMatches = true;
@@ -250,12 +254,18 @@ sessionAuthRouter.post("/login", async (c) => {
     let isPasswordValid = false;
     const creatorAcc = studentAccounts.get(mapKey);
     if (creatorAcc) {
-      isPasswordValid = await verifyPasswordSafely(password, creatorAcc.passwordHash);
+      isPasswordValid = await verifyPasswordSafely(
+        password,
+        creatorAcc.passwordHash,
+      );
     }
     if (!isPasswordValid) {
       const adminAcc = studentAccounts.get(`${studentId}:admin`);
       if (adminAcc) {
-        isPasswordValid = await verifyPasswordSafely(password, adminAcc.passwordHash);
+        isPasswordValid = await verifyPasswordSafely(
+          password,
+          adminAcc.passwordHash,
+        );
       }
     }
     if (!isPasswordValid && !creatorAcc) {
@@ -281,7 +291,7 @@ sessionAuthRouter.post("/login", async (c) => {
             lockedUntil: result.lockoutInfo.lockedUntil,
             reason: result.lockoutInfo.reason,
           },
-          429
+          429,
         );
       }
       return c.json(
@@ -290,7 +300,7 @@ sessionAuthRouter.post("/login", async (c) => {
           failedAttempts: result.attemptsCount,
           remainingAttempts: Math.max(0, 10 - result.attemptsCount),
         },
-        403
+        403,
       );
     }
   }
@@ -398,9 +408,17 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   }
 
   const body = await c.req.json().catch(() => ({}));
-  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "").trim().toUpperCase();
-  const studentId = (body.studentId || tokenPayload.studentId || "").trim().toUpperCase();
-  const files: Array<{ relativePath: string; content: string; encoding?: string }> = body.files || [];
+  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "")
+    .trim()
+    .toUpperCase();
+  const studentId = (body.studentId || tokenPayload.studentId || "")
+    .trim()
+    .toUpperCase();
+  const files: Array<{
+    relativePath: string;
+    content: string;
+    encoding?: string;
+  }> = body.files || [];
 
   if (!sessionCode || !studentId) {
     return c.json({ error: "Missing required sessionCode or studentId" }, 400);
@@ -517,6 +535,107 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     sessionCode,
     studentId,
     savedCount,
+  });
+});
+
+// GET /session/events/stream
+sessionAuthRouter.get("/events/stream", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  const queryToken = c.req.query("token");
+  let token = queryToken || "";
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.substring(7).trim();
+  }
+
+  if (!token) {
+    return c.json({ error: "Missing authorization token" }, 401);
+  }
+
+  const jwtSecret = getJwtSecret();
+  let payload: any;
+  try {
+    payload = await verify(token, jwtSecret, "HS256" as any);
+  } catch (err) {
+    return c.json({ error: "Invalid or expired session token." }, 401);
+  }
+
+  const rawStudentId = payload.studentId || payload.sub;
+  const rawSessionCode = payload.sessionCode;
+  if (!rawStudentId) {
+    return c.json({ error: "Token does not contain student identity." }, 401);
+  }
+
+  const studentId = String(rawStudentId).trim().toUpperCase();
+  const sessionCode = String(rawSessionCode || "DEFAULT")
+    .trim()
+    .toUpperCase();
+
+  c.header("Content-Type", "text/event-stream");
+  c.header("Cache-Control", "no-cache, no-transform");
+  c.header("Connection", "keep-alive");
+  c.header("X-Accel-Buffering", "no");
+
+  return streamSSE(c, async (stream) => {
+    const currentTopN = await getStudentTopNClassification(
+      sessionCode,
+      studentId,
+      token,
+    );
+    const connectedPayload = {
+      studentId,
+      sessionCode,
+      activeClassification: currentTopN.label,
+      confidence: currentTopN.confidence,
+      iScoreS: currentTopN.iScoreS,
+      eScoreS: currentTopN.eScoreS,
+      timestamp: Date.now(),
+    };
+
+    await stream.writeSSE({
+      event: "connected",
+      data: JSON.stringify(connectedPayload),
+    });
+
+    const { unregister } = registerSseClient(
+      studentId,
+      sessionCode,
+      async (event, data) => {
+        try {
+          await stream.writeSSE({
+            event,
+            data: JSON.stringify(data),
+          });
+        } catch (err) {
+          // write failed
+        }
+      },
+      () => {
+        try {
+          stream.close();
+        } catch {}
+      },
+    );
+
+    const pingInterval = setInterval(async () => {
+      try {
+        await stream.writeSSE({
+          event: "ping",
+          data: JSON.stringify({ timestamp: Date.now() }),
+        });
+      } catch (err) {
+        clearInterval(pingInterval);
+        unregister();
+      }
+    }, 15000);
+
+    stream.onAbort(() => {
+      clearInterval(pingInterval);
+      unregister();
+    });
+
+    await new Promise<void>((resolve) => {
+      stream.onAbort(() => resolve());
+    });
   });
 });
 

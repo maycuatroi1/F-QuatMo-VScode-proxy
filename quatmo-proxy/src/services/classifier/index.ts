@@ -265,6 +265,30 @@ export async function evaluateTurnAndSession(
       sessionStates.set(stateKey, state);
     }
 
+    // Broadcast real-time SSE event to Fvscode client and Admin dashboard (0ms latency)
+    try {
+      const { broadcastStudentEvent, broadcastSessionEvent } = await import("../eventStream");
+      void broadcastStudentEvent(sCode, sId, "iem_update", {
+        label,
+        confidence,
+        iScoreS: I_score_S,
+        eScoreS: E_score_S,
+        iScoreTurn: I_score_Ti,
+        eScoreTurn: E_score_Ti,
+        windowSize: windowTurns.length,
+        timestamp: Date.now(),
+      });
+      void broadcastSessionEvent(sCode, "session_state_update", {
+        studentId: sId,
+        latestClassification: label,
+        iScoreS: I_score_S,
+        eScoreS: E_score_S,
+        timestamp: Date.now(),
+      });
+    } catch (broadcastErr) {
+      console.error("[Evaluator] Failed to broadcast real-time event:", broadcastErr);
+    }
+
     try {
       const logDir = path.resolve(process.cwd(), "logs", "sessions", sCode);
       let logFilePath = path.resolve(logDir, `${sId}.json`);

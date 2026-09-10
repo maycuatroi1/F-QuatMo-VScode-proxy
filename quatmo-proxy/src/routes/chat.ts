@@ -27,6 +27,7 @@ import {
   getStudentTopNClassification,
   type TopNClassificationResult,
 } from "../services/classifier/index";
+import { enqueueEvaluation } from "../services/classifier/evaluatorQueue";
 import { extractCodeSnapshot } from "../services/classifier/features";
 import type { IemLabel } from "../services/classifier/currentPromptClassifier";
 
@@ -1412,15 +1413,14 @@ chatRouter.post(
         !hasToolCalls
       ) {
         const completionText = responseData.choices[0].message.content || "";
-        setImmediate(() => {
-          evaluateTurnAndSession(
-            finalSessionCode,
-            finalStudentId,
-            token,
-            userPrompt,
-            completionText,
-            body.messages,
-          ).catch((e) => console.error("[Background Classifier] Error:", e));
+        enqueueEvaluation({
+          sessionCode: finalSessionCode,
+          studentId: finalStudentId,
+          token,
+          prompt: userPrompt,
+          response: completionText,
+          history: body.messages,
+          queuedAt: Date.now(),
         });
       }
 
@@ -1499,15 +1499,14 @@ chatRouter.post(
         }
 
         if (shouldClassify && !hasAnyToolCalls) {
-          setImmediate(() => {
-            evaluateTurnAndSession(
-              finalSessionCode,
-              finalStudentId,
-              token,
-              userPrompt,
-              completionText,
-              body.messages,
-            ).catch((e) => console.error("[Background Classifier] Error:", e));
+          enqueueEvaluation({
+            sessionCode: finalSessionCode,
+            studentId: finalStudentId,
+            token,
+            prompt: userPrompt,
+            response: completionText,
+            history: body.messages,
+            queuedAt: Date.now(),
           });
         }
 
