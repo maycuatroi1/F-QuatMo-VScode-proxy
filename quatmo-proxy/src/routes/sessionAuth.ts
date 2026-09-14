@@ -1,9 +1,12 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { sign, verify } from "hono/jwt";
 import { redis } from "../services/redis";
 import { getJwtSecret } from "../services/jwtKey";
+import { eventBus } from "../services/eventBus";
+import { redisStore } from "../services/classifier/redisStore";
 
 declare const Bun: any;
 import {
@@ -26,6 +29,228 @@ function sanitizeFilename(str: string): string {
 }
 
 const sessionAuthRouter = new Hono();
+
+sessionAuthRouter.get("/events/stream", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  let token = "";
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.substring(7).trim();
+  } else {
+    token = c.req.query("token") || "";
+  }
+
+  if (!token) {
+    return c.json({ error: "Missing or invalid token" }, 401);
+  }
+
+  let sessionCode = "";
+  let studentId = "";
+
+  try {
+    const payload: any = await verify(token, getJwtSecret(), "HS256" as any);
+    if (payload) {
+      sessionCode = (payload.sessionCode || "").toUpperCase();
+      studentId = (payload.studentId || "").toUpperCase();
+    }
+  } catch {
+    return c.json({ error: "Invalid or expired session token" }, 401);
+  }
+
+  if (!sessionCode || !studentId) {
+    return c.json({ error: "Token is missing sessionCode or studentId" }, 401);
+  }
+
+  const session = sessions.get(sessionCode);
+  if (!session) {
+    return c.json({ error: "Session does not exist or has ended" }, 404);
+  }
+
+  const currentTime = Math.floor(Date.now() / 1000);
+  if (session.durationMinutes > 0) {
+    const sessionEndTime = session.startTime + session.durationMinutes * 60;
+    if (currentTime >= sessionEndTime) {
+      return c.json({ error: "Session duration has expired" }, 403);
+    }
+  }
+
+  c.header("Content-Type", "text/event-stream");
+  c.header("Cache-Control", "no-cache, no-transform");
+  c.header("Connection", "keep-alive");
+  c.header("X-Accel-Buffering", "no");
+
+  return streamSSE(c, async (stream) => {
+    let initialLabel = "none";
+    let initialConfidence = 0;
+    let iScoreS: number | undefined;
+    let eScoreS: number | undefined;
+
+    try {
+      const cached = await redisStore.getCachedClassification(token);
+      if (cached && cached.label && cached.label !== "none") {
+        initialLabel = cached.label;
+        initialConfidence = cached.confidence || 0.8;
+      }
+    } catch {}
+
+    if (initialLabel === "none" && sessionCode && studentId) {
+      const stateKey = `${sessionCode}:${studentId}`;
+      const state = sessionStates.get(stateKey) as any;
+      if (
+        state?.latestClassification &&
+        state.latestClassification !== "none"
+      ) {
+        initialLabel = state.latestClassification;
+        initialConfidence = 0.8;
+        iScoreS = state.I_score_S;
+        eScoreS = state.E_score_S;
+      }
+    }
+
+    await stream.writeSSE({
+      event: "connected",
+      data: JSON.stringify({
+        status: "connected",
+        activeClassification: initialLabel,
+        confidence: initialConfidence,
+        iScoreS,
+        eScoreS,
+        sessionCode,
+        studentId,
+        timestamp: Date.now(),
+      }),
+    });
+
+    const lastEventId =
+      c.req.header("last-event-id") ||
+      c.req.header("Last-Event-ID") ||
+      c.req.query("lastEventId") ||
+      "";
+
+    let isAborted = false;
+    const eventQueue: any[] = [];
+    let notifyEvent: (() => void) | null = null;
+
+    // Check if client reconnected and missed the latest event
+    if (lastEventId && sessionCode && studentId) {
+      try {
+        const latestCached = await redisStore.getLatestEvent(sessionCode, studentId);
+        if (latestCached && latestCached.id && latestCached.id !== lastEventId) {
+          eventQueue.push(latestCached);
+        }
+      } catch {}
+    }
+
+    const unsubscribe = eventBus.subscribeIemUpdate(
+      { sessionCode, studentId, token },
+      (payload) => {
+        eventQueue.push(payload);
+        if (notifyEvent) {
+          notifyEvent();
+          notifyEvent = null;
+        }
+      },
+    );
+
+    const unsubEnd = eventBus.subscribeSessionEnd(sessionCode, (reason) => {
+      eventQueue.push({ type: "session_ended", reason });
+      if (notifyEvent) {
+        notifyEvent();
+        notifyEvent = null;
+      }
+    });
+
+    stream.onAbort(() => {
+      isAborted = true;
+      unsubscribe();
+      unsubEnd();
+      if (notifyEvent) {
+        notifyEvent();
+        notifyEvent = null;
+      }
+    });
+
+    try {
+      while (!isAborted) {
+        if (eventQueue.length === 0) {
+          // Heartbeat interval with randomized jitter (25s - 35s) to avoid thundering herd
+          const jitterMs = 25000 + Math.floor(Math.random() * 10000);
+          await Promise.race([
+            new Promise<void>((resolve) => {
+              notifyEvent = resolve;
+            }),
+            stream.sleep(jitterMs),
+          ]);
+        }
+
+        if (isAborted) break;
+
+        while (eventQueue.length > 0) {
+          const event = eventQueue.shift();
+          if (!event) continue;
+
+          if (event.type === "session_ended") {
+            await stream.writeSSE({
+              event: "session_ended",
+              data: JSON.stringify({
+                reason: event.reason || "Session ended",
+                timestamp: Date.now(),
+              }),
+            });
+            isAborted = true;
+            break;
+          }
+
+          const eventId =
+            event.id ||
+            `${sessionCode}-${studentId}-${event.timestamp || Date.now()}`;
+          await stream.writeSSE({
+            id: eventId,
+            event: "iem_update",
+            data: JSON.stringify({
+              id: eventId,
+              label: event.label,
+              confidence: event.confidence,
+              iScoreS: event.iScoreS,
+              eScoreS: event.eScoreS,
+              iScoreTurn: event.iScoreTurn,
+              eScoreTurn: event.eScoreTurn,
+              windowSize: event.windowSize,
+              timestamp: event.timestamp || Date.now(),
+            }),
+          });
+        }
+
+        if (isAborted) break;
+
+        const activeSession = sessions.get(sessionCode);
+        const tickTime = Math.floor(Date.now() / 1000);
+        if (
+          !activeSession ||
+          (activeSession.durationMinutes > 0 &&
+            tickTime >=
+              activeSession.startTime + activeSession.durationMinutes * 60)
+        ) {
+          await stream.writeSSE({
+            event: "session_ended",
+            data: JSON.stringify({
+              reason: "Session ended or expired",
+              timestamp: tickTime,
+            }),
+          });
+          isAborted = true;
+          break;
+        }
+
+        await stream.writeSSE({ event: "ping", data: "{}" });
+      }
+    } catch (streamErr) {
+      // Client disconnected
+    } finally {
+      unsubscribe();
+      unsubEnd();
+    }
+  });
+});
 
 sessionAuthRouter.get("/status", async (c) => {
   const authHeader = c.req.header("Authorization");
@@ -51,10 +276,7 @@ sessionAuthRouter.get("/status", async (c) => {
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
   if (!state) {
-    return c.json(
-      { error: "Student session state not found." },
-      404,
-    );
+    return c.json({ error: "Student session state not found." }, 404);
   }
 
   let consumed = state.tokensConsumed;
@@ -153,7 +375,10 @@ sessionAuthRouter.post("/login", async (c) => {
 
   if (!studentId) {
     return c.json(
-      { error: "Missing Student ID. Please log in with your FPT Student Account first." },
+      {
+        error:
+          "Missing Student ID. Please log in with your FPT Student Account first.",
+      },
       400,
     );
   }
@@ -171,7 +396,7 @@ sessionAuthRouter.post("/login", async (c) => {
         lockedUntil: lockout.lockedUntil,
         reason: lockout.reason,
       },
-      429
+      429,
     );
   }
 
@@ -206,7 +431,9 @@ sessionAuthRouter.post("/login", async (c) => {
 
   if (!account) {
     return c.json(
-      { error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.` },
+      {
+        error: `Student account for ${studentId} does not exist under instructor @${session.createdBy || "admin"}.`,
+      },
       403,
     );
   }
@@ -228,8 +455,7 @@ sessionAuthRouter.post("/login", async (c) => {
     // Check if the lecturer updated the password after the token was issued
     const tokenIssuedAtMs = (bearerIat || 0) * 1000;
     const isPasswordStillFresh =
-      !account.updatedAt ||
-      tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
+      !account.updatedAt || tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
 
     if (isLecturerAuthorized && isPasswordStillFresh) {
       bearerMatches = true;
@@ -250,12 +476,18 @@ sessionAuthRouter.post("/login", async (c) => {
     let isPasswordValid = false;
     const creatorAcc = studentAccounts.get(mapKey);
     if (creatorAcc) {
-      isPasswordValid = await verifyPasswordSafely(password, creatorAcc.passwordHash);
+      isPasswordValid = await verifyPasswordSafely(
+        password,
+        creatorAcc.passwordHash,
+      );
     }
     if (!isPasswordValid) {
       const adminAcc = studentAccounts.get(`${studentId}:admin`);
       if (adminAcc) {
-        isPasswordValid = await verifyPasswordSafely(password, adminAcc.passwordHash);
+        isPasswordValid = await verifyPasswordSafely(
+          password,
+          adminAcc.passwordHash,
+        );
       }
     }
     if (!isPasswordValid && !creatorAcc) {
@@ -281,7 +513,7 @@ sessionAuthRouter.post("/login", async (c) => {
             lockedUntil: result.lockoutInfo.lockedUntil,
             reason: result.lockoutInfo.reason,
           },
-          429
+          429,
         );
       }
       return c.json(
@@ -290,7 +522,7 @@ sessionAuthRouter.post("/login", async (c) => {
           failedAttempts: result.attemptsCount,
           remainingAttempts: Math.max(0, 10 - result.attemptsCount),
         },
-        403
+        403,
       );
     }
   }
@@ -398,9 +630,17 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   }
 
   const body = await c.req.json().catch(() => ({}));
-  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "").trim().toUpperCase();
-  const studentId = (body.studentId || tokenPayload.studentId || "").trim().toUpperCase();
-  const files: Array<{ relativePath: string; content: string; encoding?: string }> = body.files || [];
+  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "")
+    .trim()
+    .toUpperCase();
+  const studentId = (body.studentId || tokenPayload.studentId || "")
+    .trim()
+    .toUpperCase();
+  const files: Array<{
+    relativePath: string;
+    content: string;
+    encoding?: string;
+  }> = body.files || [];
 
   if (!sessionCode || !studentId) {
     return c.json({ error: "Missing required sessionCode or studentId" }, 400);

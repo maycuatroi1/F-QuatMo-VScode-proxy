@@ -1,25 +1,25 @@
 import { fastLineLCS } from "./algorithms";
 import type { ClientContext, TurnLog } from "./redisStore";
 
-// Define feature lists and their weights
+// Define feature lists and their weights (Sec 12.1 - 12.4)
 export const INSTRUMENTAL_WEIGHTS: Record<string, number> = {
-  // Prompt features (i1 - i8)
-  i1: 0.60, // asks conceptual explanation
-  i2: 0.65, // asks API/syntax usage details
-  i3: 0.70, // asks debugging hint or error root cause
-  i4: 0.50, // asks documentation reference
-  i5: 0.75, // provides own code and asks for diagnostics
-  i6: 0.60, // requests structural architectural advice
-  i7: 0.55, // asks validation of a solution step
-  i8: 0.70, // explicitly requests code review comments
+  // 12.1. Instrumental Prompt Features (i1 - i8)
+  i1: 0.50, // inquire_no_context
+  i2: 0.85, // integrate_with_context
+  i3: 0.65, // conceptual_question
+  i4: 0.70, // problem_understanding
+  i5: 0.60, // example_request
+  i6: 0.80, // error_interpretation
+  i7: 0.75, // verification_request
+  i8: 0.45, // code_implementation_question_soft
 
-  // Response features (r1 - r6)
-  r1: 0.65, // conceptual explanation without full code solution
-  r2: 0.60, // narrow syntax reference snippet
-  r3: 0.70, // diagnostic explanation or hint
-  r4: 0.55, // documentation reference
-  r5: 0.75, // code review feedback (no replacement code)
-  r6: 0.50, // step-by-step logic pseudocode
+  // 12.3. Instrumental Output Features (r1 - r6)
+  r1: 0.55, // tutor_role
+  r2: 0.75, // conceptual_explanation
+  r3: 0.75, // code_explanation
+  r4: 0.60, // example_only
+  r5: 0.70, // evaluator_feedback_only
+  r6: 0.85, // stepwise_hint
 
   // Trajectory features (t1 - t5)
   t1: 0.70, // sustained_inquiry_pattern
@@ -37,17 +37,17 @@ export const INSTRUMENTAL_WEIGHTS: Record<string, number> = {
 };
 
 export const EXECUTIVE_WEIGHTS: Record<string, number> = {
-  // Prompt features (e1 - e6)
-  e1: 0.80, // copy-pastes assignment text demanding solution
-  e2: 0.85, // asks AI to write whole file or rewrite it completely
-  e3: 0.75, // demands replacement code without explanation
-  e4: 0.70, // asks AI to fix errors directly on their behalf
-  e5: 0.65, // asks for boilerplate setup script
-  e6: 0.60, // expresses helplessness ("make it work", "do it for me")
+  // 12.2. Executive Prompt Features (e1 - e6)
+  e1: 0.90, // code_generation_request
+  e2: 0.85, // delegate_request
+  e3: 0.80, // assignment_pasted
+  e4: 0.65, // code_pasted_no_question
+  e5: 0.75, // direct_correction_request
+  e6: 0.40, // results_pasted
 
-  // Response features (r7 - r8)
-  r7: 0.85, // provides complete copy-pasteable full script/file
-  r8: 0.80, // provides direct patch edits rewriting massive chunks
+  // 12.4. Executive Output Features (r7 - r8)
+  r7: 0.85, // executor_role
+  r8: 0.95, // exact_solution_code
 
   // Trajectory features (t6 - t10)
   t6: 0.85, // repeated_copy_paste_pattern
@@ -104,7 +104,7 @@ export function deriveIemLabel(
 ): "instrumental" | "executive" | "mixed" | "ambiguous" {
   const delta = instrumentalScore - executiveScore;
 
-  // 1. Dominant signal: Leader is >= HIGH (0.55) and separation > 0.20
+  // 1. Dominant signal: Leader is >= HIGH (0.55) and separation is decisive (> 0.20)
   if (instrumentalScore >= IEM_HIGH_THRESHOLD && delta > 0.20) {
     return "instrumental";
   }
@@ -136,6 +136,7 @@ export function deriveIemLabel(
     return "executive";
   }
 
+  // 4. Ambiguous fallback
   return "ambiguous";
 }
 
@@ -558,7 +559,18 @@ export function calculateProgrammaticFeatures(
 
   const hasTestEvidence = hasPromptTestEvidence || currentTerminalActive || priorTerminalActive;
 
-  if (hasTerminalTelemetry) {
+  const hasCodeInContext = Boolean(
+    (clientContext?.activeFile?.content && clientContext.activeFile.content.trim().length > 0) ||
+    recentTurns.some((t) => extractCodeBlocks(t.response).trim().length > 0)
+  );
+
+  const isPureInquiry =
+    /\b(what is|what are|why|explain|describe|concept|how does|how to|meaning of|intuition behind|giải thích|là gì|tại sao|nguyên lý|ý nghĩa)\b/i.test(prompt) &&
+    !/\b(write|code|solve|fix|cho tôi code|giải giúp)\b/i.test(prompt);
+
+  if (!hasCodeInContext || isPureInquiry) {
+    features["c10"] = 0;
+  } else if (hasTerminalTelemetry) {
     features["_hasTerminalTelemetry"] = 1;
     // With IDE telemetry, confirmation of zero test activity across turns is ground truth.
     features["c10"] = hasTestEvidence
@@ -571,14 +583,12 @@ export function calculateProgrammaticFeatures(
             ? 0.50
             : 0.25;
   } else {
-    // Legacy prompt-scan fallback without IDE telemetry (capped at 0.75)
+    // Legacy prompt-scan fallback without IDE telemetry (capped at 0.50, only after multiple turns with code)
     features["c10"] = hasTestEvidence
       ? 0
       : recentTurns.length >= 3
-        ? 0.75
-        : recentTurns.length >= 1
-          ? 0.50
-          : 0.25;
+        ? 0.50
+        : 0;
   }
 
   // ─────────────────────────────────────────────────────────────────

@@ -1,5 +1,7 @@
 import {
   calculateSignalScore,
+  calculateIemConfidence,
+  deriveIemLabel,
   EXECUTIVE_WEIGHTS,
   INSTRUMENTAL_WEIGHTS,
 } from "./features";
@@ -54,19 +56,28 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   const hasCodeContext =
     /attached (context )?file|```|traceback|\b(line|error) \d+\b/i.test(text);
 
+  // Explicit delegation phrasing (e.g. "for me", "cho tôi", "làm hộ tôi", etc.)
+  const hasExplicitDelegation =
+    /\b(for me|to me|give me|send me|show me|cho (?:tôi|tao|mình|em)|hộ (?:tôi|tao|mình|em)|giúp (?:tôi|tao|mình|em))\b/i.test(
+      text,
+    );
+
   // --- Instrumental Signals ---
   const asksExplanation =
-    /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|difference between|compare|meaning of|intuition behind)\b/i.test(
+    /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|how can|how to|difference between|compare|meaning of|intuition behind)\b/i.test(
       text,
     ) ||
-    /(?:giải thích|là gì|tại sao|nguyên lý|ý nghĩa|khác nhau thế nào|hoạt động như thế nào)/i.test(
+    /(?:giải thích|là gì|tại sao|nguyên lý|ý nghĩa|khác nhau thế nào|hoạt động như thế nào|làm thế nào|cách làm|cách cài đặt|hướng dẫn)/i.test(
       text,
     );
 
   // --- Executive Signals ---
   const asksDirectCreation =
-    /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website)\b/i.test(
-      text,
+    (
+      /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website)\b/i.test(
+        text,
+      ) &&
+      (!asksExplanation || hasExplicitDelegation)
     ) ||
     /\bwrite (?:me )?(?:a |an |the )?(?:full |complete )?(?:code|script|function|program|solution|implementation|app)\b/i.test(
       text,
@@ -111,7 +122,7 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   if (asksExplanation) activate(features, "i1", 0.75);
 
   if (
-    /\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide)\b/i.test(
+    /\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide|in python|in c\+\+|in java|in javascript|in js|in ts|in c|bằng python|trong python|bằng c|bằng java)\b/i.test(
       text,
     ) ||
     /(?:cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text)
@@ -120,17 +131,26 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   }
 
   if (
-    (/\b(why (?:did|is|does)|root cause|what causes|diagnose|understand (?:the )?error|meaning of (?:this )?traceback|exception|stack trace)\b/i.test(
+    asksExplanation &&
+    /\b(algorithm|data structure|binary search|bubble sort|quick sort|merge sort|sorting|recursion|tree|graph|dp|dynamic programming|thuật toán|cấu trúc dữ liệu)\b/i.test(
       text,
-    ) ||
-      /(?:tại sao lỗi|nguyên nhân lỗi|lỗi này nghĩa là gì)/i.test(text)) &&
-    !delegatesFix
+    )
   ) {
-    activate(features, "i3", 0.75);
+    activate(features, "i3", 0.85);
   }
 
   if (
-    /\b(documentation|official docs?|specification|reference guide|man page|docs for)\b/i.test(
+    (/\b(why\b|root cause|what causes|diagnose|concept|meaning of|intuition behind|theory|mechanism|understand (?:the )?error|meaning of (?:this )?traceback|exception|stack trace)\b/i.test(
+      text,
+    ) ||
+      /(?:tại sao|nguyên lý|ý nghĩa|bản chất|khái niệm|nguyên nhân lỗi|lỗi này nghĩa là gì)/i.test(text)) &&
+    !delegatesFix
+  ) {
+    activate(features, "i3", 0.85);
+  }
+
+  if (
+    /\b(documentation|official docs?|specification|reference guide|man page|docs for|problem statement|problem understanding|đề bài|hiểu bài)\b/i.test(
       text,
     )
   ) {
@@ -168,9 +188,17 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   }
 
   if (
-    /\b(complexity|time complexity|space complexity|big o|optimize|how to improve efficiency|refactor advice|clean code)\b/i.test(
+    /\b(complexity|time complexity|space complexity|big o|optimize|how to improve efficiency|refactor advice|clean code|độ phức tạp)\b/i.test(
       text,
     )
+  ) {
+    activate(features, "i8", 0.75);
+  }
+
+  if (
+    asksExplanation &&
+    /\b(implement|code|write|algorithm|function|class|cài đặt|viết code|thuật toán)\b/i.test(text) &&
+    !hasExplicitDelegation
   ) {
     activate(features, "i8", 0.75);
   }
@@ -180,7 +208,8 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     text.length >= 200 &&
     /\b(requirements?|assignment|task|acceptance criteria|problem statement|input format|output format|sample input|sample output|test case|bài tập|đề bài|yêu cầu bài)\b/i.test(
       text,
-    )
+    ) &&
+    !asksExplanation
   ) {
     activate(features, "e1", 0.85);
   }
@@ -208,27 +237,19 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
 
   const instrumentalScore = scoreFeatures(features, INSTRUMENTAL_WEIGHTS);
   const executiveScore = scoreFeatures(features, EXECUTIVE_WEIGHTS);
-  const hardExecutive = ["e1", "e2", "e3", "e4", "e6"].some(
-    (key) => (features[key] ?? 0) >= 0.75,
-  );
 
-  let label: IemLabel;
-  if (hardExecutive) {
-    label = "executive";
-  } else if (instrumentalScore < 0.2 && executiveScore < 0.2) {
-    label = "mixed";
-  } else if (Math.abs(instrumentalScore - executiveScore) < 0.12) {
-    label = "mixed";
-  } else {
-    label = instrumentalScore > executiveScore ? "instrumental" : "executive";
-  }
+  // Apply the exact 3-Gate threshold rules from Research Paper Section III-D:
+  // G_instrumental: I >= HIGH (0.55) && E < MID (0.45) && (I - E) >= MARGIN (0.15)
+  // G_executive:    E >= HIGH (0.55) && I < MID (0.45) && (E - I) >= MARGIN (0.15)
+  // G_conflict:     I >= MID (0.45) && E >= MID (0.45) -> mixed
+  // G_ambiguous:    fallback -> mixed
+  const rawLabel = deriveIemLabel(instrumentalScore, executiveScore);
+  const label: IemLabel =
+    rawLabel === "instrumental" || rawLabel === "executive"
+      ? rawLabel
+      : "mixed";
 
-  const strongest = Math.max(instrumentalScore, executiveScore);
-  const separation = Math.abs(instrumentalScore - executiveScore);
-  const confidence =
-    label === "mixed"
-      ? Math.max(0.35, Math.min(1, 1 - separation / 0.25))
-      : Math.min(1, strongest * 0.6 + Math.min(1, separation / 0.4) * 0.4);
+  const confidence = calculateIemConfidence(rawLabel, instrumentalScore, executiveScore);
 
   return {
     label,
@@ -236,6 +257,6 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     instrumentalScore,
     executiveScore,
     activeFeatures: features,
-    hardExecutive,
+    hardExecutive: label === "executive" && executiveScore >= 0.75,
   };
 }

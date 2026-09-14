@@ -22,6 +22,30 @@ test("conceptual current request selects instrumental mode", () => {
   expect(decision.label).toBe("instrumental");
 });
 
+test("implementation inquiry without delegation selects instrumental mode", () => {
+  const decision1 = classifyCurrentPrompt(
+    "How can I implement a binary search algorithm in Python?",
+  );
+  expect(decision1.label).toBe("instrumental");
+
+  const decision2 = classifyCurrentPrompt(
+    "Hướng dẫn cách cài đặt thuật toán quicksort bằng Python",
+  );
+  expect(decision2.label).toBe("instrumental");
+});
+
+test("conceptual questions without terminal telemetry do not receive c10 penalty", () => {
+  const features = calculateProgrammaticFeatures(
+    "Explain what a deadlock is in operating systems",
+    "",
+    null,
+    null,
+    30,
+    [],
+  );
+  expect(features.c10).toBe(0);
+});
+
 test("vietnamese executive prompt is accurately classified as executive", () => {
   const decision1 = classifyCurrentPrompt("Viết code cho tôi bài tập tạo web django này");
   expect(decision1.label).toBe("executive");

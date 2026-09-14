@@ -837,7 +837,7 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
   } = body as any;
 
   if (typeof durationMinutes === "number") session.durationMinutes = durationMinutes;
-  if (typeof aiOption === "string") session.aiOption = aiOption;
+  if (typeof aiOption === "string" && ["chatbot", "agent", "none"].includes(aiOption)) session.aiOption = aiOption as "chatbot" | "agent" | "none";
   if (typeof aiValidityMinutes === "number") session.aiValidityMinutes = aiValidityMinutes;
   if (typeof defaultTokenBudget === "number") session.defaultTokenBudget = defaultTokenBudget;
   if (sessionType === "basic" || sessionType === "exam") session.sessionType = sessionType;

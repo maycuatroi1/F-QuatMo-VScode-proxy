@@ -45,6 +45,10 @@ const localLatestClassifications = new Map<
 const CLIENT_CONTEXT_TTL_SEC = 120;
 const TURNS_TTL_SEC = 18000;
 const LATEST_CLASS_TTL_SEC = 300;
+const EVAL_PENDING_TTL_SEC = parseInt(
+  process.env.EVAL_PENDING_TTL_SEC || "120",
+  10,
+);
 
 export const redisStore = {
   async saveClientContext(
@@ -117,6 +121,55 @@ export const redisStore = {
     return [];
   },
 
+  /**
+   * Atomically appends a turn to the student's sliding window and trims to maxWindow using an atomic Redis Lua script.
+   * Eliminates Read-Modify-Write race conditions under high CCU.
+   */
+  async pushTurnAtomic(
+    sessionCode: string,
+    studentId: string,
+    turn: TurnLog,
+    maxWindow = 10,
+  ): Promise<TurnLog[]> {
+    const sCode = sessionCode.toUpperCase();
+    const sId = studentId.toUpperCase();
+    const key = `session:turns:${sCode}:${sId}`;
+
+    if (redis && redis.status === "ready") {
+      try {
+        const luaScript = `
+          redis.call('RPUSH', KEYS[1], ARGV[1])
+          redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
+          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+          return redis.call('LRANGE', KEYS[1], 0, -1)
+        `;
+        const result = (await redis.eval(
+          luaScript,
+          1,
+          key,
+          JSON.stringify(turn),
+          maxWindow.toString(),
+          TURNS_TTL_SEC.toString(),
+        )) as string[];
+
+        if (Array.isArray(result)) {
+          return result.map((item) => JSON.parse(item));
+        }
+      } catch (err) {
+        console.error(
+          "[Classifier Redis] pushTurnAtomic Lua failed, falling back to local memory:",
+          err,
+        );
+      }
+    }
+
+    const list = localTurns.get(key) || [];
+    list.push(turn);
+    const trimmed = list.slice(-maxWindow);
+    localTurns.set(key, trimmed);
+    return trimmed;
+  },
+
   async saveTurns(
     sessionCode: string,
     studentId: string,
@@ -125,13 +178,54 @@ export const redisStore = {
     const key = `session:turns:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
     if (redis && redis.status === "ready") {
       try {
-        await redis.set(key, JSON.stringify(turns), "EX", TURNS_TTL_SEC);
+        const pipeline = redis.pipeline();
+        pipeline.del(key);
+        if (turns.length > 0) {
+          pipeline.rpush(key, ...turns.map((t) => JSON.stringify(t)));
+          pipeline.expire(key, TURNS_TTL_SEC);
+        }
+        await pipeline.exec();
       } catch (err) {
         console.error("[Classifier Redis] Failed to save turns:", err);
       }
     } else {
       localTurns.set(key, turns);
     }
+  },
+
+  async cacheLatestEvent(
+    sessionCode: string,
+    studentId: string,
+    event: any,
+  ): Promise<void> {
+    const key = `session:latest-event:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
+    if (redis && redis.status === "ready") {
+      try {
+        await redis.set(key, JSON.stringify(event), "EX", 86400);
+      } catch (err) {
+        console.error("[Classifier Redis] Failed to cache latest event:", err);
+      }
+    } else {
+      localLatestClassifications.set(key, event);
+    }
+  },
+
+  async getLatestEvent(
+    sessionCode: string,
+    studentId: string,
+  ): Promise<any | null> {
+    const key = `session:latest-event:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
+    if (redis && redis.status === "ready") {
+      try {
+        const val = await redis.get(key);
+        if (val) return JSON.parse(val);
+      } catch (err) {
+        console.error("[Classifier Redis] Failed to get latest event:", err);
+      }
+    } else {
+      return localLatestClassifications.get(key) || null;
+    }
+    return null;
   },
 
   async cacheClassification(
@@ -194,7 +288,7 @@ export const redisStore = {
     if (redis && redis.status === "ready") {
       try {
         if (pending) {
-          await redis.set(key, "true", "EX", 15); // 15s TTL max
+          await redis.set(key, "true", "EX", EVAL_PENDING_TTL_SEC);
         } else {
           await redis.del(key);
         }
@@ -204,6 +298,10 @@ export const redisStore = {
     } else {
       if (pending) {
         localPendingEvaluations.set(key, true);
+        setTimeout(
+          () => localPendingEvaluations.delete(key),
+          EVAL_PENDING_TTL_SEC * 1000,
+        );
       } else {
         localPendingEvaluations.delete(key);
       }

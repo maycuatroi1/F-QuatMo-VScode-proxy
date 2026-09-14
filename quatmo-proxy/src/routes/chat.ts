@@ -24,8 +24,10 @@ import { redisStore } from "../services/classifier/redisStore";
 import { s3Storage } from "../services/s3Storage";
 import {
   evaluateTurnAndSession,
+  queueEvaluation,
   getStudentTopNClassification,
   type TopNClassificationResult,
+  type EvaluationResult,
 } from "../services/classifier/index";
 import { extractCodeSnapshot } from "../services/classifier/features";
 import type { IemLabel } from "../services/classifier/currentPromptClassifier";
@@ -224,7 +226,11 @@ chatRouter.get("/latest-classification", unifiedAuthMiddleware(), async (c) => {
   }
   // Wait if evaluation is pending (long polling)
   let retries = 0;
-  while ((await redisStore.isEvaluationPending(token)) && retries < 25) {
+  const maxRetries = parseInt(
+    process.env.CLASSIFICATION_POLL_RETRIES || "300",
+    10,
+  );
+  while ((await redisStore.isEvaluationPending(token)) && retries < maxRetries) {
     await new Promise((resolve) => setTimeout(resolve, 200));
     retries++;
   }
@@ -941,7 +947,7 @@ chatRouter.post(
     const currentIemConfidence: number = topNDecision.confidence;
 
     console.log(
-      `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode}) | Active Label: ${currentIemLabel} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
+      `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode}) | overallLabel (top5): ${currentIemLabel.toUpperCase()} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
     );
 
     if (isUserPrompt && messages && Array.isArray(messages)) {
@@ -996,28 +1002,13 @@ chatRouter.post(
     if (body.messages && Array.isArray(body.messages)) {
       const warningText =
         "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
-      let runtimePolicy = "";
-      if (currentIemLabel === "instrumental") {
-        runtimePolicy =
-          "\n\nRUNTIME IEM POLICY (INSTRUMENTAL MODE - LEVEL 1 RELAXED GATE):\n" +
-          "- Focus primarily on computational theory, root causes, and web architecture.\n" +
-          "- You may freely provide clear explanations accompanied by illustrative code snippets (3-10 lines) and concrete mini-examples to demonstrate concepts.\n" +
-          "- Respond 100% in English only.";
-      } else if (currentIemLabel === "mixed") {
-        runtimePolicy =
-          "\n\nRUNTIME IEM POLICY (MIXED MODE - LEVEL 2 BALANCED GATE):\n" +
-          "- For raw problem statements, do not dump full solutions; deconstruct into steps and ask for student's direction.\n" +
-          "- Provide scaffolded skeleton templates (with # TODO comments) when the student shares a preliminary idea.\n" +
-          "- Unlock full clean code when the student articulates their workflow or logic.\n" +
-          "- Respond 100% in English only.";
-      } else {
-        runtimePolicy =
-          "\n\nRUNTIME IEM POLICY (EXECUTIVE MODE - LEVEL 3 STRICTEST COGNITIVE GATE):\n" +
-          "- STRICT ZERO-CODE ON RAW PROMPTS: Absolutely no solution code blocks for raw problem statements, exercises, or lazy requests.\n" +
-          "- Deconstruct the problem into 2-3 logical steps and ask the student how they plan to solve Step 1 in detail.\n" +
-          "- If the student gives a shallow/vague answer, probe deeper. DO NOT unlock code until the student thoroughly explains their detailed algorithm, pseudocode, or draft code.\n" +
-          "- Respond 100% in English only.";
-      }
+      const runtimePolicy =
+        "\n\nRUNTIME TUTOR POLICY (NATURAL & DEMAND-DRIVEN ASSISTANCE):\n" +
+        "- Be helpful, supportive, and direct ('Hỏi gì đáp nấy'). Avoid unnecessary friction or interrogation.\n" +
+        "- Demand-Driven: When asked conceptual or theoretical questions, explain clearly and concisely in text. When asked for code, examples, or bug fixes, provide clean, working code directly.\n" +
+        "- Modular Code Generation: When asked for a large project or full application, do NOT dump an entire massive monolithic codebase or multiple full files in one response. Provide core architecture/skeleton and the primary foundational module first, guiding the student incrementally.\n" +
+        "- Keep answers sharp, concise, and focused strictly on what the student asked.\n" +
+        "- Respond 100% in English only.";
       let sessionContextBlock = "";
       const activeSession = sessions.get(finalSessionCode);
       if (activeSession) {
@@ -1412,16 +1403,14 @@ chatRouter.post(
         !hasToolCalls
       ) {
         const completionText = responseData.choices[0].message.content || "";
-        setImmediate(() => {
-          evaluateTurnAndSession(
-            finalSessionCode,
-            finalStudentId,
-            token,
-            userPrompt,
-            completionText,
-            body.messages,
-          ).catch((e) => console.error("[Background Classifier] Error:", e));
-        });
+        queueEvaluation(
+          finalSessionCode,
+          finalStudentId,
+          token,
+          userPrompt,
+          completionText,
+          body.messages,
+        ).catch((e) => console.error("[Queue Evaluation] Error:", e));
       }
 
       await recordTokenUsage(totalConsumed);
@@ -1499,16 +1488,14 @@ chatRouter.post(
         }
 
         if (shouldClassify && !hasAnyToolCalls) {
-          setImmediate(() => {
-            evaluateTurnAndSession(
-              finalSessionCode,
-              finalStudentId,
-              token,
-              userPrompt,
-              completionText,
-              body.messages,
-            ).catch((e) => console.error("[Background Classifier] Error:", e));
-          });
+          queueEvaluation(
+            finalSessionCode,
+            finalStudentId,
+            token,
+            userPrompt,
+            completionText,
+            body.messages,
+          ).catch((e) => console.error("[Queue Evaluation] Error:", e));
         }
 
         // Run output safety check asynchronously (non-blocking chunk delivery)

@@ -207,7 +207,9 @@ export async function evaluateTurnSemanticFeatures(
         ],
         temperature: 0,
       }),
-      signal: AbortSignal.timeout(35000),
+      signal: AbortSignal.timeout(
+        parseInt(process.env.CLASSIFIER_TIMEOUT_MS || "90000", 10),
+      ),
     });
 
     if (!res.ok) {

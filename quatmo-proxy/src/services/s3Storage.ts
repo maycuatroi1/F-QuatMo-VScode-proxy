@@ -34,20 +34,7 @@ export class S3StorageService {
 
     if (accessKeyId && secretAccessKey) {
       try {
-        const isHttps = endpoint.startsWith("https://");
         const requestHandler = new NodeHttpHandler({
-          httpAgent: new http.Agent({
-            keepAlive: true,
-            maxSockets: 250,
-            maxFreeSockets: 50,
-            timeout: 30000,
-          }),
-          httpsAgent: new https.Agent({
-            keepAlive: true,
-            maxSockets: 250,
-            maxFreeSockets: 50,
-            timeout: 30000,
-          }),
           connectionTimeout: 10000,
           requestTimeout: 30000,
         });
@@ -60,6 +47,7 @@ export class S3StorageService {
             secretAccessKey,
           },
           forcePathStyle,
+          maxAttempts: 4,
           requestHandler,
         });
         this.initialized = true;
@@ -74,6 +62,38 @@ export class S3StorageService {
     } else {
       this.client = null;
       this.initialized = false;
+    }
+  }
+
+  private async sendCommand<T = any>(command: any): Promise<T> {
+    if (!this.client) {
+      this.initClient();
+    }
+    if (!this.client) {
+      throw new Error("S3 client is not available");
+    }
+
+    try {
+      return (await this.client.send(command)) as T;
+    } catch (err: any) {
+      const isTransientSocketErr =
+        err?.code === "FailedToOpenSocket" ||
+        err?.code === "ECONNRESET" ||
+        err?.code === "EPIPE" ||
+        err?.code === "ETIMEDOUT" ||
+        err?.message?.includes("FailedToOpenSocket") ||
+        err?.message?.includes("typo in the url or port");
+
+      if (isTransientSocketErr) {
+        console.warn(
+          `[S3 Storage] Transient socket error (${err?.code || "network"}). Re-initializing client and retrying once...`,
+        );
+        this.initClient();
+        if (this.client) {
+          return (await this.client.send(command)) as T;
+        }
+      }
+      throw err;
     }
   }
 
@@ -127,7 +147,7 @@ export class S3StorageService {
     const body = JSON.stringify(turns, null, 2);
 
     try {
-      await this.client.send(
+      await this.sendCommand(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -150,7 +170,7 @@ export class S3StorageService {
 
     const key = this.formatStudentPromptLogKey(sessionCode, studentId);
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new GetObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -179,7 +199,7 @@ export class S3StorageService {
     const body = JSON.stringify(turns, null, 2);
 
     try {
-      await this.client.send(
+      await this.sendCommand(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -199,7 +219,7 @@ export class S3StorageService {
 
     const key = this.formatGuestPromptLogKey(guestId);
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new GetObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -242,7 +262,7 @@ export class S3StorageService {
     }
 
     try {
-      await this.client.send(
+      await this.sendCommand(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -275,7 +295,7 @@ export class S3StorageService {
     const key = `${prefix}${fileName}`;
 
     try {
-      await this.client.send(
+      await this.sendCommand(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -300,7 +320,7 @@ export class S3StorageService {
     try {
       let continuationToken: string | undefined = undefined;
       do {
-        const resp = await this.client.send(
+        const resp: any = await this.sendCommand(
           new ListObjectsV2Command({
             Bucket: this.bucket,
             Prefix: prefix,
@@ -312,10 +332,10 @@ export class S3StorageService {
           const deleteParams = {
             Bucket: this.bucket,
             Delete: {
-              Objects: resp.Contents.map((obj) => ({ Key: obj.Key! })),
+              Objects: resp.Contents.map((obj: any) => ({ Key: obj.Key! })),
             },
           };
-          await this.client.send(new DeleteObjectsCommand(deleteParams));
+          await this.sendCommand(new DeleteObjectsCommand(deleteParams));
         }
 
         continuationToken = resp.NextContinuationToken;
@@ -339,7 +359,7 @@ export class S3StorageService {
 
     const prefix = this.formatExamRecordPrefix(sessionCode, studentId);
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new ListObjectsV2Command({
           Bucket: this.bucket,
           Prefix: prefix,
@@ -385,7 +405,7 @@ export class S3StorageService {
     const key = `${prefix}${fileName}`;
 
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new GetObjectCommand({
           Bucket: this.bucket,
           Key: key,
@@ -414,7 +434,7 @@ export class S3StorageService {
     if (!this.isAvailable() || !this.client) return [];
 
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new ListObjectsV2Command({
           Bucket: this.bucket,
           Prefix: "sessions/",
@@ -455,7 +475,7 @@ export class S3StorageService {
     const studentsPrefix = `sessions/${safeSession}/students/`;
 
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new ListObjectsV2Command({
           Bucket: this.bucket,
           Prefix: studentsPrefix,
@@ -482,7 +502,7 @@ export class S3StorageService {
           let lastActivity: number | undefined;
 
           try {
-            const head = await this.client.send(
+            const head = await this.sendCommand(
               new HeadObjectCommand({
                 Bucket: this.bucket,
                 Key: promptLogKey,
@@ -522,7 +542,7 @@ export class S3StorageService {
     if (!this.isAvailable() || !this.client) return [];
 
     try {
-      const resp = await this.client.send(
+      const resp = await this.sendCommand(
         new ListObjectsV2Command({
           Bucket: this.bucket,
           Prefix: "guests/",
