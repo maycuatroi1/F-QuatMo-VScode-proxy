@@ -594,6 +594,33 @@ export class S3StorageService {
   }
 
   /**
+   * List all objects in releases/ prefix (max 5 slots)
+   */
+  public async listAllReleaseObjects(): Promise<Array<{ key: string; filename: string; size: number; lastModified?: Date }>> {
+    if (!this.isAvailable() || !this.client) return [];
+    try {
+      const resp = await this.sendCommand(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: "releases/",
+        }),
+      );
+      return (resp.Contents || [])
+        .filter((item: any) => item.Key && item.Key !== "releases/")
+        .map((item: any) => ({
+          key: item.Key,
+          filename: item.Key.split("/").pop() || item.Key,
+          size: item.Size || 0,
+          lastModified: item.LastModified,
+        }))
+        .sort((a: any, b: any) => (b.lastModified?.getTime() || 0) - (a.lastModified?.getTime() || 0));
+    } catch (err: any) {
+      console.warn("[S3 Storage] Failed to list all release objects:", err?.message || err);
+      return [];
+    }
+  }
+
+  /**
    * Find any available setup executable in releases/ folder
    */
   public async findLatestReleaseInS3(): Promise<{ key: string; filename: string; size: number; lastModified?: Date } | null> {

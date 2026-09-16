@@ -236,12 +236,15 @@ updateRouter.get("/release/current", async (c) => {
     downloadUrl = `${proto}://${host}/v1/releases/${filename}`;
   }
 
+  const s3Files = await s3Storage.listAllReleaseObjects();
+
   return c.json({
     success: true,
     release: {
       ...release,
       downloadUrl,
     },
+    s3Files,
     s3Enabled: s3Storage.isAvailable(),
   });
 });
