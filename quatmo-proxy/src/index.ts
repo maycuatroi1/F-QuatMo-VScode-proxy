@@ -5,6 +5,7 @@ import { chatRouter } from "./routes/chat";
 import { adminRouter } from "./routes/admin";
 import { sessionAuthRouter } from "./routes/sessionAuth";
 import { authRouter } from "./routes/auth";
+import { updateRouter } from "./routes/update";
 import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
@@ -56,6 +57,8 @@ app.route("/session", sessionAuthRouter);
 app.route("/v1/session", sessionAuthRouter);
 app.route("/auth", authRouter);
 app.route("/v1/auth", authRouter);
+app.route("/v1", updateRouter);
+app.route("/", updateRouter);
 
 app.get("/v1/models", unifiedAuthMiddleware(), (c) => {
   return c.json({

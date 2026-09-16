@@ -1,0 +1,15 @@
+{
+  "version": "1.95.3",
+  "commit": "e7b29a14c8f530d961e4a3b82759c01f6834d825",
+  "updateType": "patch",
+  "productVersion": "1.95.3",
+  "releasedAt": "2026-09-16T06:26:59.535Z",
+  "mandatory": false,
+  "notes": "Update Session icon to new modern Security Shield badge",
+  "filename": "Fvscode-Patch-1.95.3.zip",
+  "s3Key": "releases/Fvscode-Patch-1.95.3.zip",
+  "downloadUrl": "https://fvscode-proxy.iahn.hanoi.vn/v1/releases/Fvscode-Patch-1.95.3.zip",
+  "sha256hash": "108498313648593685af98a6da7481fc3affb2fe186d9bba99f5dabf7821148c",
+  "sizeBytes": 33138296,
+  "sizeMB": 31.6
+}

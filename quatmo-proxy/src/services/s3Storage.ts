@@ -568,6 +568,89 @@ export class S3StorageService {
       return [];
     }
   }
+
+  /**
+   * Fetch release manifest from S3 (releases/release_manifest.json)
+   */
+  public async getReleaseManifestFromS3(): Promise<any | null> {
+    if (!this.isAvailable() || !this.client) return null;
+    try {
+      const resp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: "releases/release_manifest.json",
+        }),
+      );
+      if (!resp.Body) return null;
+      const str = await resp.Body.transformToString("utf-8");
+      return JSON.parse(str);
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.warn("[S3 Storage] Failed to fetch release_manifest.json from S3:", err?.message || err);
+      return null;
+    }
+  }
+
+  /**
+   * Find any available setup executable in releases/ folder
+   */
+  public async findLatestReleaseInS3(): Promise<{ key: string; filename: string; size: number; lastModified?: Date } | null> {
+    if (!this.isAvailable() || !this.client) return null;
+    try {
+      const resp = await this.sendCommand(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: "releases/",
+        }),
+      );
+      const exes = (resp.Contents || [])
+        .filter((item: any) => item.Key && item.Key.toLowerCase().endsWith(".exe"))
+        .sort((a: any, b: any) => ((b.LastModified?.getTime() || 0) - (a.LastModified?.getTime() || 0)));
+
+      if (exes.length === 0) return null;
+      const newest = exes[0];
+      return {
+        key: newest.Key,
+        filename: newest.Key.split("/").pop() || "Fvscode-UserSetup-x64.exe",
+        size: newest.Size || 0,
+        lastModified: newest.LastModified,
+      };
+    } catch (err: any) {
+      console.warn("[S3 Storage] Failed to list releases from S3:", err?.message || err);
+      return null;
+    }
+  }
+
+  /**
+   * Get readable stream for a release object in releases/
+   */
+  public async getReleaseStream(filename: string): Promise<{ stream: any; contentLength?: number; contentType?: string } | null> {
+    if (!this.isAvailable() || !this.client) return null;
+    const safeName = filename.replace(/[^a-zA-Z0-9.\-_]/g, "");
+    const key = `releases/${safeName}`;
+    try {
+      const resp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        }),
+      );
+      if (!resp.Body) return null;
+      return {
+        stream: resp.Body,
+        contentLength: resp.ContentLength != null ? Number(resp.ContentLength) : undefined,
+        contentType: resp.ContentType || "application/octet-stream",
+      };
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.error(`[S3 Storage] Failed to get release stream for ${key}:`, err);
+      return null;
+    }
+  }
 }
 
 export const s3Storage = new S3StorageService();
