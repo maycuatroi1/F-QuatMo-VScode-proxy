@@ -104,15 +104,36 @@ export const redisStore = {
     return null;
   },
 
-  async getTurns(sessionCode: string, studentId: string): Promise<TurnLog[]> {
-    const key = `session:turns:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
+  async getTurns(
+    sessionCode: string,
+    studentId: string,
+    conversationId?: string,
+  ): Promise<TurnLog[]> {
+    const sCode = sessionCode.toUpperCase();
+    const sId = studentId.toUpperCase();
+    const key = conversationId
+      ? `session:turns:${sCode}:${sId}:${conversationId}`
+      : `session:turns:${sCode}:${sId}`;
     if (redis && redis.status === "ready") {
       try {
+        // First attempt LRANGE because pushTurnAtomic and saveTurns store turns as a Redis List
+        const items = await redis.lrange(key, 0, -1);
+        if (items && items.length > 0) {
+          return items.map((item) => JSON.parse(item));
+        }
+        // Fallback for legacy keys stored as a single JSON string
         const val = await redis.get(key);
         if (val) {
           return JSON.parse(val);
         }
-      } catch (err) {
+      } catch (err: any) {
+        // If LRANGE throws WRONGTYPE because key is a legacy string, read via GET
+        if (err?.message?.includes("WRONGTYPE")) {
+          try {
+            const val = await redis.get(key);
+            if (val) return JSON.parse(val);
+          } catch {}
+        }
         console.error("[Classifier Redis] Failed to get turns:", err);
       }
     } else {
@@ -124,16 +145,20 @@ export const redisStore = {
   /**
    * Atomically appends a turn to the student's sliding window and trims to maxWindow using an atomic Redis Lua script.
    * Eliminates Read-Modify-Write race conditions under high CCU.
+   * If conversationId is provided, the sliding window is scoped strictly to that conversation.
    */
   async pushTurnAtomic(
     sessionCode: string,
     studentId: string,
     turn: TurnLog,
     maxWindow = 10,
+    conversationId?: string,
   ): Promise<TurnLog[]> {
     const sCode = sessionCode.toUpperCase();
     const sId = studentId.toUpperCase();
-    const key = `session:turns:${sCode}:${sId}`;
+    const key = conversationId
+      ? `session:turns:${sCode}:${sId}:${conversationId}`
+      : `session:turns:${sCode}:${sId}`;
 
     if (redis && redis.status === "ready") {
       try {
@@ -167,6 +192,11 @@ export const redisStore = {
     list.push(turn);
     const trimmed = list.slice(-maxWindow);
     localTurns.set(key, trimmed);
+    setTimeout(() => {
+      if (localTurns.get(key) === trimmed) {
+        localTurns.delete(key);
+      }
+    }, TURNS_TTL_SEC * 1000);
     return trimmed;
   },
 
@@ -174,8 +204,13 @@ export const redisStore = {
     sessionCode: string,
     studentId: string,
     turns: TurnLog[],
+    conversationId?: string,
   ): Promise<void> {
-    const key = `session:turns:${sessionCode.toUpperCase()}:${studentId.toUpperCase()}`;
+    const sCode = sessionCode.toUpperCase();
+    const sId = studentId.toUpperCase();
+    const key = conversationId
+      ? `session:turns:${sCode}:${sId}:${conversationId}`
+      : `session:turns:${sCode}:${sId}`;
     if (redis && redis.status === "ready") {
       try {
         const pipeline = redis.pipeline();

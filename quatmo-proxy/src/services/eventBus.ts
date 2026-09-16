@@ -9,6 +9,7 @@ export interface IemUpdateEventPayload {
   token?: string;
   sessionCode: string;
   studentId: string;
+  conversationId?: string;
   label: string; // overallLabel
   currentLabel?: string; // single-turn label
   overallLabel?: string; // top-5 sliding window label

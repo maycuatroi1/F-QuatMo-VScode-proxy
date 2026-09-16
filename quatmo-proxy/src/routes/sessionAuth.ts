@@ -208,6 +208,7 @@ sessionAuthRouter.get("/events/stream", async (c) => {
             event: "iem_update",
             data: JSON.stringify({
               id: eventId,
+              conversationId: event.conversationId,
               label: event.label,
               confidence: event.confidence,
               iScoreS: event.iScoreS,

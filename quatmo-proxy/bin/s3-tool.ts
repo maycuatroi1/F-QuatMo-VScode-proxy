@@ -249,6 +249,26 @@ async function syncLocalToS3(sessionCodeArg?: string, studentIdArg?: string) {
   console.log(`\n✅ Sync complete! Uploaded/verified ${totalUploaded} files to S3.\n`);
 }
 
+async function deleteObject(key: string) {
+  if (!key) {
+    console.error("\n❌ Please specify an S3 object key to delete (e.g. releases/Fvscode-Patch-1.95.3.zip)\n");
+    process.exit(1);
+  }
+  const { client, bucket } = await getDirectClient();
+  try {
+    console.log(`\n🗑️ Deleting s3://${bucket}/${key}...`);
+    await client.send(
+      new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      })
+    );
+    console.log(`✅ Deleted s3://${bucket}/${key} successfully.\n`);
+  } catch (err: any) {
+    console.error(`\n❌ Failed to delete object ${key}: ${err?.message || err}\n`);
+  }
+}
+
 async function main() {
   if (command === "test" || command === "check") {
     await testConnection();
@@ -258,6 +278,8 @@ async function main() {
     await listObjects(args[1] || "");
   } else if (command === "sync") {
     await syncLocalToS3(args[1], args[2]);
+  } else if (command === "delete" || command === "rm") {
+    await deleteObject(args[1]);
   } else {
     console.log(`
 QuatMo S3 CLI Diagnostic Tool
@@ -265,6 +287,7 @@ Usage:
   bun bin/s3-tool.ts test                          # Test S3 connection & credentials
   bun bin/s3-tool.ts list [prefix]                 # List objects (e.g. list sessions/)
   bun bin/s3-tool.ts view <key>                    # View contents of an S3 file
+  bun bin/s3-tool.ts delete <key>                  # Delete an S3 object
   bun bin/s3-tool.ts sync [sessionCode] [studentId]# Sync local logs to S3
 `);
   }

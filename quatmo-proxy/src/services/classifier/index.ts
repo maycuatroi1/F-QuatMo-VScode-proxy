@@ -53,6 +53,7 @@ export async function getStudentTopNClassification(
   sessionCode: string,
   studentId: string,
   token?: string,
+  conversationId?: string,
 ): Promise<TopNClassificationResult> {
   const sCode = (sessionCode || "DEFAULT").toUpperCase();
   const sId = (studentId || "DEFAULT_USER").toUpperCase();
@@ -60,7 +61,7 @@ export async function getStudentTopNClassification(
 
   // 1. Derive directly from the top-N window turns in Redis / in-memory store
   try {
-    const turns = await redisStore.getTurns(sCode, sId);
+    const turns = await redisStore.getTurns(sCode, sId, conversationId);
     if (turns && turns.length > 0) {
       const windowTurns = turns.slice(-IEM_WINDOW_SIZE);
       const I_score_S = calculateSessionSignalScore(
@@ -83,6 +84,16 @@ export async function getStudentTopNClassification(
         windowSize: windowTurns.length,
         iScoreS: I_score_S,
         eScoreS: E_score_S,
+      };
+    } else if (conversationId) {
+      // If a specific conversationId is provided and has no turns, it is a brand new conversation!
+      // Must start fresh and not inherit previous conversations' scores.
+      return {
+        label: "mixed",
+        overallLabel: "mixed",
+        confidence: 0.5,
+        source: "new_conversation",
+        windowSize: 0,
       };
     }
   } catch (err) {
@@ -205,6 +216,7 @@ export async function evaluateTurnAndSession(
   response: string,
   history: Array<{ role: string; content: string }>,
   isFastTrack = false,
+  conversationId?: string,
 ): Promise<EvaluationResult | null> {
   const sCode = sessionCode.toUpperCase();
   const sId = studentId.toUpperCase();
@@ -212,7 +224,7 @@ export async function evaluateTurnAndSession(
 
   try {
     const clientContext = await redisStore.getClientContext(sCode, sId);
-    const turns = await redisStore.getTurns(sCode, sId);
+    const turns = await redisStore.getTurns(sCode, sId, conversationId);
     const priorTurns = turns.slice(-(IEM_WINDOW_SIZE - 1));
     const lastTurn =
       priorTurns.length > 0 ? priorTurns[priorTurns.length - 1] : null;
@@ -337,6 +349,7 @@ export async function evaluateTurnAndSession(
       sId,
       currentTurn,
       IEM_WINDOW_SIZE,
+      conversationId,
     );
 
     const I_score_S = calculateSessionSignalScore(
@@ -355,7 +368,7 @@ export async function evaluateTurnAndSession(
     const confidence = calculateIemConfidence(label, I_score_S, E_score_S);
 
     console.log(
-      `[Evaluator] IEM Result for ${sId} in ${sCode} (Window: ${windowTurns.length}) -> ` +
+      `[Evaluator] IEM Result for ${sId} in ${sCode}${conversationId ? ` [Conv: ${conversationId}]` : ""} (Window: ${windowTurns.length}) -> ` +
         `currentLabel: ${currentLabel.toUpperCase()} [I(Turn): ${I_score_Ti.toFixed(2)} | E(Turn): ${E_score_Ti.toFixed(2)}] | ` +
         `overallLabel (top5): ${overallLabel.toUpperCase()} [I(Top5): ${I_score_S.toFixed(2)} | E(Top5): ${E_score_S.toFixed(2)} | Delta: ${delta.toFixed(2)}]`,
     );
@@ -376,6 +389,7 @@ export async function evaluateTurnAndSession(
         token,
         sessionCode: sCode,
         studentId: sId,
+        conversationId,
         label: overallLabel,
         overallLabel,
         currentLabel,
@@ -475,6 +489,7 @@ export function queueEvaluation(
   prompt: string,
   response: string,
   history: Array<{ role: string; content: string }>,
+  conversationId?: string,
 ): Promise<EvaluationResult | null> {
   return classifierConcurrencyController.enqueue((isFastTrack) =>
     evaluateTurnAndSession(
@@ -485,6 +500,7 @@ export function queueEvaluation(
       response,
       history,
       isFastTrack,
+      conversationId,
     ),
   );
 }

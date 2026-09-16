@@ -20,6 +20,7 @@ import dotenv from "dotenv";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { redisStore } from "../services/classifier/redisStore";
 import { s3Storage } from "../services/s3Storage";
 import {
@@ -937,17 +938,39 @@ chatRouter.post(
 
     const isUserPrompt = isRealUserMessage(lastMsg);
 
-    // Retrieve active IEM label from student's top-N sliding window classification history
+    const rawConversationId: string | undefined =
+      typeof body.conversationId === "string" && body.conversationId.trim()
+        ? body.conversationId.trim()
+        : c.req.header("x-conversation-id")?.trim() || undefined;
+
+    let activeConversationId = rawConversationId;
+    if (!activeConversationId && Array.isArray(body.messages)) {
+      const firstUserMsg = body.messages.find((m: any) => m && m.role === "user");
+      if (
+        firstUserMsg &&
+        typeof firstUserMsg.content === "string" &&
+        firstUserMsg.content.trim()
+      ) {
+        activeConversationId = crypto
+          .createHash("sha256")
+          .update(firstUserMsg.content.trim())
+          .digest("hex")
+          .slice(0, 12);
+      }
+    }
+
+    // Retrieve active IEM label from student's top-N sliding window classification history scoped to active conversation
     const topNDecision = await getStudentTopNClassification(
       finalSessionCode,
       finalStudentId,
       token,
+      activeConversationId,
     );
     const currentIemLabel: IemLabel = topNDecision.label;
     const currentIemConfidence: number = topNDecision.confidence;
 
     console.log(
-      `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode}) | overallLabel (top5): ${currentIemLabel.toUpperCase()} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
+      `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode})${activeConversationId ? ` [Conv: ${activeConversationId}]` : ""} | overallLabel (top5): ${currentIemLabel.toUpperCase()} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
     );
 
     if (isUserPrompt && messages && Array.isArray(messages)) {
@@ -1410,6 +1433,7 @@ chatRouter.post(
           userPrompt,
           completionText,
           body.messages,
+          activeConversationId,
         ).catch((e) => console.error("[Queue Evaluation] Error:", e));
       }
 
@@ -1495,6 +1519,7 @@ chatRouter.post(
             userPrompt,
             completionText,
             body.messages,
+            activeConversationId,
           ).catch((e) => console.error("[Queue Evaluation] Error:", e));
         }
 
