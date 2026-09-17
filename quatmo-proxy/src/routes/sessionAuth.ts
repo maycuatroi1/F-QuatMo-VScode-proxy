@@ -323,6 +323,7 @@ sessionAuthRouter.get("/status", async (c) => {
       session.aiValidityMinutes === -1
         ? -1
         : Math.ceil(aiRemainingSeconds / 60),
+    runtimeConfig: session.runtimeConfig,
   });
 });
 
@@ -613,6 +614,7 @@ sessionAuthRouter.post("/login", async (c) => {
     token,
     studentId,
     sessionCode,
+    runtimeConfig: session.runtimeConfig,
   });
 });
 
@@ -630,18 +632,62 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     return c.json({ error: "Token expired or invalid" }, 401);
   }
 
-  const body = await c.req.json().catch(() => ({}));
-  const sessionCode = (body.sessionCode || tokenPayload.sessionCode || "")
-    .trim()
-    .toUpperCase();
-  const studentId = (body.studentId || tokenPayload.studentId || "")
-    .trim()
-    .toUpperCase();
-  const files: Array<{
+  let sessionCode = "";
+  let studentId = "";
+  interface ParsedUploadFile {
     relativePath: string;
-    content: string;
-    encoding?: string;
-  }> = body.files || [];
+    buffer: Buffer;
+  }
+  const uploadFiles: ParsedUploadFile[] = [];
+
+  const contentType = c.req.header("content-type") || "";
+
+  if (contentType.includes("multipart/form-data")) {
+    const formData = await c.req.formData().catch(() => null);
+    if (!formData) {
+      return c.json({ error: "Failed to parse multipart form data" }, 400);
+    }
+    sessionCode = String(formData.get("sessionCode") || tokenPayload.sessionCode || "").trim().toUpperCase();
+    studentId = String(formData.get("studentId") || tokenPayload.studentId || "").trim().toUpperCase();
+
+    // Parse path mapping if provided as JSON array
+    let explicitPaths: string[] = [];
+    const pathsRaw = formData.get("filePaths");
+    if (typeof pathsRaw === "string") {
+      try { explicitPaths = JSON.parse(pathsRaw); } catch { /* ignore */ }
+    }
+
+    const fileEntries = formData.getAll("files");
+    for (let i = 0; i < fileEntries.length; i++) {
+      const entry = fileEntries[i];
+      if (entry && typeof (entry as any).arrayBuffer === "function") {
+        const fileObj = entry as File;
+        const relPath = explicitPaths[i] || fileObj.name;
+        if (relPath) {
+          const ab = await fileObj.arrayBuffer();
+          uploadFiles.push({
+            relativePath: relPath,
+            buffer: Buffer.from(ab),
+          });
+        }
+      }
+    }
+  } else {
+    // Fallback: Legacy JSON payload
+    const body = await c.req.json().catch(() => ({}));
+    sessionCode = String(body.sessionCode || tokenPayload.sessionCode || "").trim().toUpperCase();
+    studentId = String(body.studentId || tokenPayload.studentId || "").trim().toUpperCase();
+
+    const rawFiles: Array<{ relativePath: string; content: string; encoding?: string }> = body.files || [];
+    for (const f of rawFiles) {
+      if (f && f.relativePath && f.content !== undefined) {
+        uploadFiles.push({
+          relativePath: f.relativePath,
+          buffer: f.encoding === "base64" ? Buffer.from(f.content, "base64") : Buffer.from(f.content, "utf-8"),
+        });
+      }
+    }
+  }
 
   if (!sessionCode || !studentId) {
     return c.json({ error: "Missing required sessionCode or studentId" }, 400);
@@ -663,31 +709,20 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   }
   await fs.promises.mkdir(targetDir, { recursive: true });
 
-  const validFiles = files.filter(
-    (f) => f && f.relativePath && f.content !== undefined,
-  );
-
   // 1. Asynchronous concurrent local disk writes
   await Promise.all(
-    validFiles.map(async (file) => {
+    uploadFiles.map(async (file) => {
       const safeRelPath = path
         .normalize(file.relativePath)
         .replace(/^(\.\.[\/\\])+/, "");
       const destPath = path.join(targetDir, safeRelPath);
       const destDir = path.dirname(destPath);
       await fs.promises.mkdir(destDir, { recursive: true });
-      if (file.encoding === "base64") {
-        await fs.promises.writeFile(
-          destPath,
-          Buffer.from(file.content, "base64"),
-        );
-      } else {
-        await fs.promises.writeFile(destPath, file.content, "utf-8");
-      }
+      await fs.promises.writeFile(destPath, file.buffer);
     }),
   );
 
-  const savedCount = validFiles.length;
+  const savedCount = uploadFiles.length;
   const metaPath = path.join(targetDir, "upload_info.json");
   const metaData = {
     studentId,
@@ -714,19 +749,15 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
       await s3Storage.purgeStudentExamRecords(sessionCode, studentId);
 
       // Upload all files concurrently
-      const s3UploadPromises = validFiles.map((file) => {
+      const s3UploadPromises = uploadFiles.map((file) => {
         const safeRelPath = path
           .normalize(file.relativePath)
           .replace(/^(\.\.[\/\\])+/, "");
-        const contentPayload =
-          file.encoding === "base64"
-            ? Buffer.from(file.content, "base64")
-            : file.content;
         return s3Storage.uploadStudentFile(
           sessionCode,
           studentId,
           safeRelPath,
-          contentPayload,
+          file.buffer,
         );
       });
 

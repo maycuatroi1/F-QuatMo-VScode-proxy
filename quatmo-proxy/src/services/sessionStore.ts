@@ -29,6 +29,14 @@ export interface ExamQuestion {
   questionPrompt: string;
 }
 
+export interface SessionRuntimeConfig {
+  enabled: boolean;
+  runtimeType: "python" | "nodejs" | "java" | "cpp" | "dotnet" | "custom";
+  runtimeVersion: string;
+  packages?: string[];
+  lanMirrorUrl?: string;
+}
+
 export interface Session {
   sessionCode: string;
   startTime: number;
@@ -41,6 +49,7 @@ export interface Session {
   sessionType?: "basic" | "exam";
   sessionPrompt?: string;
   examQuestions?: ExamQuestion[];
+  runtimeConfig?: SessionRuntimeConfig;
   createdAt: number;
   createdBy?: string;
   updatedAt?: number;
@@ -169,6 +178,7 @@ try { db.run("ALTER TABLE sessions ADD COLUMN exam_questions TEXT DEFAULT '[]'")
 try { db.run("ALTER TABLE sessions ADD COLUMN created_by TEXT DEFAULT 'admin'"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN runtime_config TEXT DEFAULT ''"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS session_states (
@@ -264,8 +274,8 @@ const stmtDeleteStudent = db.prepare(`
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, session_type, session_prompt, exam_questions, created_at, created_by, updated_at, updated_by)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $session_type, $session_prompt, $exam_questions, $created, $created_by, $updated_at, $updated_by)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, session_type, session_prompt, exam_questions, runtime_config, created_at, created_by, updated_at, updated_by)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $session_type, $session_prompt, $exam_questions, $runtime_config, $created, $created_by, $updated_at, $updated_by)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -366,6 +376,7 @@ export class PersistedSessions extends Map<string, Session> {
       $session_type: value.sessionType || "basic",
       $session_prompt: value.sessionPrompt || "",
       $exam_questions: JSON.stringify(value.examQuestions || []),
+      $runtime_config: value.runtimeConfig ? JSON.stringify(value.runtimeConfig) : "",
       $created: value.createdAt || now,
       $created_by: value.createdBy || "admin",
       $updated_at: value.updatedAt || now,
@@ -637,6 +648,12 @@ try {
     } catch {
       parsedQuestions = [];
     }
+    let parsedRuntimeConfig: SessionRuntimeConfig | undefined;
+    try {
+      if (r.runtime_config) parsedRuntimeConfig = JSON.parse(r.runtime_config);
+    } catch {
+      parsedRuntimeConfig = undefined;
+    }
     Map.prototype.set.call(sessions, r.session_code, {
       sessionCode: r.session_code,
       startTime: r.start_time,
@@ -649,6 +666,7 @@ try {
       sessionType: r.session_type || "basic",
       sessionPrompt: r.session_prompt || "",
       examQuestions: parsedQuestions,
+      runtimeConfig: parsedRuntimeConfig,
       createdAt: r.created_at || Date.now(),
       createdBy: r.created_by || "admin",
       updatedAt: r.updated_at || r.created_at || Date.now(),

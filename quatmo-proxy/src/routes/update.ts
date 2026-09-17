@@ -35,6 +35,8 @@ export interface ReleaseManifest {
   s3Key?: string;
   /** Fully-qualified public or proxy-routed artifact download URL. */
   downloadUrl: string;
+  /** Optional high-speed CDN or LAN mirror download URL to offload bandwidth from proxy. */
+  cdnUrl?: string;
   /** Cryptographic SHA-256 hexadecimal checksum. */
   sha256hash?: string;
   /** Binary file size in bytes. */
@@ -211,7 +213,15 @@ updateRouter.get("/api/update/:platform/:quality/:commit", async (c) => {
     c.req.header("x-forwarded-proto") ||
     (host.startsWith("localhost") ? "http" : "https");
   const filename = release.filename || "Fvscode-UserSetup-x64.exe";
-  const downloadUrl = `${proto}://${host}/v1/releases/${filename}`;
+  const rawUrl = release.cdnUrl || release.downloadUrl;
+  const isLocalOrRelative =
+    !rawUrl ||
+    rawUrl.startsWith("/") ||
+    rawUrl.includes("localhost:") ||
+    rawUrl.includes("127.0.0.1:");
+  const downloadUrl = isLocalOrRelative
+    ? `${proto}://${host}/v1/releases/${filename}`
+    : rawUrl;
 
   return c.json({
     url: downloadUrl,
@@ -261,10 +271,7 @@ updateRouter.get("/releases/:filename", async (c) => {
     }
   }
 
-  return c.json(
-    { error: `Release binary ${safeFilename} not found locally or on S3.` },
-    404,
-  );
+  return c.json({ error: `Artifact ${safeFilename} not found` }, 404);
 });
 
 /**
@@ -277,9 +284,18 @@ updateRouter.get("/release/current", async (c) => {
     c.req.header("x-forwarded-proto") ||
     (host.startsWith("localhost") ? "http" : "https");
 
-  let downloadUrl = release.downloadUrl;
-  if (downloadUrl && downloadUrl.includes("/releases/")) {
-    const filename = path.basename(downloadUrl);
+  // If a high-speed CDN URL is specified, prioritize it directly.
+  // If downloadUrl points to an external CDN/S3 URL, keep it untouched.
+  // Only resolve against current proxy host if it is relative or points to a localhost dev instance.
+  let downloadUrl = release.cdnUrl || release.downloadUrl;
+  const isLocalOrRelative =
+    !downloadUrl ||
+    downloadUrl.startsWith("/") ||
+    downloadUrl.includes("localhost:") ||
+    downloadUrl.includes("127.0.0.1:");
+
+  if (isLocalOrRelative) {
+    const filename = path.basename(downloadUrl || release.filename || "Fvscode-UserSetup-x64.exe");
     downloadUrl = `${proto}://${host}/v1/releases/${filename}`;
   }
 

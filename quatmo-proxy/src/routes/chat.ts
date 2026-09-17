@@ -1061,6 +1061,17 @@ chatRouter.post(
             sessionContextBlock += `\n`;
           });
         }
+        if (activeSession.runtimeConfig && activeSession.runtimeConfig.enabled) {
+          const rc = activeSession.runtimeConfig;
+          const pkgs =
+            Array.isArray(rc.packages) && rc.packages.length > 0
+              ? rc.packages.join(", ")
+              : "Standard core library only";
+          sessionContextBlock += `\n\nENVIRONMENT & RUNTIME CONSTRAINTS:\n`;
+          sessionContextBlock += `- Primary Language & Runtime: ${rc.runtimeType} ${rc.runtimeVersion || ""}\n`;
+          sessionContextBlock += `- Permitted / Pre-installed Packages: ${pkgs}\n`;
+          sessionContextBlock += `- Strict Directive: Ensure all code examples, solutions, and syntax recommendations are 100% compatible with ${rc.runtimeType} ${rc.runtimeVersion || ""}. Do not introduce unlisted external libraries.\n`;
+        }
       }
 
       const tutorPrompt = await getSystemPromptForIem(currentIemLabel);

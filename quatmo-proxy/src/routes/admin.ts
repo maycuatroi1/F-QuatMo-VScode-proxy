@@ -49,6 +49,7 @@ import {
   type LecturerAccount,
   type Group,
   type StudentAccount,
+  type SessionRuntimeConfig,
 } from "../services/sessionStore";
 
 type AdminVariables = {
@@ -311,6 +312,7 @@ adminRouter.get("/lecturers/:username/details", async (c) => {
       sessionType: s.sessionType || "basic",
       sessionPrompt: s.sessionPrompt || "",
       examQuestions: s.examQuestions || [],
+      runtimeConfig: s.runtimeConfig,
       createdAt: s.createdAt,
     }));
 
@@ -683,6 +685,7 @@ adminRouter.post("/sessions", async (c) => {
     sessionType,
     sessionPrompt,
     examQuestions,
+    runtimeConfig,
   } = body as {
     durationMinutes?: number;
     aiOption?: "chatbot" | "agent" | "none";
@@ -692,6 +695,7 @@ adminRouter.post("/sessions", async (c) => {
     sessionType?: "basic" | "exam";
     sessionPrompt?: string;
     examQuestions?: any[];
+    runtimeConfig?: SessionRuntimeConfig;
   };
 
   if (
@@ -779,6 +783,7 @@ adminRouter.post("/sessions", async (c) => {
     sessionType: sessionType || "basic",
     sessionPrompt: sessionPrompt || "",
     examQuestions: Array.isArray(examQuestions) ? examQuestions : [],
+    runtimeConfig: runtimeConfig && typeof runtimeConfig === "object" ? runtimeConfig : undefined,
     createdAt: now,
     createdBy: caller.username,
     updatedAt: now,
@@ -1013,6 +1018,7 @@ adminRouter.get("/sessions", async (c) => {
       sessionType: session.sessionType || "basic",
       sessionPrompt: session.sessionPrompt || "",
       examQuestions: session.examQuestions || [],
+      runtimeConfig: session.runtimeConfig,
       createdAt: session.createdAt || session.startTime * 1000,
       createdBy: session.createdBy || "admin",
       updatedAt: session.updatedAt || session.createdAt || Date.now(),
