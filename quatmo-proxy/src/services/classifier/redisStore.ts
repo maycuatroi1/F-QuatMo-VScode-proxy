@@ -116,24 +116,22 @@ export const redisStore = {
       : `session:turns:${sCode}:${sId}`;
     if (redis && redis.status === "ready") {
       try {
-        // First attempt LRANGE because pushTurnAtomic and saveTurns store turns as a Redis List
-        const items = await redis.lrange(key, 0, -1);
-        if (items && items.length > 0) {
+        const keyType = await redis.type(key);
+        if (keyType === "list") {
+          const items = await redis.lrange(key, 0, -1);
           return items.map((item) => JSON.parse(item));
+        } else if (keyType === "string") {
+          const val = await redis.get(key);
+          if (val) {
+            try {
+              const parsed = JSON.parse(val);
+              return Array.isArray(parsed) ? parsed : [];
+            } catch {
+              return [];
+            }
+          }
         }
-        // Fallback for legacy keys stored as a single JSON string
-        const val = await redis.get(key);
-        if (val) {
-          return JSON.parse(val);
-        }
-      } catch (err: any) {
-        // If LRANGE throws WRONGTYPE because key is a legacy string, read via GET
-        if (err?.message?.includes("WRONGTYPE")) {
-          try {
-            const val = await redis.get(key);
-            if (val) return JSON.parse(val);
-          } catch {}
-        }
+      } catch (err) {
         console.error("[Classifier Redis] Failed to get turns:", err);
       }
     } else {
@@ -146,6 +144,7 @@ export const redisStore = {
    * Atomically appends a turn to the student's sliding window and trims to maxWindow using an atomic Redis Lua script.
    * Eliminates Read-Modify-Write race conditions under high CCU.
    * If conversationId is provided, the sliding window is scoped strictly to that conversation.
+   * Includes automatic migration: deletes legacy conflicting string keys before pushing into a list.
    */
   async pushTurnAtomic(
     sessionCode: string,
@@ -163,6 +162,11 @@ export const redisStore = {
     if (redis && redis.status === "ready") {
       try {
         const luaScript = `
+          local t = redis.call('TYPE', KEYS[1])
+          local typeStr = type(t) == 'table' and t.ok or t
+          if typeStr == 'string' then
+            redis.call('DEL', KEYS[1])
+          end
           redis.call('RPUSH', KEYS[1], ARGV[1])
           redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
           redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
@@ -328,7 +332,10 @@ export const redisStore = {
           await redis.del(key);
         }
       } catch (err) {
-        console.error("[Classifier Redis] Failed to set evaluation pending:", err);
+        console.error(
+          "[Classifier Redis] Failed to set evaluation pending:",
+          err,
+        );
       }
     } else {
       if (pending) {
@@ -350,7 +357,10 @@ export const redisStore = {
         const val = await redis.get(key);
         return val === "true";
       } catch (err) {
-        console.error("[Classifier Redis] Failed to check evaluation pending:", err);
+        console.error(
+          "[Classifier Redis] Failed to check evaluation pending:",
+          err,
+        );
         return false;
       }
     } else {

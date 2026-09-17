@@ -24,6 +24,7 @@ import {
   getAdminPassword,
 } from "../services/adminCredentials";
 import { redis } from "../services/redis";
+import { redisStore } from "../services/classifier/redisStore";
 import { sign, verify } from "hono/jwt";
 import { getJwtSecret } from "../services/jwtKey";
 import AdmZip from "adm-zip";
@@ -1577,18 +1578,69 @@ adminRouter.get(
       `${studentId}.json`,
     );
 
+    let turns: any[] = [];
     if (fs.existsSync(jsonPath)) {
       try {
         const raw = await fs.promises.readFile(jsonPath, "utf-8");
-        const turns = JSON.parse(raw);
-        return c.json({
-          sessionCode,
-          studentId,
-          turns: Array.isArray(turns) ? turns : [],
-        });
+        const parsed = JSON.parse(raw);
+        turns = Array.isArray(parsed) ? parsed : [];
       } catch (err: any) {
         return c.json({ error: `Failed to parse log: ${err.message}` }, 500);
       }
+    } else {
+      const altJsonPath = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        sessionCode,
+        `${studentId.toUpperCase()}.json`,
+      );
+      if (fs.existsSync(altJsonPath)) {
+        try {
+          const raw = await fs.promises.readFile(altJsonPath, "utf-8");
+          const parsed = JSON.parse(raw);
+          turns = Array.isArray(parsed) ? parsed : [];
+        } catch {}
+      }
+    }
+
+    if (turns.length > 0) {
+      try {
+        const redisTurns = await redisStore.getTurns(sessionCode, studentId);
+        if (redisTurns && redisTurns.length > 0) {
+          for (const t of turns) {
+            const match = redisTurns.find((rt: any) => rt.prompt === t.prompt);
+            if (match) {
+              if (!t.classification) t.classification = {};
+              if (
+                (!t.classification.features ||
+                  Object.keys(t.classification.features).length === 0) &&
+                match.featureVector
+              ) {
+                t.classification.features = match.featureVector;
+              }
+              if (
+                typeof match.I_score === "number" &&
+                typeof t.classification.iScoreTurn !== "number"
+              ) {
+                t.classification.iScoreTurn = match.I_score;
+              }
+              if (
+                typeof match.E_score === "number" &&
+                typeof t.classification.eScoreTurn !== "number"
+              ) {
+                t.classification.eScoreTurn = match.E_score;
+              }
+            }
+          }
+        }
+      } catch {}
+
+      return c.json({
+        sessionCode,
+        studentId,
+        turns,
+      });
     }
 
     // Check .log file

@@ -409,25 +409,43 @@ export async function evaluateTurnAndSession(
       });
 
     try {
-      const logDir = path.resolve(process.cwd(), "logs", "sessions", sCode);
-      let logFilePath = path.resolve(logDir, `${sId}.json`);
+      const safeSessionCode = (sCode || "DEFAULT").toUpperCase();
+      const safeStudentId = (sId || "DEFAULT_USER").toUpperCase();
+      const logDir = path.resolve(process.cwd(), "logs", "sessions", safeSessionCode);
+      let logFilePath = path.resolve(logDir, `${safeStudentId}.json`);
+      if (!fs.existsSync(logFilePath)) {
+        logFilePath = path.resolve(logDir, `${sId}.json`);
+      }
       if (!fs.existsSync(logFilePath)) {
         const guestPath = path.resolve(
           process.cwd(),
           "logs",
           "guests",
-          `${sId}.json`,
+          `${safeStudentId}.json`,
         );
         if (fs.existsSync(guestPath)) {
           logFilePath = guestPath;
+        } else {
+          const altGuest = path.resolve(
+            process.cwd(),
+            "logs",
+            "guests",
+            `${sId}.json`,
+          );
+          if (fs.existsSync(altGuest)) {
+            logFilePath = altGuest;
+          }
         }
       }
       if (fs.existsSync(logFilePath)) {
         const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
         const logs = JSON.parse(fileContent);
         if (logs.length > 0) {
-          const lastEntry = logs[logs.length - 1];
-          lastEntry.classification = {
+          const targetEntry =
+            logs.slice().reverse().find((e: any) => e.prompt === prompt) ||
+            logs[logs.length - 1];
+          targetEntry.classification = {
+            ...(targetEntry.classification || {}),
             label: overallLabel,
             overallLabel,
             currentLabel,
@@ -438,16 +456,17 @@ export async function evaluateTurnAndSession(
             iScoreTurn: I_score_Ti,
             eScoreTurn: E_score_Ti,
             windowSize: windowTurns.length,
-            method: "sliding_window_hierarchical_signal_score_v3",
             summary: `currentLabel: ${currentLabel} | overallLabel: ${overallLabel} | I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)}`,
+            features: combinedFeatures,
           };
+          targetEntry.featureVector = combinedFeatures;
           await fs.promises.writeFile(
             logFilePath,
             JSON.stringify(logs, null, 2),
             "utf-8",
           );
           console.log(
-            `[Evaluator] Updated local JSON log file for ${sId} with currentLabel: ${currentLabel} | overallLabel (top5): ${overallLabel}`,
+            `[Evaluator] Updated local JSON log file for ${safeStudentId} with currentLabel: ${currentLabel} | overallLabel (top5): ${overallLabel}`,
           );
         }
       }

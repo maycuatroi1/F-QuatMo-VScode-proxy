@@ -565,6 +565,7 @@ async function logStudentInteraction(
         (!lastEntry.classification || lastEntry.classification.label === "none")
       ) {
         lastEntry.classification = {
+          ...(lastEntry.classification || {}),
           label: finalLabel,
           currentLabel: finalLabel,
           confidence: finalConfidence,

@@ -5,13 +5,7 @@ import type { TurnLog } from "./redisStore";
 let cachedEvalPrompt = "";
 let lastPromptLoadedTime = 0;
 
-const ACTIVATION_VALUES: Record<string, number> = {
-  none: 0.0,
-  weak: 0.25,
-  partial: 0.5,
-  clear: 0.75,
-  strong: 1.0,
-};
+
 
 async function getEvaluationSystemPrompt(): Promise<string> {
   const now = Date.now();
@@ -225,14 +219,26 @@ export async function evaluateTurnSemanticFeatures(
       const content = responseJson.choices?.[0]?.message?.content || "";
       console.log("[Classifier LLM] Assistant Message Content:", content);
 
-      const startIdx = content.indexOf("{");
-      const endIdx = content.lastIndexOf("}");
-      if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-        parsed = JSON.parse(content.substring(startIdx, endIdx + 1));
+      const arrayStart = content.indexOf("[");
+      const arrayEnd = content.lastIndexOf("]");
+      const objStart = content.indexOf("{");
+      const objEnd = content.lastIndexOf("}");
+
+      if (
+        arrayStart !== -1 &&
+        arrayEnd !== -1 &&
+        (objStart === -1 || arrayStart < objStart)
+      ) {
+        parsed = JSON.parse(content.substring(arrayStart, arrayEnd + 1));
+      } else if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+        parsed = JSON.parse(content.substring(objStart, objEnd + 1));
       } else {
         parsed = JSON.parse(content.replace(/```json|```/g, "").trim());
       }
-      console.log("[Classifier LLM] Parsed JSON Object:", JSON.stringify(parsed, null, 2));
+      console.log(
+        "[Classifier LLM] Parsed JSON Object:",
+        JSON.stringify(parsed, null, 2),
+      );
     } catch (e) {
       console.error(
         "[Classifier LLM] Failed to parse JSON response:",
@@ -243,15 +249,69 @@ export async function evaluateTurnSemanticFeatures(
 
     if (parsed) {
       const result: Record<string, number> = { ...defaultFeatures };
-      for (const [key, value] of Object.entries(parsed)) {
-        if (typeof value === "string") {
-          const valNormalized = value.toLowerCase().trim();
-          if (ACTIVATION_VALUES[valNormalized] !== undefined) {
-            result[key] = ACTIVATION_VALUES[valNormalized];
+      const activeKeys: string[] = [];
+
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (typeof item === "string") {
+            const k = item.toLowerCase().trim();
+            if (k in defaultFeatures) {
+              result[k] = 1.0;
+              activeKeys.push(k);
+            }
+          }
+        }
+      } else if (typeof parsed === "object" && parsed !== null) {
+        const list = Array.isArray(parsed.active_features)
+          ? parsed.active_features
+          : Array.isArray(parsed.features)
+            ? parsed.features
+            : null;
+
+        if (list) {
+          for (const item of list) {
+            if (typeof item === "string") {
+              const k = item.toLowerCase().trim();
+              if (k in defaultFeatures) {
+                result[k] = 1.0;
+                activeKeys.push(k);
+              }
+            }
+          }
+        } else {
+          for (const [key, value] of Object.entries(parsed)) {
+            const k = key.toLowerCase().trim();
+            if (k in defaultFeatures) {
+              if (typeof value === "number") {
+                if (value > 0) {
+                  result[k] = 1.0;
+                  activeKeys.push(k);
+                }
+              } else if (typeof value === "boolean") {
+                if (value) {
+                  result[k] = 1.0;
+                  activeKeys.push(k);
+                }
+              } else if (typeof value === "string") {
+                const s = value.toLowerCase().trim();
+                if (s !== "none" && s !== "false" && s !== "0" && s !== "") {
+                  result[k] = 1.0;
+                  activeKeys.push(k);
+                }
+              }
+            }
           }
         }
       }
-      console.log("[Classifier LLM] Mapped Features:", JSON.stringify(result, null, 2));
+
+      console.log(
+        `[Classifier LLM] Active Features (${activeKeys.length}):`,
+        JSON.stringify(activeKeys),
+      );
+      console.log(
+        "[Classifier LLM] Mapped Features (Pure Criteria Weights):",
+        JSON.stringify(result, null, 2),
+      );
       return result;
     }
   } catch (err: any) {

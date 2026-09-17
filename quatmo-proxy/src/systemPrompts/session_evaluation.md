@@ -11,13 +11,9 @@ Important scope rules:
 - Do not assume anything outside this window.
 - Evaluate feature activation for the current turn, but use the recent 5-turn window to judge trajectory, evolution, and code-behavior evidence.
 
-## Activation Levels
-For each active feature, assign one of these levels:
-- `none` (0.0) - No evidence of this feature (do NOT include in output).
-- `weak` (0.25) - Minor or faint indicator.
-- `partial` (0.50) - Clear but incomplete indicator.
-- `clear` (0.75) - Strong, obvious, and complete indicator.
-- `strong` (1.00) - Overwhelmingly obvious and active indicator.
+## Feature Activation Criteria
+Determine which semantic features are actively present in this turn.
+A feature is active if there is clear evidence of the student or AI demonstrating the corresponding behavior described in the rubrics below. Features without evidence are inactive (do not include them in the output).
 
 ---
 
@@ -80,18 +76,18 @@ For each active feature, assign one of these levels:
 ---
 
 ## Output Format
-Return EXACTLY a JSON block containing ONLY the active features (activation level is "weak", "partial", "clear", or "strong"). Do NOT include keys with "none".
+Return EXACTLY a JSON array listing ONLY the active feature keys observed in the turn.
 Example:
 ```json
-{
-  "i1": "clear",
-  "r2": "strong",
-  "t1": "clear"
-}
+[
+  "i1",
+  "i3",
+  "r2"
+]
 ```
-If no features are active, return an empty JSON object:
+If no features are active, return an empty JSON array:
 ```json
-{}
+[]
 ```
 
 Do not output any explanation, and do not output any markdown formatting outside of the JSON block. Only use defined keys: i1–i8, e1–e6, r1–r8, t1–t10, c1–c10.
