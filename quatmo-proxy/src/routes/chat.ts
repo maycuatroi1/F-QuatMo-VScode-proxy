@@ -6,7 +6,7 @@ import { countMessagesTokens, countTokens } from "../services/token";
 import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
 import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
-import { sessions } from "../services/sessionStore";
+import { sessions, type SessionPromptMode } from "../services/sessionStore";
 import { logSession, logGlobal, logGuest } from "../services/secureLogger";
 import {
   validateUserMessages,
@@ -752,45 +752,73 @@ async function logStudentError(
 }
 
 const cachedPrompts = new Map<string, string>();
-async function getSystemPromptForIem(label: IemLabel): Promise<string> {
-  if (process.env.NODE_ENV === "production" && cachedPrompts.has(label)) {
-    return cachedPrompts.get(label)!;
+
+async function getSystemPromptForIem(
+  label: IemLabel,
+  mode: SessionPromptMode = "scaffolded_code",
+): Promise<string> {
+  const cacheKey = `${mode}:${label}`;
+  if (process.env.NODE_ENV === "production" && cachedPrompts.has(cacheKey)) {
+    return cachedPrompts.get(cacheKey)!;
   }
+
+  const baseDir = path.join(process.cwd(), "src", "systemPrompts");
+
+  if (mode === "standard") {
+    const standardPath = path.join(baseDir, "standard", "chatbot.md");
+    try {
+      if (fs.existsSync(standardPath)) {
+        const content = await fs.promises.readFile(standardPath, "utf-8");
+        if (process.env.NODE_ENV === "production") cachedPrompts.set(cacheKey, content);
+        return content;
+      }
+    } catch (err) {
+      console.error("[StandardPrompt] Error reading standard/chatbot.md:", err);
+    }
+    return "You are a professional, helpful, and pragmatic software engineering assistant.";
+  }
+
+  const folderName = mode === "socratic_tutor" ? "socratic_tutor" : "scaffolded_code";
+  const fallbackFile = mode === "socratic_tutor" ? "socratic_tutor.md" : "python_tutor.md";
+
   let filename = "mixed.md";
   if (label === "instrumental") {
     filename = "instrumental.md";
   } else if (label === "executive") {
     filename = "executive.md";
   }
+
   try {
-    let tutorPath = path.join(
-      process.cwd(),
-      "src",
-      "systemPrompts",
-      filename,
-    );
-    if (!fs.existsSync(tutorPath) && filename === "instrumental.md") {
-      tutorPath = path.join(
-        process.cwd(),
-        "src",
-        "systemPrompts",
-        "python_tutor.md",
-      );
+    let targetPath = path.join(baseDir, folderName, filename);
+    if (!fs.existsSync(targetPath)) {
+      targetPath = path.join(baseDir, folderName, fallbackFile);
     }
-    if (fs.existsSync(tutorPath)) {
-      const prompt = await fs.promises.readFile(tutorPath, "utf-8");
+    // Backward compatibility fallback to root src/systemPrompts/
+    if (!fs.existsSync(targetPath)) {
+      targetPath = path.join(baseDir, filename);
+    }
+    if (!fs.existsSync(targetPath)) {
+      targetPath = path.join(baseDir, "python_tutor.md");
+    }
+
+    if (fs.existsSync(targetPath)) {
+      const prompt = await fs.promises.readFile(targetPath, "utf-8");
       if (process.env.NODE_ENV === "production") {
-        cachedPrompts.set(label, prompt);
+        cachedPrompts.set(cacheKey, prompt);
       }
       return prompt;
     }
   } catch (err) {
-    console.error(`[IemPrompt] Error reading tutor prompt for ${label}:`, err);
+    console.error(`[IemPrompt] Error reading prompt for ${mode}/${label}:`, err);
   }
+
   if (filename !== "mixed.md") {
-    return getSystemPromptForIem("mixed");
+    return getSystemPromptForIem("mixed", mode);
   }
-  return "You are a Python programming tutor.";
+
+  return mode === "socratic_tutor"
+    ? "You are Quạt Mo, an expert Socratic programming tutor. Never provide direct code solutions; guide the student conceptually through inquiry."
+    : "You are Quạt Mo, an intelligent, helpful, and supportive AI programming tutor at FPT University.";
 }
 
 chatRouter.post(
@@ -960,19 +988,31 @@ chatRouter.post(
       }
     }
 
-    // Retrieve active IEM label from student's top-N sliding window classification history scoped to active conversation
-    const topNDecision = await getStudentTopNClassification(
-      finalSessionCode,
-      finalStudentId,
-      token,
-      activeConversationId,
-    );
-    const currentIemLabel: IemLabel = topNDecision.label;
-    const currentIemConfidence: number = topNDecision.confidence;
+    const activeSession = sessions.get(finalSessionCode);
+    const promptMode: SessionPromptMode = activeSession?.promptMode || "scaffolded_code";
 
-    console.log(
-      `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode})${activeConversationId ? ` [Conv: ${activeConversationId}]` : ""} | overallLabel (top5): ${currentIemLabel.toUpperCase()} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
-    );
+    let currentIemLabel: IemLabel = "none" as IemLabel;
+    let currentIemConfidence = 0;
+
+    if (promptMode !== "standard") {
+      // Retrieve active IEM label from student's top-N sliding window classification history scoped to active conversation
+      const topNDecision = await getStudentTopNClassification(
+        finalSessionCode,
+        finalStudentId,
+        token,
+        activeConversationId,
+      );
+      currentIemLabel = topNDecision.label;
+      currentIemConfidence = topNDecision.confidence;
+
+      console.log(
+        `[IEM Active Label] Student: ${finalStudentId} (${finalSessionCode})${activeConversationId ? ` [Conv: ${activeConversationId}]` : ""} | overallLabel (top5): ${currentIemLabel.toUpperCase()} | Confidence: ${currentIemConfidence.toFixed(2)} | Source: ${topNDecision.source}`,
+      );
+    } else {
+      console.log(
+        `[Prompt Mode] Standard chatbot mode active for ${finalStudentId} (${finalSessionCode}). Bypassing IEM classification.`,
+      );
+    }
 
     if (isUserPrompt && messages && Array.isArray(messages)) {
       const inputSafetyStart = performance.now();
@@ -1026,15 +1066,35 @@ chatRouter.post(
     if (body.messages && Array.isArray(body.messages)) {
       const warningText =
         "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
-      const runtimePolicy =
-        "\n\nRUNTIME TUTOR POLICY (NATURAL & DEMAND-DRIVEN ASSISTANCE):\n" +
-        "- Be helpful, supportive, and direct ('Hỏi gì đáp nấy'). Avoid unnecessary friction or interrogation.\n" +
-        "- Demand-Driven: When asked conceptual or theoretical questions, explain clearly and concisely in text. When asked for code, examples, or bug fixes, provide clean, working code directly.\n" +
-        "- Modular Code Generation: When asked for a large project or full application, do NOT dump an entire massive monolithic codebase or multiple full files in one response. Provide core architecture/skeleton and the primary foundational module first, guiding the student incrementally.\n" +
-        "- Keep answers sharp, concise, and focused strictly on what the student asked.\n" +
-        "- Respond 100% in English only.";
+      
+      let runtimePolicy = "";
+      if (promptMode === "standard") {
+        runtimePolicy =
+          "\n\nRUNTIME ASSISTANT POLICY (STANDARD SOFTWARE ENGINEERING ASSISTANT):\n" +
+          "- Be direct, helpful, and technically precise.\n" +
+          "- Provide complete, clean, and functional code solutions, explanations, or debugging assistance as requested.\n" +
+          "- Keep answers sharp, concise, and focused strictly on what the user asked.\n" +
+          "- Respond 100% in English only.";
+      } else if (promptMode === "socratic_tutor") {
+        runtimePolicy =
+          "\n\nRUNTIME TUTOR POLICY (STRICT SOCRATIC TUTOR - ZERO CODE GENERATION):\n" +
+          "- CRITICAL ENFORCEMENT: You are STRICTLY FORBIDDEN from generating runnable solution code, complete functions, copy-pasteable blocks, or direct code corrections.\n" +
+          "- Guide the student exclusively through Socratic questioning, algorithmic decomposition, boundary case analysis, and conceptual frameworks.\n" +
+          "- If the student demands direct code, politely explain that you are here to guide their reasoning so they master the concept themselves, then ask an illuminating question about their logic or approach.\n" +
+          "- High-level conceptual pseudocode is permitted ONLY if essential to illustrate structure, but NEVER runnable programming language code.\n" +
+          "- Keep inquiries focused, concise, and intellectually engaging.\n" +
+          "- Respond 100% in English only.";
+      } else {
+        runtimePolicy =
+          "\n\nRUNTIME TUTOR POLICY (NATURAL & DEMAND-DRIVEN ASSISTANCE):\n" +
+          "- Be helpful, supportive, and direct ('Hỏi gì đáp nấy'). Avoid unnecessary friction or interrogation.\n" +
+          "- Demand-Driven: When asked conceptual or theoretical questions, explain clearly and concisely in text. When asked for code, examples, or bug fixes, provide clean, working code directly.\n" +
+          "- Modular Code Generation: When asked for a large project or full application, do NOT dump an entire massive monolithic codebase or multiple full files in one response. Provide core architecture/skeleton and the primary foundational module first, guiding the student incrementally.\n" +
+          "- Keep answers sharp, concise, and focused strictly on what the student asked.\n" +
+          "- Respond 100% in English only.";
+      }
+
       let sessionContextBlock = "";
-      const activeSession = sessions.get(finalSessionCode);
       if (activeSession) {
         if (activeSession.sessionPrompt && activeSession.sessionPrompt.trim()) {
           sessionContextBlock += `\n\nLECTURER SESSION INSTRUCTIONS & ASSIGNMENT REQUIREMENTS:\n${activeSession.sessionPrompt.trim()}\n`;
@@ -1074,7 +1134,7 @@ chatRouter.post(
         }
       }
 
-      const tutorPrompt = await getSystemPromptForIem(currentIemLabel);
+      const tutorPrompt = await getSystemPromptForIem(currentIemLabel, promptMode);
       const systemMessage = {
         role: "system",
         content:
@@ -1130,6 +1190,7 @@ chatRouter.post(
         : null;
 
     const shouldClassify = !!(
+      promptMode !== "standard" &&
       process.env.CLASSIFIER_API_URL &&
       isUserPrompt &&
       policyPrompt
@@ -1143,7 +1204,27 @@ chatRouter.post(
     let classifierLabel = currentIemLabel;
     let classifierConfidence = currentIemConfidence;
 
-    if (isUserPrompt && currentIemLabel) {
+    if (promptMode === "standard") {
+      latestClassifications.set(token, {
+        label: "none",
+        confidence: 0,
+      });
+      await redisStore
+        .setCachedClassification(token, "none", 0)
+        .catch(() => {});
+
+      if (authMode === "session" && sessionContext) {
+        try {
+          const { sessionStates } = await import("../services/sessionStore");
+          const stateKey = `${sessionContext.sessionCode}:${sessionContext.studentId}`;
+          const state = sessionStates.get(stateKey);
+          if (state) {
+            state.latestClassification = "none";
+            state.promptCount = (state.promptCount || 0) + 1;
+          }
+        } catch (e) {}
+      }
+    } else if (isUserPrompt && currentIemLabel) {
       latestClassifications.set(token, {
         label: currentIemLabel,
         confidence: currentIemConfidence,

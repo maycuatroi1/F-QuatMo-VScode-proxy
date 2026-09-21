@@ -13,6 +13,9 @@ import {
   studentAccounts,
   sessions,
   sessionStates,
+  studentGroups,
+  getStudentAccount,
+  getStudentGroup,
   type StudentSessionState,
   verifyPasswordSafely,
 } from "../services/sessionStore";
@@ -133,8 +136,15 @@ sessionAuthRouter.get("/events/stream", async (c) => {
     // Check if client reconnected and missed the latest event
     if (lastEventId && sessionCode && studentId) {
       try {
-        const latestCached = await redisStore.getLatestEvent(sessionCode, studentId);
-        if (latestCached && latestCached.id && latestCached.id !== lastEventId) {
+        const latestCached = await redisStore.getLatestEvent(
+          sessionCode,
+          studentId,
+        );
+        if (
+          latestCached &&
+          latestCached.id &&
+          latestCached.id !== lastEventId
+        ) {
           eventQueue.push(latestCached);
         }
       } catch {}
@@ -410,7 +420,28 @@ sessionAuthRouter.post("/login", async (c) => {
   const stateKey = `${sessionCode}:${studentId}`;
   const existingState = sessionStates.get(stateKey);
 
-  if (!session.allowedStudentIds.has(studentId) && !existingState) {
+  const isDirectlyAllowed = session.allowedStudentIds.has(studentId);
+  let isGroupAllowed = false;
+
+  if (
+    !isDirectlyAllowed &&
+    Array.isArray(session.assignedGroups) &&
+    session.assignedGroups.length > 0
+  ) {
+    for (const groupName of session.assignedGroups) {
+      const g = getStudentGroup(groupName, session.createdBy);
+      if (g && Array.isArray(g.userIds)) {
+        if (g.userIds.some((uid) => uid.trim().toUpperCase() === studentId)) {
+          isGroupAllowed = true;
+          session.allowedStudentIds.add(studentId);
+          sessions.set(sessionCode, session);
+          break;
+        }
+      }
+    }
+  }
+
+  if (!isDirectlyAllowed && !isGroupAllowed && !existingState) {
     return c.json(
       {
         error:
@@ -429,7 +460,10 @@ sessionAuthRouter.post("/login", async (c) => {
   const mapKey = `${studentId}:${sessionCreator}`;
   const creatorAccount = studentAccounts.get(mapKey);
   const adminAccount = studentAccounts.get(`${studentId}:admin`);
-  const account = creatorAccount || adminAccount;
+  const account =
+    creatorAccount ||
+    (sessionCreator === "admin" ? adminAccount : undefined) ||
+    getStudentAccount(studentId, sessionCreator);
 
   if (!account) {
     return c.json(
@@ -440,31 +474,36 @@ sessionAuthRouter.post("/login", async (c) => {
     );
   }
 
-  // Check if Bearer token is valid FOR THIS SPECIFIC INSTRUCTOR
-  let bearerMatches = false;
+  let bearerAuthenticated = false;
   if (bearerStudentId && bearerStudentId.trim().toUpperCase() === studentId) {
-    let isLecturerAuthorized = false;
-    if (bearerValidLecturers) {
-      if (creatorAccount) {
-        // Must specifically match this lecturer
-        isLecturerAuthorized = bearerValidLecturers.includes(sessionCreator);
-      } else if (adminAccount) {
-        // Fallback to admin if created by admin
-        isLecturerAuthorized = bearerValidLecturers.includes("admin");
-      }
-    }
-
-    // Check if the lecturer updated the password after the token was issued
-    const tokenIssuedAtMs = (bearerIat || 0) * 1000;
     const isPasswordStillFresh =
-      !account.updatedAt || tokenIssuedAtMs >= account.updatedAt - 2000; // 2s clock skew grace
+      !account.updatedAt ||
+      (bearerIat ? (bearerIat + 2) * 1000 >= account.updatedAt : true);
 
-    if (isLecturerAuthorized && isPasswordStillFresh) {
-      bearerMatches = true;
+    if (isPasswordStillFresh) {
+      if (bearerValidLecturers && Array.isArray(bearerValidLecturers)) {
+        const isDirectMatch = bearerValidLecturers.includes(sessionCreator);
+        const isSuperAdminSession = sessionCreator === "admin";
+        const hasAdminAuth = bearerValidLecturers.includes("admin");
+        if (
+          isDirectMatch ||
+          (isSuperAdminSession && hasAdminAuth) ||
+          hasAdminAuth
+        ) {
+          bearerAuthenticated = true;
+        }
+      } else if (bearerCreatedBy) {
+        if (
+          bearerCreatedBy.toLowerCase() === sessionCreator ||
+          bearerCreatedBy.toLowerCase() === "admin"
+        ) {
+          bearerAuthenticated = true;
+        }
+      }
     }
   }
 
-  if (!bearerMatches) {
+  if (!bearerAuthenticated) {
     if (!password) {
       return c.json(
         {
@@ -476,31 +515,23 @@ sessionAuthRouter.post("/login", async (c) => {
     }
 
     let isPasswordValid = false;
-    const creatorAcc = studentAccounts.get(mapKey);
-    if (creatorAcc) {
+    if (creatorAccount) {
       isPasswordValid = await verifyPasswordSafely(
         password,
-        creatorAcc.passwordHash,
+        creatorAccount.passwordHash,
       );
     }
-    if (!isPasswordValid) {
-      const adminAcc = studentAccounts.get(`${studentId}:admin`);
-      if (adminAcc) {
-        isPasswordValid = await verifyPasswordSafely(
-          password,
-          adminAcc.passwordHash,
-        );
-      }
+    if (!isPasswordValid && adminAccount) {
+      isPasswordValid = await verifyPasswordSafely(
+        password,
+        adminAccount.passwordHash,
+      );
     }
-    if (!isPasswordValid && !creatorAcc) {
-      for (const acc of studentAccounts.values()) {
-        if (acc.studentId.toUpperCase() === studentId) {
-          if (await verifyPasswordSafely(password, acc.passwordHash)) {
-            isPasswordValid = true;
-            break;
-          }
-        }
-      }
+    if (!isPasswordValid && account) {
+      isPasswordValid = await verifyPasswordSafely(
+        password,
+        account.passwordHash,
+      );
     }
 
     if (!isPasswordValid) {
@@ -573,6 +604,22 @@ sessionAuthRouter.post("/login", async (c) => {
 
   if (redis && redis.status === "ready") {
     try {
+      const pattern = `session:user:*:${studentId}`;
+      const oldKeys = await redis.keys(pattern);
+      const keysToDelete = oldKeys.filter(
+        (k) => !k.includes(`:${sessionCode}:${studentId}`),
+      );
+      if (keysToDelete.length > 0) {
+        await redis.del(...keysToDelete);
+      }
+    } catch (err) {
+      console.warn(
+        "[Auth] Failed to clean up stale Redis session keys on switch:",
+        err,
+      );
+    }
+
+    try {
       const redisKey = `session:user:${sessionCode}:${studentId}`;
       await redis.hset(redisKey, {
         budget: String(session.defaultTokenBudget),
@@ -601,6 +648,7 @@ sessionAuthRouter.post("/login", async (c) => {
     studentId,
     sessionCode,
     aiOption: session.aiOption,
+    promptMode: session.promptMode || "scaffolded_code",
     aiValidityMinutes: session.aiValidityMinutes,
     loginTime: state.loginTimestamp,
     sessionEndTime,
@@ -614,6 +662,8 @@ sessionAuthRouter.post("/login", async (c) => {
     token,
     studentId,
     sessionCode,
+    aiOption: session.aiOption,
+    promptMode: session.promptMode || "scaffolded_code",
     runtimeConfig: session.runtimeConfig,
   });
 });
@@ -647,14 +697,26 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     if (!formData) {
       return c.json({ error: "Failed to parse multipart form data" }, 400);
     }
-    sessionCode = String(formData.get("sessionCode") || tokenPayload.sessionCode || "").trim().toUpperCase();
-    studentId = String(formData.get("studentId") || tokenPayload.studentId || "").trim().toUpperCase();
+    sessionCode = String(
+      formData.get("sessionCode") || tokenPayload.sessionCode || "",
+    )
+      .trim()
+      .toUpperCase();
+    studentId = String(
+      formData.get("studentId") || tokenPayload.studentId || "",
+    )
+      .trim()
+      .toUpperCase();
 
     // Parse path mapping if provided as JSON array
     let explicitPaths: string[] = [];
     const pathsRaw = formData.get("filePaths");
     if (typeof pathsRaw === "string") {
-      try { explicitPaths = JSON.parse(pathsRaw); } catch { /* ignore */ }
+      try {
+        explicitPaths = JSON.parse(pathsRaw);
+      } catch {
+        /* ignore */
+      }
     }
 
     const fileEntries = formData.getAll("files");
@@ -675,15 +737,26 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   } else {
     // Fallback: Legacy JSON payload
     const body = await c.req.json().catch(() => ({}));
-    sessionCode = String(body.sessionCode || tokenPayload.sessionCode || "").trim().toUpperCase();
-    studentId = String(body.studentId || tokenPayload.studentId || "").trim().toUpperCase();
+    sessionCode = String(body.sessionCode || tokenPayload.sessionCode || "")
+      .trim()
+      .toUpperCase();
+    studentId = String(body.studentId || tokenPayload.studentId || "")
+      .trim()
+      .toUpperCase();
 
-    const rawFiles: Array<{ relativePath: string; content: string; encoding?: string }> = body.files || [];
+    const rawFiles: Array<{
+      relativePath: string;
+      content: string;
+      encoding?: string;
+    }> = body.files || [];
     for (const f of rawFiles) {
       if (f && f.relativePath && f.content !== undefined) {
         uploadFiles.push({
           relativePath: f.relativePath,
-          buffer: f.encoding === "base64" ? Buffer.from(f.content, "base64") : Buffer.from(f.content, "utf-8"),
+          buffer:
+            f.encoding === "base64"
+              ? Buffer.from(f.content, "base64")
+              : Buffer.from(f.content, "utf-8"),
         });
       }
     }

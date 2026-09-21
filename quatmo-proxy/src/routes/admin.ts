@@ -50,6 +50,7 @@ import {
   type Group,
   type StudentAccount,
   type SessionRuntimeConfig,
+  type SessionPromptMode,
 } from "../services/sessionStore";
 
 type AdminVariables = {
@@ -684,6 +685,7 @@ adminRouter.post("/sessions", async (c) => {
     assignedGroups,
     sessionType,
     sessionPrompt,
+    promptMode,
     examQuestions,
     runtimeConfig,
   } = body as {
@@ -694,6 +696,7 @@ adminRouter.post("/sessions", async (c) => {
     assignedGroups?: string[];
     sessionType?: "basic" | "exam";
     sessionPrompt?: string;
+    promptMode?: SessionPromptMode;
     examQuestions?: any[];
     runtimeConfig?: SessionRuntimeConfig;
   };
@@ -712,6 +715,10 @@ adminRouter.post("/sessions", async (c) => {
       400,
     );
   }
+
+  const validPromptModes: SessionPromptMode[] = ["standard", "scaffolded_code", "socratic_tutor"];
+  const validatedPromptMode: SessionPromptMode =
+    promptMode && validPromptModes.includes(promptMode) ? promptMode : "scaffolded_code";
 
   let sessionCode = "";
   do {
@@ -782,6 +789,7 @@ adminRouter.post("/sessions", async (c) => {
     assignedGroups: groupNames,
     sessionType: sessionType || "basic",
     sessionPrompt: sessionPrompt || "",
+    promptMode: validatedPromptMode,
     examQuestions: Array.isArray(examQuestions) ? examQuestions : [],
     runtimeConfig: runtimeConfig && typeof runtimeConfig === "object" ? runtimeConfig : undefined,
     createdAt: now,
@@ -839,7 +847,9 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     defaultTokenBudget,
     sessionType,
     sessionPrompt,
+    promptMode,
     examQuestions,
+    runtimeConfig,
   } = body as any;
 
   if (typeof durationMinutes === "number") session.durationMinutes = durationMinutes;
@@ -848,7 +858,11 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
   if (typeof defaultTokenBudget === "number") session.defaultTokenBudget = defaultTokenBudget;
   if (sessionType === "basic" || sessionType === "exam") session.sessionType = sessionType;
   if (typeof sessionPrompt === "string") session.sessionPrompt = sessionPrompt;
+  if (promptMode && ["standard", "scaffolded_code", "socratic_tutor"].includes(promptMode)) {
+    session.promptMode = promptMode as SessionPromptMode;
+  }
   if (Array.isArray(examQuestions)) session.examQuestions = examQuestions;
+  if (runtimeConfig && typeof runtimeConfig === "object") session.runtimeConfig = runtimeConfig;
 
   session.updatedAt = Date.now();
   session.updatedBy = caller.username;
@@ -1017,6 +1031,7 @@ adminRouter.get("/sessions", async (c) => {
       assignedGroups: session.assignedGroups || [],
       sessionType: session.sessionType || "basic",
       sessionPrompt: session.sessionPrompt || "",
+      promptMode: session.promptMode || "scaffolded_code",
       examQuestions: session.examQuestions || [],
       runtimeConfig: session.runtimeConfig,
       createdAt: session.createdAt || session.startTime * 1000,
