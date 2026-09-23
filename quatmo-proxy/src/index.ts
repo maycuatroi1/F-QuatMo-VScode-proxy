@@ -23,7 +23,7 @@ validateSecretsAtStartup();
  * CORS_ORIGINS: comma-separated exact origins; "*.domain" allows https subdomains.
  */
 const corsPatterns = (
-  process.env.CORS_ORIGINS || "*.iahn.hanoi.vn,vscode-webview://*"
+  process.env.CORS_ORIGINS || "*.iahn.hanoi.vn,vscode-webview://*,vscode-file://*"
 )
   .split(",")
   .map((o) => o.trim().toLowerCase())
@@ -37,6 +37,7 @@ function isAllowedOrigin(origin: string): boolean {
   for (const p of corsPatterns) {
     if (p === o) return true;
     if (p === "vscode-webview://*" && o.startsWith("vscode-webview://")) return true;
+    if (p === "vscode-file://*" && o.startsWith("vscode-file://")) return true;
     if (p.startsWith("*.")) {
       const suffix = p.slice(1); // ".iahn.hanoi.vn"
       try {
