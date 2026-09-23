@@ -35,6 +35,7 @@ export interface SessionRuntimeConfig {
   runtimeVersion: string;
   packages?: string[];
   lanMirrorUrl?: string;
+  downloadUrl?: string;
 }
 
 export type SessionPromptMode = "standard" | "scaffolded_code" | "socratic_tutor";

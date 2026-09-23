@@ -31,25 +31,42 @@ const corsPatterns = (
 
 function isAllowedOrigin(origin: string): boolean {
   const o = origin.toLowerCase();
-  if (process.env.NODE_ENV !== "production" && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o)) {
-    return true;
-  }
   for (const p of corsPatterns) {
     if (p === o) return true;
     if (p === "vscode-webview://*" && o.startsWith("vscode-webview://")) return true;
     if (p === "vscode-file://*" && o.startsWith("vscode-file://")) return true;
+    if (
+      p === o.replace(/^https?:\/\//, "") ||
+      `http://${p}` === o ||
+      `https://${p}` === o
+    ) {
+      return true;
+    }
     if (p.startsWith("*.")) {
       const suffix = p.slice(1); // ".iahn.hanoi.vn"
       try {
         const u = new URL(o);
-        if (u.protocol === "https:" && (u.hostname.endsWith(suffix) || u.hostname === suffix.slice(1))) {
+        if (
+          u.protocol === "https:" &&
+          (u.hostname.endsWith(suffix) || u.hostname === suffix.slice(1))
+        ) {
           return true;
         }
       } catch {}
     }
+    // Wildcard origin matching (e.g. http://localhost:* or *.domain.com)
+    if (p.includes("*")) {
+      const regex = new RegExp(
+        "^" + p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$",
+      );
+      if (regex.test(o) || regex.test(o.replace(/^https?:\/\//, ""))) return true;
+    }
   }
   // Surface misconfiguration (e.g. admin UI hosted on a domain not in CORS_ORIGINS).
-  logOnce(`cors:${o}`, `[CORS] Rejected origin ${o.slice(0, 200)} (add it to CORS_ORIGINS if legitimate)`);
+  logOnce(
+    `cors:${o}`,
+    `[CORS] Rejected origin ${o.slice(0, 200)} (add it to CORS_ORIGINS if legitimate)`,
+  );
   return false;
 }
 

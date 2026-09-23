@@ -1,17 +1,17 @@
 {
-  "version": "1.96.1",
+  "version": "1.96.3",
   "commit": "0c305f1b8afea035cdb283bef94edb88b7029f98",
   "updateType": "patch",
-  "productVersion": "1.96.1",
-  "releasedAt": "2026-09-23T08:38:07.092Z",
+  "productVersion": "1.96.3",
+  "releasedAt": "2026-09-23T16:47:25.555Z",
   "mandatory": false,
-  "notes": "Ban cap nhat sua loi v1.96.1",
-  "filename": "Fvscode-Patch-1.96.1.zip",
-  "s3Key": "releases/Fvscode-Patch-1.96.1.zip",
-  "downloadUrl": "https://fvscode-proxy.iahn.hanoi.vn/v1/releases/Fvscode-Patch-1.96.1.zip",
-  "sha256hash": "19b98514b590130eb94bcfeb08951d43b3f656b70d32b14390435d5e22b27aff",
-  "sizeBytes": 36283728,
-  "sizeMB": 34.6,
+  "notes": "Cap nhat dynamic runtime provisioner",
+  "filename": "Fvscode-Patch-1.96.3.zip",
+  "s3Key": "releases/Fvscode-Patch-1.96.3.zip",
+  "downloadUrl": "https://fvscode-proxy.iahn.hanoi.vn/v1/releases/Fvscode-Patch-1.96.3.zip",
+  "sha256hash": "77af61042eed31883b12f8f5cb3b3ae4b6eef53e346000515bd7ec067896ce42",
+  "sizeBytes": 36612259,
+  "sizeMB": 34.92,
   "buildHash": "b7646fb5eed6c6401786547e9a3f86d1e58c8fecababd6338a1367be70694ae3",
-  "signature": "ed25519:xDc+AyBnnvT9VAuPoubkzCvlUP5YnIR9Z8kdgYpTg4xRIRDrt/WvIugt2zA1+KpTb0vYGdSFTOZIaXtInRgqAQ=="
+  "signature": "ed25519:aqP4KR32SRUo4ZGET8bh1FzhU20mkBMK63fY7m3aSeUEa+cXjUcwnzPCmCTKJr52OnORa9ZlwhLT3sJEYIQcAw=="
 }
