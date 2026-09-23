@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
+import { getTrustedClientIP, readZipTextEntriesSafely, safeEqual } from "../services/security";
 import {
   checkLockout,
   recordFailedAttempt,
@@ -8,15 +10,7 @@ import {
 } from "../services/rateLimiter";
 
 export function getClientIP(c: any): string {
-  const forwarded = c.req.header("x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0].trim();
-  }
-  const realIp = c.req.header("x-real-ip");
-  if (realIp) {
-    return realIp.trim();
-  }
-  return "127.0.0.1";
+  return getTrustedClientIP((n) => c.req.header(n));
 }
 import { getProxyApiKey } from "../services/proxyKey";
 import {
@@ -62,24 +56,30 @@ const adminRouter = new Hono<{ Variables: AdminVariables }>();
 // ─── FLOW ────────────────────────────────────────────────────────────────────
 //  Middleware protecting Admin data endpoints via PROXY_API_KEY or Admin/Lecturer JWT Token
 // ─────────────────────────────────────────────────────────────────────────────
+const ADMIN_LOGIN_PATHS = new Set(["/admin/login", "/v1/admin/login"]);
+
+/** Returns the authenticated caller or aborts with 401 (never defaults to admin). */
+function requireCaller(c: any): { username: string; role: string; name: string } {
+  const caller = c.get("caller");
+  if (!caller || !caller.role || !caller.username) {
+    throw new HTTPException(401, { message: "Unauthorized" });
+  }
+  return caller;
+}
+
 adminRouter.use("*", async (c, next) => {
-  const path = c.req.path;
-  const url = c.req.url;
-  if (
-    c.req.method === "OPTIONS" ||
-    path.includes("/login") ||
-    url.includes("/login")
-  ) {
+  // Only the exact login routes are public. Never match on the raw URL/query string
+  // (e.g. "/admin/lecturers?x=/login" used to bypass authentication).
+  if (c.req.method === "OPTIONS" || ADMIN_LOGIN_PATHS.has(c.req.path)) {
     await next();
     return;
   }
 
   const masterKey = getProxyApiKey();
-  const xApiKey = c.req.header("x-api-key") || c.req.header("X-API-Key");
+  const xApiKey = (c.req.header("x-api-key") || "").trim();
   const authHeader = c.req.header("Authorization");
 
-  // If x-api-key is supplied, validate it against masterKey
-  if (xApiKey && xApiKey.trim() !== masterKey) {
+  if (xApiKey && !safeEqual(xApiKey, masterKey)) {
     return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
   }
 
@@ -88,7 +88,7 @@ adminRouter.use("*", async (c, next) => {
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7).trim();
 
-    if (token === masterKey) {
+    if (safeEqual(token, masterKey)) {
       caller = { username: "admin", role: "admin", name: "Super Admin" };
     } else {
       try {
@@ -97,21 +97,51 @@ adminRouter.use("*", async (c, next) => {
           getJwtSecret(),
           "HS256" as any,
         );
-        if (decoded && (decoded.role || decoded.username)) {
+        // Only tokens minted by /admin/login are accepted: explicit role + username,
+        // and never student/session tokens (which share the same signing secret).
+        if (
+          decoded &&
+          (decoded.role === "admin" || decoded.role === "lecturer") &&
+          typeof decoded.username === "string" &&
+          decoded.username &&
+          !decoded.studentId &&
+          !decoded.sessionCode
+        ) {
+          if (decoded.role === "lecturer") {
+            const lec = lecturerAccounts.get(decoded.username);
+            if (!lec || lec.status === "inactive") {
+              return c.json(
+                { error: "Lecturer account is inactive or no longer exists." },
+                401,
+              );
+            }
+          }
           caller = {
-            username: decoded.username || "admin",
-            role: decoded.role || "admin",
-            name: decoded.name || decoded.username || "Admin",
+            username: decoded.username,
+            role: decoded.role,
+            name: decoded.name || decoded.username,
           };
         }
       } catch {
-        // Invalid JWT
+        // JWT verification failed
+      }
+
+      // A Bearer token was present but invalid or expired.
+      // NEVER fall back to admin identity via x-api-key when a token was provided —
+      // this would silently promote a lecturer's expired session into admin and corrupt
+      // data isolation (createdBy field gets stamped as "admin" instead of the lecturer).
+      if (!caller) {
+        return c.json(
+          {
+            error:
+              "Unauthorized. Session expired or invalid token. Please sign in again.",
+          },
+          401,
+        );
       }
     }
-  }
-
-  // 2. Secondary fallback: If no valid JWT, validate x-api-key against masterKey
-  if (!caller && xApiKey && xApiKey.trim() === masterKey) {
+  } else if (xApiKey && safeEqual(xApiKey, masterKey)) {
+    // Pure API-key-only access (no Bearer token): for server-to-server scripts or curl.
     caller = { username: "admin", role: "admin", name: "Super Admin" };
   }
 
@@ -123,6 +153,41 @@ adminRouter.use("*", async (c, next) => {
 
   return c.json({ error: "Unauthorized. Invalid Token or Proxy API Key" }, 401);
 });
+
+// ─── Role / ownership guards ─────────────────────────────────────────────────
+const requireSuperAdmin = async (c: any, next: any) => {
+  const caller = requireCaller(c);
+  if (caller.role !== "admin") {
+    return c.json({ error: "Forbidden. Super Admin access required." }, 403);
+  }
+  await next();
+};
+
+/** Lecturers may only touch sessions they created; super admin may touch all. */
+const requireSessionOwner = async (c: any, next: any) => {
+  const caller = requireCaller(c);
+  if (caller.role === "admin") {
+    await next();
+    return;
+  }
+  const code = String(c.req.param("sessionCode") || "").toUpperCase();
+  const session = sessions.get(code);
+  const owner = (session?.createdBy || "admin").toLowerCase();
+  if (!session || owner !== caller.username.toLowerCase()) {
+    return c.json({ error: "Forbidden. You do not own this session." }, 403);
+  }
+  await next();
+};
+
+adminRouter.use("/sessions/:sessionCode", requireSessionOwner);
+adminRouter.use("/sessions/:sessionCode/*", requireSessionOwner);
+adminRouter.use("/visualize/sessions/:sessionCode/*", requireSessionOwner);
+adminRouter.use("/logs/*", requireSuperAdmin);
+adminRouter.use("/guests/*", requireSuperAdmin);
+adminRouter.use("/visualize/guests", requireSuperAdmin);
+adminRouter.use("/visualize/guests/*", requireSuperAdmin);
+adminRouter.use("/s3/*", requireSuperAdmin);
+adminRouter.use("/security/*", requireSuperAdmin);
 
 // Admin / Lecturer login endpoint validating credentials and returning signed JWT token
 adminRouter.post("/login", async (c) => {
@@ -159,7 +224,7 @@ adminRouter.post("/login", async (c) => {
   const expectedPassword = getAdminPassword();
 
   // 1. Check Super Admin credentials
-  if (inputUser === expectedUsername && password === expectedPassword) {
+  if (safeEqual(inputUser, expectedUsername) && safeEqual(password, expectedPassword)) {
     await recordSuccessfulLogin(ip, inputUser);
     const jwtSecret = getJwtSecret();
     const payload = {
@@ -237,7 +302,7 @@ adminRouter.post("/login", async (c) => {
 
 // ─── SECURITY & AUDIT LOCKOUT ENDPOINTS (Super Admin Only) ───────────────────
 adminRouter.get("/security/lockouts", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -247,7 +312,7 @@ adminRouter.get("/security/lockouts", async (c) => {
 });
 
 adminRouter.post("/security/unlock", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -268,7 +333,7 @@ adminRouter.post("/security/unlock", async (c) => {
 
 // ─── LECTURER MANAGEMENT ENDPOINTS (Super Admin Only) ─────────────────────────
 adminRouter.get("/lecturers", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -287,7 +352,7 @@ adminRouter.get("/lecturers", async (c) => {
 });
 
 adminRouter.get("/lecturers/:username/details", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -358,7 +423,7 @@ adminRouter.get("/lecturers/:username/details", async (c) => {
 });
 
 adminRouter.post("/lecturers", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -416,7 +481,7 @@ adminRouter.post("/lecturers", async (c) => {
 });
 
 adminRouter.patch("/lecturers/:username/status", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -454,7 +519,7 @@ adminRouter.patch("/lecturers/:username/status", async (c) => {
 });
 
 adminRouter.post("/lecturers/:username/reset-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -489,7 +554,7 @@ adminRouter.post("/lecturers/:username/reset-password", async (c) => {
 
 // Self-service change password for logged-in Lecturer / Admin
 adminRouter.post("/change-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { currentPassword, newPassword } = body as {
     currentPassword?: string;
@@ -547,7 +612,7 @@ adminRouter.post("/change-password", async (c) => {
 
 // ─── STUDENT ACCOUNT ENDPOINTS ────────────────────────────────────────────────
 adminRouter.post("/students/:studentId/reset-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const rawId = decodeURIComponent(c.req.param("studentId")).trim();
   if (!rawId) {
     return c.json({ error: "Student ID is required." }, 400);
@@ -584,7 +649,7 @@ adminRouter.post("/students/:studentId/reset-password", async (c) => {
 });
 
 const handleStudentImport = async (c: any) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { students } = body as {
     students?: Array<{ studentId: string; password?: string }>;
@@ -654,12 +719,13 @@ adminRouter.post("/students", handleStudentImport);
 adminRouter.post("/students/import", handleStudentImport);
 
 adminRouter.get("/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
   const list: any[] = [];
   for (const account of studentAccounts.values()) {
     const creator = (account.createdBy || "admin").toLowerCase();
-    if (creator !== callerUser) {
+    if (callerRole !== "admin" && creator !== callerUser) {
       continue;
     }
     list.push({
@@ -675,7 +741,7 @@ adminRouter.get("/students", async (c) => {
 
 // ─── SESSION ENDPOINTS ───────────────────────────────────────────────────────
 adminRouter.post("/sessions", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const {
     durationMinutes,
@@ -716,9 +782,15 @@ adminRouter.post("/sessions", async (c) => {
     );
   }
 
-  const validPromptModes: SessionPromptMode[] = ["standard", "scaffolded_code", "socratic_tutor"];
+  const validPromptModes: SessionPromptMode[] = [
+    "standard",
+    "scaffolded_code",
+    "socratic_tutor",
+  ];
   const validatedPromptMode: SessionPromptMode =
-    promptMode && validPromptModes.includes(promptMode) ? promptMode : "scaffolded_code";
+    promptMode && validPromptModes.includes(promptMode)
+      ? promptMode
+      : "scaffolded_code";
 
   let sessionCode = "";
   do {
@@ -791,7 +863,10 @@ adminRouter.post("/sessions", async (c) => {
     sessionPrompt: sessionPrompt || "",
     promptMode: validatedPromptMode,
     examQuestions: Array.isArray(examQuestions) ? examQuestions : [],
-    runtimeConfig: runtimeConfig && typeof runtimeConfig === "object" ? runtimeConfig : undefined,
+    runtimeConfig:
+      runtimeConfig && typeof runtimeConfig === "object"
+        ? runtimeConfig
+        : undefined,
     createdAt: now,
     createdBy: caller.username,
     updatedAt: now,
@@ -828,7 +903,7 @@ adminRouter.post("/sessions", async (c) => {
 });
 
 adminRouter.patch("/sessions/:sessionCode", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const sessionCode = c.req.param("sessionCode").toUpperCase();
   const session = sessions.get(sessionCode);
 
@@ -850,19 +925,42 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     promptMode,
     examQuestions,
     runtimeConfig,
+    assignedGroups,
+    createdBy,
   } = body as any;
 
-  if (typeof durationMinutes === "number") session.durationMinutes = durationMinutes;
-  if (typeof aiOption === "string" && ["chatbot", "agent", "none"].includes(aiOption)) session.aiOption = aiOption as "chatbot" | "agent" | "none";
-  if (typeof aiValidityMinutes === "number") session.aiValidityMinutes = aiValidityMinutes;
-  if (typeof defaultTokenBudget === "number") session.defaultTokenBudget = defaultTokenBudget;
-  if (sessionType === "basic" || sessionType === "exam") session.sessionType = sessionType;
+  if (typeof durationMinutes === "number")
+    session.durationMinutes = durationMinutes;
+  if (
+    typeof aiOption === "string" &&
+    ["chatbot", "agent", "none"].includes(aiOption)
+  )
+    session.aiOption = aiOption as "chatbot" | "agent" | "none";
+  if (typeof aiValidityMinutes === "number")
+    session.aiValidityMinutes = aiValidityMinutes;
+  if (typeof defaultTokenBudget === "number")
+    session.defaultTokenBudget = defaultTokenBudget;
+  if (sessionType === "basic" || sessionType === "exam")
+    session.sessionType = sessionType;
   if (typeof sessionPrompt === "string") session.sessionPrompt = sessionPrompt;
-  if (promptMode && ["standard", "scaffolded_code", "socratic_tutor"].includes(promptMode)) {
+  if (
+    promptMode &&
+    ["standard", "scaffolded_code", "socratic_tutor"].includes(promptMode)
+  ) {
     session.promptMode = promptMode as SessionPromptMode;
   }
   if (Array.isArray(examQuestions)) session.examQuestions = examQuestions;
-  if (runtimeConfig && typeof runtimeConfig === "object") session.runtimeConfig = runtimeConfig;
+  if (Array.isArray(assignedGroups)) session.assignedGroups = assignedGroups;
+  if (runtimeConfig && typeof runtimeConfig === "object")
+    session.runtimeConfig = runtimeConfig;
+
+  if (
+    caller.role === "admin" &&
+    typeof createdBy === "string" &&
+    createdBy.trim()
+  ) {
+    session.createdBy = createdBy.trim();
+  }
 
   session.updatedAt = Date.now();
   session.updatedBy = caller.username;
@@ -879,7 +977,7 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
 });
 
 adminRouter.post("/sessions/:sessionCode/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const sessionCode = c.req.param("sessionCode").toUpperCase();
   const session = sessions.get(sessionCode);
 
@@ -967,13 +1065,15 @@ adminRouter.post(
 );
 
 adminRouter.get("/sessions", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
 
   const allSessions = Array.from(sessions.values());
-  const scopedSessions = allSessions.filter(
-    (s) => (s.createdBy || "admin").toLowerCase() === callerUser,
-  );
+  const scopedSessions = allSessions.filter((s) => {
+    if (callerRole === "admin") return true;
+    return (s.createdBy || "admin").toLowerCase() === callerUser;
+  });
 
   const sessionPromises = scopedSessions.map(async (session) => {
     const code = session.sessionCode;
@@ -1048,6 +1148,23 @@ adminRouter.get("/sessions", async (c) => {
 
 // ─── LOG DOWNLOAD HELPER & ENDPOINTS ──────────────────────────────────────────
 
+/** Secrets / databases that must never leave the server through log exports. */
+function isSensitiveLogFile(name: string): boolean {
+  const n = name.toLowerCase();
+  return (
+    n.endsWith(".key") ||
+    n.endsWith(".pem") ||
+    n.startsWith("quatmo.db") ||
+    n.endsWith(".db") ||
+    n.endsWith(".db-wal") ||
+    n.endsWith(".db-shm") ||
+    n.endsWith(".sqlite") ||
+    n === ".env" ||
+    n.startsWith(".env.") ||
+    n === "client_gate_state.json"
+  );
+}
+
 async function sendDirectoryZip(
   dirPath: string,
   zipFileName: string,
@@ -1075,6 +1192,9 @@ async function sendDirectoryZip(
         if (entry.isDirectory()) {
           await walkAndAdd(entryFullPath, entryRelativePath);
         } else if (entry.isFile()) {
+          if (isSensitiveLogFile(entry.name)) {
+            continue;
+          }
           try {
             const fileBuffer = await fs.promises.readFile(entryFullPath);
             const zipPath = entryRelativePath.replace(/\\/g, "/");
@@ -1103,7 +1223,7 @@ async function sendDirectoryZip(
     return c.body(zipBuffer);
   } catch (err: any) {
     console.error(`[Admin] Failed to zip logs for ${dirPath}:`, err);
-    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+    return c.json({ error: `Failed to create ZIP` }, 500);
   }
 }
 
@@ -1359,7 +1479,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
             eventLogCount,
             lastActivity,
             studentCount:
-              students.length || (sessionObj?.allowedStudentIds?.size || 0),
+              students.length || sessionObj?.allowedStudentIds?.size || 0,
           });
         }
       }
@@ -1396,10 +1516,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
-  const caller = (c.get("caller") as any) || {
-    username: "admin",
-    role: "admin",
-  };
+  const caller = requireCaller(c) as any;
   const callerUser = (caller.username || "admin").toLowerCase();
   const callerRole = (caller.role || "admin").toLowerCase();
   const filteredSessions = resultSessions.filter((s) => {
@@ -1606,7 +1723,7 @@ adminRouter.get(
         const parsed = JSON.parse(raw);
         turns = Array.isArray(parsed) ? parsed : [];
       } catch (err: any) {
-        return c.json({ error: `Failed to parse log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to parse log` }, 500);
       }
     } else {
       const altJsonPath = path.resolve(
@@ -1684,7 +1801,7 @@ adminRouter.get(
         }
         return c.json({ sessionCode, studentId, turns });
       } catch (err: any) {
-        return c.json({ error: `Failed to read log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to read log` }, 500);
       }
     }
 
@@ -1782,12 +1899,7 @@ async function loadEventLogFromS3(
     if (Buffer.isBuffer(zipBuffer)) {
       try {
         const zip = new AdmZip(zipBuffer);
-        for (const entry of zip.getEntries()) {
-          if (!entry.isDirectory) {
-            initialFiles[entry.entryName.replace(/\\/g, "/")] =
-              entry.getData().toString("utf-8");
-          }
-        }
+        Object.assign(initialFiles, readZipTextEntriesSafely(zip));
       } catch {}
     }
 
@@ -1799,9 +1911,7 @@ async function loadEventLogFromS3(
       metadata: metadata || {
         examSessionId: targetRecordId,
         examStartAt: coreRecords[0]?.timestamp || Date.now(),
-        examEndAt:
-          coreRecords[coreRecords.length - 1]?.timestamp ||
-          Date.now(),
+        examEndAt: coreRecords[coreRecords.length - 1]?.timestamp || Date.now(),
       },
       coreRecords,
       aiRecords,
@@ -1924,18 +2034,20 @@ adminRouter.get(
       if (fs.existsSync(snapshotZipPath)) {
         try {
           const zip = new AdmZip(snapshotZipPath);
-          const zipEntries = zip.getEntries();
-          for (const entry of zipEntries) {
-            if (!entry.isDirectory) {
-              const text = entry.getData().toString("utf-8");
-              initialFiles[entry.entryName.replace(/\\/g, "/")] = text;
-            }
-          }
+          Object.assign(initialFiles, readZipTextEntriesSafely(zip));
         } catch {}
       }
 
-      if (availableRecords.length === 0 && coreRecords.length === 0 && s3Storage.isAvailable()) {
-        const s3Result = await loadEventLogFromS3(sessionCode, studentId, c.req.query("recordId"));
+      if (
+        availableRecords.length === 0 &&
+        coreRecords.length === 0 &&
+        s3Storage.isAvailable()
+      ) {
+        const s3Result = await loadEventLogFromS3(
+          sessionCode,
+          studentId,
+          c.req.query("recordId"),
+        );
         if (s3Result) {
           return c.json(s3Result);
         }
@@ -1957,7 +2069,7 @@ adminRouter.get(
         initialFiles,
       });
     } catch (err: any) {
-      return c.json({ error: `Failed to load event log: ${err.message}` }, 500);
+      return c.json({ error: `Failed to load event log` }, 500);
     }
   },
 );
@@ -2076,7 +2188,7 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
           turns: Array.isArray(turns) ? turns : [],
         });
       } catch (err: any) {
-        return c.json({ error: `Failed to parse log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to parse log` }, 500);
       }
     }
 
@@ -2093,7 +2205,7 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
         }
         return c.json({ guestId, turns });
       } catch (err: any) {
-        return c.json({ error: `Failed to read log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to read log` }, 500);
       }
     }
   }
@@ -2375,9 +2487,11 @@ async function syncGroupWithActiveSessions(
 }
 
 adminRouter.get("/groups", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
   const groupsList = Array.from(studentGroups.values()).filter((g) => {
+    if (callerRole === "admin") return true;
     return (g.createdBy || "admin").toLowerCase() === callerUser;
   });
 
@@ -2385,7 +2499,7 @@ adminRouter.get("/groups", async (c) => {
 });
 
 adminRouter.post("/groups", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { name, userIds } = body as { name?: string; userIds?: string[] };
 
@@ -2425,7 +2539,7 @@ adminRouter.post("/groups", async (c) => {
 });
 
 adminRouter.post("/groups/:name/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
@@ -2495,7 +2609,7 @@ adminRouter.post("/groups/:name/students", async (c) => {
 });
 
 adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const studentId = decodeURIComponent(c.req.param("studentId"))
     .trim()
@@ -2543,7 +2657,7 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
 });
 
 adminRouter.delete("/groups/:name", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);

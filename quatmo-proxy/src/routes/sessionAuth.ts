@@ -26,6 +26,12 @@ import {
 } from "../services/rateLimiter";
 import { s3Storage } from "../services/s3Storage";
 import { getClientIP } from "./admin";
+import { clientVersionGate } from "../middleware/clientVersionGate";
+import { evaluateClient, readClientIdentity } from "../services/clientGate";
+import { normalizeUploadRelPath, resolveInside } from "../services/security";
+
+const MAX_UPLOAD_FILES = parseInt(process.env.MAX_UPLOAD_FILES || "5000", 10);
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(100 * 1024 * 1024), 10);
 
 function sanitizeFilename(str: string): string {
   return str.replace(/[^a-zA-Z0-9_\-]/g, "_");
@@ -337,7 +343,7 @@ sessionAuthRouter.get("/status", async (c) => {
   });
 });
 
-sessionAuthRouter.post("/login", async (c) => {
+sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
   const body = await c.req.json().catch(() => ({}));
   let {
     sessionCode: rawSessionCode,
@@ -653,6 +659,11 @@ sessionAuthRouter.post("/login", async (c) => {
     loginTime: state.loginTimestamp,
     sessionEndTime,
     exp: sessionEndTime,
+    // cgv = client-gate-verified: this token was issued to a client that passed
+    // the version/checksum gate, so chat requests with it are not re-checked.
+    ...(evaluateClient(readClientIdentity((n) => c.req.header(n))).status === "ok"
+      ? { cgv: 1 }
+      : {}),
   };
 
   const token = await sign(payload, jwtSecret);
@@ -680,6 +691,14 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     tokenPayload = await verify(token, getJwtSecret(), "HS256" as any);
   } catch {
     return c.json({ error: "Token expired or invalid" }, 401);
+  }
+
+  // Identity comes ONLY from the verified session token. Body fields are accepted
+  // for backward compatibility but must match the token.
+  const tokenSessionCode = String(tokenPayload?.sessionCode || "").trim().toUpperCase();
+  const tokenStudentId = String(tokenPayload?.studentId || "").trim().toUpperCase();
+  if (!tokenSessionCode || !tokenStudentId) {
+    return c.json({ error: "A session token is required to upload logs." }, 403);
   }
 
   let sessionCode = "";
@@ -762,8 +781,41 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     }
   }
 
-  if (!sessionCode || !studentId) {
-    return c.json({ error: "Missing required sessionCode or studentId" }, 400);
+  sessionCode = sessionCode || tokenSessionCode;
+  studentId = studentId || tokenStudentId;
+  if (sessionCode !== tokenSessionCode || studentId !== tokenStudentId) {
+    return c.json({ error: "sessionCode/studentId do not match your session token." }, 403);
+  }
+
+  if (uploadFiles.length > MAX_UPLOAD_FILES) {
+    return c.json({ error: `Too many files (max ${MAX_UPLOAD_FILES}).` }, 413);
+  }
+  // Drop (instead of rejecting the whole submission) entries whose path is absolute,
+  // contains "..", or would overwrite the server-generated upload_info.json. The rest
+  // of the student's work is still stored, and nothing can escape the student folder.
+  let totalBytes = 0;
+  let droppedFiles = 0;
+  for (let i = uploadFiles.length - 1; i >= 0; i--) {
+    const f = uploadFiles[i];
+    const normalized = normalizeUploadRelPath(f.relativePath);
+    if (!normalized || normalized.toLowerCase() === "upload_info.json") {
+      uploadFiles.splice(i, 1);
+      droppedFiles++;
+      continue;
+    }
+    f.relativePath = normalized;
+    totalBytes += f.buffer.length;
+  }
+  if (droppedFiles > 0) {
+    console.warn(
+      `[SessionAuth] upload-logs ${sessionCode}/${studentId}: dropped ${droppedFiles} file(s) with unsafe paths`,
+    );
+    if (uploadFiles.length === 0) {
+      return c.json({ error: "Invalid file path." }, 400);
+    }
+  }
+  if (totalBytes > MAX_UPLOAD_BYTES) {
+    return c.json({ error: `Upload too large (max ${MAX_UPLOAD_BYTES} bytes).` }, 413);
   }
 
   const targetDir = path.resolve(
@@ -785,10 +837,8 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   // 1. Asynchronous concurrent local disk writes
   await Promise.all(
     uploadFiles.map(async (file) => {
-      const safeRelPath = path
-        .normalize(file.relativePath)
-        .replace(/^(\.\.[\/\\])+/, "");
-      const destPath = path.join(targetDir, safeRelPath);
+      const destPath = resolveInside(targetDir, file.relativePath);
+      if (!destPath) return;
       const destDir = path.dirname(destPath);
       await fs.promises.mkdir(destDir, { recursive: true });
       await fs.promises.writeFile(destPath, file.buffer);
@@ -823,13 +873,10 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
 
       // Upload all files concurrently
       const s3UploadPromises = uploadFiles.map((file) => {
-        const safeRelPath = path
-          .normalize(file.relativePath)
-          .replace(/^(\.\.[\/\\])+/, "");
         return s3Storage.uploadStudentFile(
           sessionCode,
           studentId,
-          safeRelPath,
+          file.relativePath,
           file.buffer,
         );
       });

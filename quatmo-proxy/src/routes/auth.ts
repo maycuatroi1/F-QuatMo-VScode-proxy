@@ -81,7 +81,8 @@ authRouter.post("/login", async (c) => {
         403
       );
     }
-    return c.json({ error: "Student account does not exist." }, 403);
+    // Same response as a wrong password to avoid account enumeration.
+    return c.json({ error: "Incorrect student ID or password." }, 403);
   }
 
   await recordSuccessfulLogin(ip, studentId);

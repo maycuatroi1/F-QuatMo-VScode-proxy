@@ -1,5 +1,7 @@
 version: '3.8'
 
+# Secrets are NOT stored in this file. Put them in a .env file next to it
+# (git-ignored) or in the Dokploy "Environment" panel. See .env.example.
 services:
   quatmo-proxy:
     build:
@@ -9,15 +11,12 @@ services:
     restart: always
     ports:
       - "3000:3000"
+    env_file:
+      - .env
     environment:
       - PORT=3000
-      - REDIS_URL=redis://redis:6379
-      - PROXY_API_KEY=123456789
-      - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=123
-      - JWT_SECRET=super_secret_jwt_signing_key_for_quatmo_proxy_2026
-      - BUILD_SIGNING_SECRET=fpt_university_fvscode_signing_secret_2026_super_secure
-      - LATEST_FINGERPRINT=${LATEST_FINGERPRINT:-}
+      - NODE_ENV=production
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
     volumes:
       - ./logs:/app/logs
     depends_on:
@@ -27,9 +26,13 @@ services:
     image: redis:7-alpine
     container_name: quatmo-redis
     restart: always
-    command: redis-server --appendonly yes --appendfsync everysec --save 60 1
-    ports:
-      - "6379:6379"
+    # No "ports:" mapping: Redis is reachable only on the internal Docker network.
+    command: >
+      redis-server --appendonly yes --appendfsync everysec --save 60 1
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      --rename-command CONFIG ""
+      --rename-command FLUSHALL ""
+      --rename-command DEBUG ""
     volumes:
       - redis_data:/data
 

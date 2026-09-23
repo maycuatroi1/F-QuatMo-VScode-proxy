@@ -9,6 +9,54 @@ import { Hono } from "hono";
 import path from "path";
 import fs from "fs";
 import { s3Storage } from "../services/s3Storage";
+import { getLatestAppRelease, observeRelease } from "../services/clientGate";
+import { verify } from "hono/jwt";
+import { getJwtSecret } from "../services/jwtKey";
+import { getProxyApiKey } from "../services/proxyKey";
+import { isAllowedReleaseUrl, safeEqual } from "../services/security";
+
+/** Super-admin check for release publication (master key or admin JWT). */
+async function isSuperAdminRequest(c: any): Promise<boolean> {
+  const authHeader = c.req.header("Authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
+  const xApiKey = (c.req.header("x-api-key") || "").trim();
+  const master = getProxyApiKey();
+  if ((token && safeEqual(token, master)) || (xApiKey && safeEqual(xApiKey, master))) {
+    return true;
+  }
+  if (!token) return false;
+  try {
+    const payload: any = await verify(token, getJwtSecret(), "HS256" as any);
+    return Boolean(payload && payload.role === "admin" && payload.username && !payload.studentId);
+  } catch {
+    return false;
+  }
+}
+
+/** Public base URL used to build download links (never trust the Host header in prod). */
+function publicBase(c: any): string {
+  const configured = (process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+  if (configured) return configured;
+  const host = c.req.header("host") || "localhost:3000";
+  const proto =
+    c.req.header("x-forwarded-proto") ||
+    (host.startsWith("localhost") ? "http" : "https");
+  return `${proto}://${host}`;
+}
+
+/** Drops download URLs that are not https on an allowlisted host. */
+function sanitizeManifestUrls<T extends { downloadUrl?: string; cdnUrl?: string }>(m: T): T {
+  const out: any = { ...m };
+  if (!isAllowedReleaseUrl(out.downloadUrl)) {
+    console.error(`[UpdateRouter] Rejected non-allowlisted downloadUrl: ${out.downloadUrl}`);
+    out.downloadUrl = "";
+  }
+  if (!isAllowedReleaseUrl(out.cdnUrl)) {
+    console.error(`[UpdateRouter] Rejected non-allowlisted cdnUrl: ${out.cdnUrl}`);
+    out.cdnUrl = undefined;
+  }
+  return out;
+}
 
 /**
  * Supported software update and configuration distribution channels.
@@ -39,6 +87,8 @@ export interface ReleaseManifest {
   cdnUrl?: string;
   /** Cryptographic SHA-256 hexadecimal checksum. */
   sha256hash?: string;
+  /** SHA-256 of <appRoot>/out/main.js for installer/patch builds (client build checksum). */
+  buildHash?: string;
   /** Binary file size in bytes. */
   sizeBytes?: number;
   /** Binary file size in megabytes. */
@@ -55,6 +105,8 @@ export interface ReleaseManifest {
   extensionVersion?: string;
   /** Remote policy payload when `updateType` is 'policy'. */
   policyConfig?: Record<string, any>;
+  /** "ed25519:<base64>" publisher signature (scripts/release-signing.mjs). */
+  signature?: string;
 }
 
 const MANIFEST_PATH = path.resolve(__dirname, "../../release_manifest.json");
@@ -95,6 +147,7 @@ try {
     err,
   );
 }
+observeRelease(currentRelease);
 
 /**
  * Retrieves the current in-memory release manifest, synchronizing with local disk if available.
@@ -120,6 +173,7 @@ export function getCurrentRelease(): ReleaseManifest {
  */
 export function saveReleaseManifest(manifest: ReleaseManifest): void {
   currentRelease = { ...manifest };
+  observeRelease(currentRelease);
   try {
     fs.writeFileSync(
       MANIFEST_PATH,
@@ -153,10 +207,14 @@ export async function getLatestRelease(
     try {
       const s3Manifest = await s3Storage.getReleaseManifestFromS3();
       if (s3Manifest && s3Manifest.version && s3Manifest.commit) {
-        currentRelease = {
-          ...currentRelease,
-          ...s3Manifest,
-        };
+        // A signed manifest is authoritative and complete: replace instead of merging,
+        // otherwise fields left over from an older release (e.g. targetExtensionId)
+        // would leak into it and clients would reject its signature.
+        currentRelease = sanitizeManifestUrls(
+          s3Manifest.signature
+            ? { ...s3Manifest }
+            : { ...currentRelease, ...s3Manifest },
+        );
         saveReleaseManifest(currentRelease);
         return currentRelease;
       }
@@ -192,7 +250,21 @@ updateRouter.get("/api/update/:platform/:quality/:commit", async (c) => {
   const { platform, quality, commit } = c.req.param();
   const isBg = c.req.query("bg") === "true";
 
-  const release = await getLatestRelease();
+  const latest = await getLatestRelease();
+  // The native updater runs whatever it downloads as an Inno Setup installer, so it
+  // must only ever be offered an installer. When the newest manifest is a patch /
+  // extension / policy, fall back to the latest installer known to the client gate.
+  const gateApp = getLatestAppRelease();
+  const release: ReleaseManifest | undefined =
+    (latest.updateType || "installer") === "installer"
+      ? latest
+      : gateApp && gateApp.updateType === "installer"
+        ? ({ ...gateApp, downloadUrl: gateApp.downloadUrl || "" } as ReleaseManifest)
+        : undefined;
+
+  if (!release || !release.commit) {
+    return c.body(null, 204);
+  }
 
   console.log(
     `[UpdateRouter] Check update received - Platform: ${platform}, Quality: ${quality}, Client Commit: ${commit}, Latest Commit: ${release.commit}, Background: ${isBg}`,
@@ -208,11 +280,7 @@ updateRouter.get("/api/update/:platform/:quality/:commit", async (c) => {
     `[UpdateRouter] Update available! Client: ${commit} -> Latest: ${release.commit} (v${release.version})`,
   );
 
-  const host = c.req.header("host") || "localhost:3000";
-  const proto =
-    c.req.header("x-forwarded-proto") ||
-    (host.startsWith("localhost") ? "http" : "https");
-  const filename = release.filename || "Fvscode-UserSetup-x64.exe";
+  const filename = path.basename(release.filename || "Fvscode-UserSetup-x64.exe");
   const rawUrl = release.cdnUrl || release.downloadUrl;
   const isLocalOrRelative =
     !rawUrl ||
@@ -220,7 +288,7 @@ updateRouter.get("/api/update/:platform/:quality/:commit", async (c) => {
     rawUrl.includes("localhost:") ||
     rawUrl.includes("127.0.0.1:");
   const downloadUrl = isLocalOrRelative
-    ? `${proto}://${host}/v1/releases/${filename}`
+    ? `${publicBase(c)}/v1/releases/${filename}`
     : rawUrl;
 
   return c.json({
@@ -230,6 +298,21 @@ updateRouter.get("/api/update/:platform/:quality/:commit", async (c) => {
     productVersion: release.productVersion || release.version,
     sha256hash: release.sha256hash,
     notes: release.notes,
+    // Signed release metadata verified by Fvscode builds that pin release keys
+    // (ignored by older clients).
+    quatmoRelease: release.signature
+      ? {
+          updateType: "installer",
+          version: release.version,
+          commit: release.commit,
+          filename: release.filename,
+          sha256hash: release.sha256hash,
+          sizeBytes: release.sizeBytes,
+          buildHash: release.buildHash,
+          releasedAt: release.releasedAt,
+          signature: release.signature,
+        }
+      : undefined,
   });
 });
 
@@ -279,10 +362,6 @@ updateRouter.get("/releases/:filename", async (c) => {
  */
 updateRouter.get("/release/current", async (c) => {
   const release = await getLatestRelease();
-  const host = c.req.header("host") || "localhost:3000";
-  const proto =
-    c.req.header("x-forwarded-proto") ||
-    (host.startsWith("localhost") ? "http" : "https");
 
   // If a high-speed CDN URL is specified, prioritize it directly.
   // If downloadUrl points to an external CDN/S3 URL, keep it untouched.
@@ -296,7 +375,7 @@ updateRouter.get("/release/current", async (c) => {
 
   if (isLocalOrRelative) {
     const filename = path.basename(downloadUrl || release.filename || "Fvscode-UserSetup-x64.exe");
-    downloadUrl = `${proto}://${host}/v1/releases/${filename}`;
+    downloadUrl = `${publicBase(c)}/v1/releases/${filename}`;
   }
 
   const s3Files = await s3Storage.listAllReleaseObjects();
@@ -327,8 +406,14 @@ updateRouter.get("/admin/release/current", async (c) => {
 /**
  * Administrative endpoint to trigger immediate synchronization with the S3 release repository.
  */
+let lastForcedSync = 0;
 updateRouter.post("/release/sync-s3", async (c) => {
-  const release = await getLatestRelease(true);
+  // Public (called by the admin UI and publish script) but throttled so it cannot
+  // be used to hammer S3.
+  const now = Date.now();
+  const force = now - lastForcedSync > 10_000;
+  if (force) lastForcedSync = now;
+  const release = await getLatestRelease(force);
   return c.json({
     success: true,
     message: "Synchronized with S3 release repository successfully.",
@@ -341,10 +426,19 @@ updateRouter.post("/release/sync-s3", async (c) => {
  * Supports updating metadata for all channels: installer, patch, extension, and policy.
  */
 updateRouter.post("/release/set-latest", async (c) => {
+  if (!(await isSuperAdminRequest(c))) {
+    return c.json({ error: "Unauthorized. Super Admin access required." }, 401);
+  }
   try {
     const body = await c.req.json();
     if (!body.version || !body.commit) {
       return c.json({ error: "Missing required fields: version, commit" }, 400);
+    }
+    if (!isAllowedReleaseUrl(body.downloadUrl)) {
+      return c.json({ error: "downloadUrl must be https on an allowlisted host (RELEASE_ALLOWED_HOSTS)." }, 400);
+    }
+    if (body.sha256hash !== undefined && !/^[a-fA-F0-9]{64}$/.test(String(body.sha256hash).trim())) {
+      return c.json({ error: "sha256hash must be a 64-char hex SHA-256." }, 400);
     }
 
     const updated: ReleaseManifest = {
@@ -385,6 +479,7 @@ updateRouter.post("/release/set-latest", async (c) => {
       release: currentRelease,
     });
   } catch (err: any) {
-    return c.json({ error: err.message || "Failed to update release" }, 500);
+    console.error("[UpdateRouter] set-latest failed:", err);
+    return c.json({ error: "Failed to update release" }, 500);
   }
 });

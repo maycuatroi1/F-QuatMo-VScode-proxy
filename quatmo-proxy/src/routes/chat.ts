@@ -1,3 +1,5 @@
+import { getProxyApiKey } from "../services/proxyKey";
+import { clientVersionGate } from "../middleware/clientVersionGate";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { authMiddleware, type UserSession } from "../middleware/auth";
@@ -214,6 +216,7 @@ const chatRouter = new Hono<{
 }>();
 
 chatRouter.use("*", verifyFingerprintMiddleware());
+chatRouter.use("*", clientVersionGate({ allowVerifiedSessionTokens: true }));
 
 export const latestClassifications = new Map<
   string,
@@ -329,6 +332,16 @@ function normalizeUpstreamBody(
     ...body,
     model: upstream.actualModel,
   };
+
+  // Cost/DoS guard: clients cannot request unbounded output or many completions.
+  const maxOut = parseInt(process.env.MAX_OUTPUT_TOKENS || "8192", 10);
+  for (const k of ["max_tokens", "max_completion_tokens"]) {
+    if (upstreamBody[k] !== undefined) {
+      const v = Number(upstreamBody[k]);
+      upstreamBody[k] = Number.isFinite(v) && v > 0 ? Math.min(v, maxOut) : maxOut;
+    }
+  }
+  if (upstreamBody.n !== undefined) upstreamBody.n = 1;
 
   if (upstreamBody.messages && Array.isArray(upstreamBody.messages)) {
     upstreamBody.messages = upstreamBody.messages.map((msg: any) => {
@@ -1329,7 +1342,10 @@ chatRouter.post(
       "Content-Type": "application/json",
     };
     if (upstream.key === "FORWARD_USER_KEY") {
-      headers["Authorization"] = `Bearer ${token}`;
+      // Never leak the proxy master key to the upstream provider.
+      if (token && token !== getProxyApiKey()) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
     } else if (upstream.key && upstream.key !== "lmstudio-placeholder-key") {
       headers["Authorization"] = `Bearer ${upstream.key}`;
     }

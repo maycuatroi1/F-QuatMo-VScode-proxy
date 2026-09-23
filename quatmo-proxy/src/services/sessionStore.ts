@@ -502,7 +502,7 @@ export function getStudentAccount(studentId: string, creator = "admin"): Student
 
 export async function verifyPasswordSafely(password: string, hash: string): Promise<boolean> {
   if (!password || !hash) return false;
-  if (password === hash) return true;
+  // Never accept the stored hash itself as a password (pass-the-hash).
   try {
     return await Bun.password.verify(password, hash);
   } catch {
