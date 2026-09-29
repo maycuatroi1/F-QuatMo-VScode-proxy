@@ -29,9 +29,11 @@ import {
   evaluateTurnAndSession,
   queueEvaluation,
   getStudentTopNClassification,
+  withFileLock,
   type TopNClassificationResult,
   type EvaluationResult,
 } from "../services/classifier/index";
+import { classifierConcurrencyController } from "../services/classifier/concurrencyLimiter";
 import { extractCodeSnapshot } from "../services/classifier/features";
 import type { IemLabel } from "../services/classifier/currentPromptClassifier";
 
@@ -234,7 +236,10 @@ chatRouter.get("/latest-classification", unifiedAuthMiddleware(), async (c) => {
     process.env.CLASSIFICATION_POLL_RETRIES || "300",
     10,
   );
-  while ((await redisStore.isEvaluationPending(token)) && retries < maxRetries) {
+  while (
+    (await redisStore.isEvaluationPending(token)) &&
+    retries < maxRetries
+  ) {
     await new Promise((resolve) => setTimeout(resolve, 200));
     retries++;
   }
@@ -279,10 +284,13 @@ chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
   sessionCode = sessionCode.toUpperCase();
   studentId = studentId.toUpperCase();
 
-  const { activeFile, recentPaste, files, recentTerminal, terminalOutput } = body;
+  const { activeFile, recentPaste, files, recentTerminal, terminalOutput } =
+    body;
   const terminalActivity =
     recentTerminal ||
-    (terminalOutput ? { output: terminalOutput, timestamp: Date.now() } : undefined);
+    (terminalOutput
+      ? { output: terminalOutput, timestamp: Date.now() }
+      : undefined);
   await redisStore.saveClientContext(sessionCode, studentId, {
     activeFile,
     recentPaste,
@@ -338,7 +346,8 @@ function normalizeUpstreamBody(
   for (const k of ["max_tokens", "max_completion_tokens"]) {
     if (upstreamBody[k] !== undefined) {
       const v = Number(upstreamBody[k]);
-      upstreamBody[k] = Number.isFinite(v) && v > 0 ? Math.min(v, maxOut) : maxOut;
+      upstreamBody[k] =
+        Number.isFinite(v) && v > 0 ? Math.min(v, maxOut) : maxOut;
     }
   }
   if (upstreamBody.n !== undefined) upstreamBody.n = 1;
@@ -429,13 +438,16 @@ async function logStudentInteraction(
   nativeToolCalls?: any[],
   isSession: boolean = true,
   machineId?: string,
+  conversationId?: string,
 ) {
-  const userMessages = body?.messages?.filter((m: any) => m.role === "user") || [];
+  const userMessages =
+    body?.messages?.filter((m: any) => m.role === "user") || [];
   const currentUserMsg =
     userMessages.length > 0
       ? (typeof userMessages[userMessages.length - 1].content === "string"
           ? userMessages[userMessages.length - 1].content
-          : JSON.stringify(userMessages[userMessages.length - 1].content))
+          : JSON.stringify(userMessages[userMessages.length - 1].content)
+        )
           .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
           .trimStart()
       : "";
@@ -445,14 +457,24 @@ async function logStudentInteraction(
     studentId,
   );
   const extracted = extractCodeSnapshot(body, currentUserMsg);
-  const codeSnapshot = clientContext?.activeFile?.content || extracted.content || "";
-  const activeFilePath = clientContext?.activeFile?.path || extracted.path || "";
-  const activeFileLanguageId = clientContext?.activeFile?.languageId || extracted.languageId || "";
-  const codeSnapshots = clientContext?.files && clientContext.files.length > 0
-    ? clientContext.files
-    : extracted.content
-      ? [{ path: extracted.path, content: extracted.content, languageId: extracted.languageId }]
-      : [];
+  const codeSnapshot =
+    clientContext?.activeFile?.content || extracted.content || "";
+  const activeFilePath =
+    clientContext?.activeFile?.path || extracted.path || "";
+  const activeFileLanguageId =
+    clientContext?.activeFile?.languageId || extracted.languageId || "";
+  const codeSnapshots =
+    clientContext?.files && clientContext.files.length > 0
+      ? clientContext.files
+      : extracted.content
+        ? [
+            {
+              path: extracted.path,
+              content: extracted.content,
+              languageId: extracted.languageId,
+            },
+          ]
+        : [];
 
   const terminalOutput =
     clientContext?.recentTerminal?.output ||
@@ -526,126 +548,156 @@ async function logStudentInteraction(
       ? body.messages[body.messages.length - 1]
       : null;
 
-
   const toolCalls = extractToolCalls(cleanCompletion, nativeToolCalls);
-  const safeSessionCode = sanitizeFilename(sessionCode || "DEFAULT").toUpperCase();
-  const safeStudentId = sanitizeFilename(studentId || "DEFAULT_USER").toUpperCase();
-  const safeLogIdentifier = sanitizeFilename(machineId || studentId || "DEFAULT_USER").toUpperCase();
+  const safeSessionCode = sanitizeFilename(
+    sessionCode || "DEFAULT",
+  ).toUpperCase();
+  const safeStudentId = sanitizeFilename(
+    studentId || "DEFAULT_USER",
+  ).toUpperCase();
+  const safeLogIdentifier = sanitizeFilename(
+    machineId || studentId || "DEFAULT_USER",
+  ).toUpperCase();
 
   const logDir = isSession
     ? path.resolve(process.cwd(), "logs", "sessions", safeSessionCode)
     : path.resolve(process.cwd(), "logs", "guests");
-  const logFilePath = path.resolve(logDir, `${isSession ? safeStudentId : safeLogIdentifier}.json`);
+  const logFilePath = path.resolve(
+    logDir,
+    `${isSession ? safeStudentId : safeLogIdentifier}.json`,
+  );
 
   try {
     await fs.promises.mkdir(logDir, { recursive: true });
 
-    let logs: any[] = [];
-    if (fs.existsSync(logFilePath)) {
-      try {
-        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
-        logs = JSON.parse(fileContent);
-      } catch (e) {
-        // file empty or invalid
-      }
-    }
+    let sessionEntry: any = null;
+    let currentLogsSnapshot: any[] = [];
 
-    const lastEntry = logs.length > 0 ? logs[logs.length - 1] : null;
-    const isContinuation =
-      lastEntry &&
-      lastEntry.prompt === currentUserMsg &&
-      lastMsg?.role !== "user" &&
-      Date.now() - new Date(lastEntry.timestamp).getTime() < 300000;
+    await withFileLock(logFilePath, async () => {
+      let logs: any[] = [];
+      if (fs.existsSync(logFilePath)) {
+        try {
+          const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+          logs = JSON.parse(fileContent);
+        } catch (e) {
+          // file empty or invalid
+        }
+      }
 
-    if (isContinuation && lastEntry) {
-      lastEntry.tokensConsumedTotal += totalConsumed;
-      lastEntry.output = cleanCompletion;
-      lastEntry.history = cleanHistory;
-      lastEntry.lastUpdated = new Date().toISOString();
-      lastEntry.codeSnapshot = codeSnapshot;
-      lastEntry.activeFilePath = activeFilePath;
-      lastEntry.activeFileLanguageId = activeFileLanguageId;
-      lastEntry.codeSnapshots = codeSnapshots;
-      if (terminalOutput) {
-        lastEntry.terminalOutput = terminalOutput;
-      }
-      if (lastTerminalCommand) {
-        lastEntry.lastTerminalCommand = lastTerminalCommand;
-      }
-      if (
-        finalLabel &&
-        finalLabel !== "none" &&
-        (!lastEntry.classification || lastEntry.classification.label === "none")
-      ) {
-        lastEntry.classification = {
-          ...(lastEntry.classification || {}),
-          label: finalLabel,
-          currentLabel: finalLabel,
-          confidence: finalConfidence,
+      const lastEntry = logs.length > 0 ? logs[logs.length - 1] : null;
+      const isContinuation =
+        lastEntry &&
+        lastEntry.prompt === currentUserMsg &&
+        lastMsg?.role !== "user" &&
+        Date.now() - new Date(lastEntry.timestamp).getTime() < 300000;
+
+      if (isContinuation && lastEntry) {
+        lastEntry.tokensConsumedTotal += totalConsumed;
+        lastEntry.output = cleanCompletion;
+        lastEntry.history = cleanHistory;
+        lastEntry.lastUpdated = new Date().toISOString();
+        lastEntry.codeSnapshot = codeSnapshot;
+        lastEntry.activeFilePath = activeFilePath;
+        lastEntry.activeFileLanguageId = activeFileLanguageId;
+        lastEntry.codeSnapshots = codeSnapshots;
+        if (conversationId && !lastEntry.conversationId) {
+          lastEntry.conversationId = conversationId;
+        }
+        if (terminalOutput) {
+          lastEntry.terminalOutput = terminalOutput;
+        }
+        if (lastTerminalCommand) {
+          lastEntry.lastTerminalCommand = lastTerminalCommand;
+        }
+        if (
+          finalLabel &&
+          finalLabel !== "none" &&
+          (!lastEntry.classification ||
+            lastEntry.classification.label === "none")
+        ) {
+          lastEntry.classification = {
+            ...(lastEntry.classification || {}),
+            label: finalLabel,
+            currentLabel: finalLabel,
+            confidence: finalConfidence,
+          };
+        } else if (finalLabel && finalLabel !== "none") {
+          lastEntry.classification.currentLabel = finalLabel;
+        }
+        if (toolCalls.length > 0 || lastEntry.agentLoops.length > 0) {
+          lastEntry.agentLoops.push({
+            step: lastEntry.agentLoops.length + 1,
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            toolCalls,
+          });
+        }
+        sessionEntry = lastEntry;
+      } else {
+        const newEntry: any = {
+          timestamp: new Date().toISOString(),
+          conversationId: conversationId || undefined,
+          prompt: currentUserMsg,
+          classification: {
+            label: finalLabel || "none",
+            currentLabel: finalLabel || "none",
+            confidence: finalConfidence || 0,
+          },
+          aiOption: currentAiOption,
+          tokenLimit,
+          tokensConsumedTotal: totalConsumed,
+          output: cleanCompletion,
+          agentLoops: [],
+          history: cleanHistory,
+          codeSnapshot,
+          activeFilePath,
+          activeFileLanguageId,
+          codeSnapshots,
+          terminalOutput,
+          lastTerminalCommand,
         };
-      } else if (finalLabel && finalLabel !== "none") {
-        lastEntry.classification.currentLabel = finalLabel;
-      }
-      if (toolCalls.length > 0 || lastEntry.agentLoops.length > 0) {
-        lastEntry.agentLoops.push({
-          step: lastEntry.agentLoops.length + 1,
-          promptTokens: inputTokens,
-          completionTokens: outputTokens,
-          toolCalls,
-        });
-      }
-    } else {
-      const newEntry: any = {
-        timestamp: new Date().toISOString(),
-        prompt: currentUserMsg,
-        classification: {
-          label: finalLabel || "none",
-          currentLabel: finalLabel || "none",
-          confidence: finalConfidence || 0,
-        },
-        aiOption: currentAiOption,
-        tokenLimit,
-        tokensConsumedTotal: totalConsumed,
-        output: cleanCompletion,
-        agentLoops: [],
-        history: cleanHistory,
-        codeSnapshot,
-        activeFilePath,
-        activeFileLanguageId,
-        codeSnapshots,
-        terminalOutput,
-        lastTerminalCommand,
-      };
 
-      if (toolCalls.length > 0) {
-        newEntry.agentLoops.push({
-          step: 1,
-          promptTokens: inputTokens,
-          completionTokens: outputTokens,
-          toolCalls,
-        });
+        if (toolCalls.length > 0) {
+          newEntry.agentLoops.push({
+            step: 1,
+            promptTokens: inputTokens,
+            completionTokens: outputTokens,
+            toolCalls,
+          });
+        }
+
+        logs.push(newEntry);
+        sessionEntry = newEntry;
       }
 
-      logs.push(newEntry);
-    }
+      await fs.promises.writeFile(
+        logFilePath,
+        JSON.stringify(logs, null, 2),
+        "utf-8",
+      );
+      currentLogsSnapshot = logs;
+    });
 
-    await fs.promises.writeFile(
-      logFilePath,
-      JSON.stringify(logs, null, 2),
-      "utf-8",
-    );
-
-    const sessionEntry =
-      isContinuation && lastEntry ? lastEntry : logs[logs.length - 1];
     if (isSession) {
-      await logSession(safeSessionCode, safeStudentId, sessionEntry);
-      if (s3Storage.isAvailable()) {
-        void s3Storage.uploadStudentPromptLog(safeSessionCode, safeStudentId, logs);
+      if (sessionEntry) {
+        await logSession(safeSessionCode, safeStudentId, sessionEntry);
+      }
+      if (s3Storage.isAvailable() && currentLogsSnapshot.length > 0) {
+        void s3Storage.uploadStudentPromptLog(
+          safeSessionCode,
+          safeStudentId,
+          currentLogsSnapshot,
+        );
       }
     } else {
-      await logGuest(safeLogIdentifier, sessionEntry);
-      if (s3Storage.isAvailable()) {
-        void s3Storage.uploadGuestPromptLog(safeLogIdentifier, logs);
+      if (sessionEntry) {
+        await logGuest(safeLogIdentifier, sessionEntry);
+      }
+      if (s3Storage.isAvailable() && currentLogsSnapshot.length > 0) {
+        void s3Storage.uploadGuestPromptLog(
+          safeLogIdentifier,
+          currentLogsSnapshot,
+        );
       }
     }
   } catch (err) {
@@ -679,7 +731,8 @@ async function logStudentError(
     userMessages.length > 0
       ? (typeof userMessages[userMessages.length - 1].content === "string"
           ? userMessages[userMessages.length - 1].content
-          : JSON.stringify(userMessages[userMessages.length - 1].content))
+          : JSON.stringify(userMessages[userMessages.length - 1].content)
+        )
           .replace(/__CLASSIFIER_RESULT__:\{.*?\}\n*/g, "")
           .trimStart()
       : "";
@@ -707,14 +760,23 @@ async function logStudentError(
           ]
         : [];
 
-  const safeSessionCode = sanitizeFilename(sessionCode || "DEFAULT").toUpperCase();
-  const safeStudentId = sanitizeFilename(studentId || "DEFAULT_USER").toUpperCase();
-  const safeLogIdentifier = sanitizeFilename(machineId || studentId || "DEFAULT_USER").toUpperCase();
+  const safeSessionCode = sanitizeFilename(
+    sessionCode || "DEFAULT",
+  ).toUpperCase();
+  const safeStudentId = sanitizeFilename(
+    studentId || "DEFAULT_USER",
+  ).toUpperCase();
+  const safeLogIdentifier = sanitizeFilename(
+    machineId || studentId || "DEFAULT_USER",
+  ).toUpperCase();
 
   const logDir = isSession
     ? path.resolve(process.cwd(), "logs", "sessions", safeSessionCode)
     : path.resolve(process.cwd(), "logs", "guests");
-  const logFilePath = path.resolve(logDir, `${isSession ? safeStudentId : safeLogIdentifier}.json`);
+  const logFilePath = path.resolve(
+    logDir,
+    `${isSession ? safeStudentId : safeLogIdentifier}.json`,
+  );
 
   try {
     await fs.promises.mkdir(logDir, { recursive: true });
@@ -755,7 +817,9 @@ async function logStudentError(
     );
 
     if (isSession) {
-      await logSession(safeSessionCode, safeStudentId, newEntry).catch(() => {});
+      await logSession(safeSessionCode, safeStudentId, newEntry).catch(
+        () => {},
+      );
     } else {
       await logGuest(safeLogIdentifier, newEntry).catch(() => {});
     }
@@ -782,7 +846,8 @@ async function getSystemPromptForIem(
     try {
       if (fs.existsSync(standardPath)) {
         const content = await fs.promises.readFile(standardPath, "utf-8");
-        if (process.env.NODE_ENV === "production") cachedPrompts.set(cacheKey, content);
+        if (process.env.NODE_ENV === "production")
+          cachedPrompts.set(cacheKey, content);
         return content;
       }
     } catch (err) {
@@ -791,8 +856,10 @@ async function getSystemPromptForIem(
     return "You are a professional, helpful, and pragmatic software engineering assistant.";
   }
 
-  const folderName = mode === "socratic_tutor" ? "socratic_tutor" : "scaffolded_code";
-  const fallbackFile = mode === "socratic_tutor" ? "socratic_tutor.md" : "python_tutor.md";
+  const folderName =
+    mode === "socratic_tutor" ? "socratic_tutor" : "scaffolded_code";
+  const fallbackFile =
+    mode === "socratic_tutor" ? "socratic_tutor.md" : "python_tutor.md";
 
   let filename = "mixed.md";
   if (label === "instrumental") {
@@ -822,7 +889,10 @@ async function getSystemPromptForIem(
       return prompt;
     }
   } catch (err) {
-    console.error(`[IemPrompt] Error reading prompt for ${mode}/${label}:`, err);
+    console.error(
+      `[IemPrompt] Error reading prompt for ${mode}/${label}:`,
+      err,
+    );
   }
 
   if (filename !== "mixed.md") {
@@ -916,7 +986,8 @@ chatRouter.post(
 
     const messageText = (message: any): string => {
       if (typeof message?.content === "string") return message.content;
-      if (Array.isArray(message?.content)) return JSON.stringify(message.content);
+      if (Array.isArray(message?.content))
+        return JSON.stringify(message.content);
       return "";
     };
     const isRealUserMessage = (message: any): boolean => {
@@ -944,7 +1015,9 @@ chatRouter.post(
     const extractedCode = extractCodeSnapshot(body, policyPrompt);
     const terminalActivity =
       body.recentTerminal ||
-      (body.terminalOutput ? { output: body.terminalOutput, timestamp: Date.now() } : undefined);
+      (body.terminalOutput
+        ? { output: body.terminalOutput, timestamp: Date.now() }
+        : undefined);
     if (body.activeFile || body.files || terminalActivity) {
       await redisStore
         .saveClientContext(finalSessionCode, finalStudentId, {
@@ -987,27 +1060,47 @@ chatRouter.post(
 
     let activeConversationId = rawConversationId;
     if (!activeConversationId && Array.isArray(body.messages)) {
-      const firstUserMsg = body.messages.find((m: any) => m && m.role === "user");
+      const firstUserMsg = body.messages.find(
+        (m: any) => m && m.role === "user",
+      );
       if (
         firstUserMsg &&
         typeof firstUserMsg.content === "string" &&
         firstUserMsg.content.trim()
       ) {
+        const cleanRootPrompt = firstUserMsg.content
+          .replace(
+            /Attached Target Workspace Files:[\s\S]*?---------------------/g,
+            "",
+          )
+          .replace(
+            /--- (?:ACTIVE OPEN EDITOR FILE|ATTACHED TARGET FILE):[\s\S]*?---------------------/g,
+            "",
+          )
+          .replace(/\[(?:TARGET|ACTIVE) FILE DIRECTIVE\]:[\s\S]*/g, "")
+          .trim();
+        const baseToHash = cleanRootPrompt || firstUserMsg.content.trim();
         activeConversationId = crypto
           .createHash("sha256")
-          .update(firstUserMsg.content.trim())
+          .update(baseToHash)
           .digest("hex")
           .slice(0, 12);
       }
     }
 
     const activeSession = sessions.get(finalSessionCode);
-    const promptMode: SessionPromptMode = activeSession?.promptMode || "scaffolded_code";
+    const promptMode: SessionPromptMode =
+      activeSession?.promptMode || "scaffolded_code";
 
     let currentIemLabel: IemLabel = "none" as IemLabel;
     let currentIemConfidence = 0;
 
     if (promptMode !== "standard") {
+      const clientKey = `${(finalSessionCode || "DEFAULT").toUpperCase()}:${(finalStudentId || "DEFAULT_USER").toUpperCase()}`;
+      await classifierConcurrencyController
+        .waitForClient(clientKey, 2000)
+        .catch(() => {});
+
       // Retrieve active IEM label from student's top-N sliding window classification history scoped to active conversation
       const topNDecision = await getStudentTopNClassification(
         finalSessionCode,
@@ -1031,7 +1124,9 @@ chatRouter.post(
       const inputSafetyStart = performance.now();
       const safetyResult = await validateUserMessages(messages);
       inputSafetyDuration = performance.now() - inputSafetyStart;
-      console.log(`[Perf] Input safety check took ${inputSafetyDuration.toFixed(0)}ms`);
+      console.log(
+        `[Perf] Input safety check took ${inputSafetyDuration.toFixed(0)}ms`,
+      );
       if (!safetyResult.allowed && safetyResult.violation) {
         const v = safetyResult.violation;
         console.warn(
@@ -1048,7 +1143,7 @@ chatRouter.post(
           v.code,
           400,
           authMode === "session",
-          machineId
+          machineId,
         ).catch(() => {});
         if (body.stream) {
           return streamSSE(c, async (stream) => {
@@ -1079,7 +1174,7 @@ chatRouter.post(
     if (body.messages && Array.isArray(body.messages)) {
       const warningText =
         "\n\n- IMPORTANT: The 'todowrite' tool is ONLY for updating the task checklist/to-do list status. It DOES NOT write any files to the filesystem. To write file contents, you MUST call the 'write' tool. To edit file contents, you MUST call the 'edit' tool.";
-      
+
       let runtimePolicy = "";
       if (promptMode === "standard") {
         runtimePolicy =
@@ -1134,7 +1229,10 @@ chatRouter.post(
             sessionContextBlock += `\n`;
           });
         }
-        if (activeSession.runtimeConfig && activeSession.runtimeConfig.enabled) {
+        if (
+          activeSession.runtimeConfig &&
+          activeSession.runtimeConfig.enabled
+        ) {
           const rc = activeSession.runtimeConfig;
           const pkgs =
             Array.isArray(rc.packages) && rc.packages.length > 0
@@ -1147,7 +1245,10 @@ chatRouter.post(
         }
       }
 
-      const tutorPrompt = await getSystemPromptForIem(currentIemLabel, promptMode);
+      const tutorPrompt = await getSystemPromptForIem(
+        currentIemLabel,
+        promptMode,
+      );
       const systemMessage = {
         role: "system",
         content:
@@ -1243,11 +1344,7 @@ chatRouter.post(
         confidence: currentIemConfidence,
       });
       await redisStore
-        .setCachedClassification(
-          token,
-          currentIemLabel,
-          currentIemConfidence,
-        )
+        .setCachedClassification(token, currentIemLabel, currentIemConfidence)
         .catch(() => {});
 
       if (authMode === "session" && sessionContext) {
@@ -1306,7 +1403,7 @@ chatRouter.post(
         "BUDGET_EXCEEDED",
         402,
         authMode === "session",
-        machineId
+        machineId,
       ).catch(() => {});
       if (body.stream) {
         return streamSSE(c, async (stream) => {
@@ -1360,7 +1457,9 @@ chatRouter.post(
         // verbose: true, //stress test
       } as any);
       const mainLlmDuration = performance.now() - mainLlmStart;
-      console.log(`[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`);
+      console.log(
+        `[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`,
+      );
     } catch (err: any) {
       console.error("[Proxy] Upstream connection failed:", err.message);
       logGlobal({
@@ -1379,7 +1478,7 @@ chatRouter.post(
         "UPSTREAM_CONNECTION_FAILED",
         502,
         authMode === "session",
-        machineId
+        machineId,
       ).catch(() => {});
       return c.json(
         { error: `Connection to upstream provider failed: ${err.message}` },
@@ -1411,7 +1510,7 @@ chatRouter.post(
         "UPSTREAM_ERROR_STATUS",
         response.status,
         authMode === "session",
-        machineId
+        machineId,
       ).catch(() => {});
       return c.text(errBody, response.status as any);
     }
@@ -1484,7 +1583,9 @@ chatRouter.post(
         const outputSafetyStart = performance.now();
         const outputSafety = await checkText(content);
         const outputSafetyDuration = performance.now() - outputSafetyStart;
-        console.log(`[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`);
+        console.log(
+          `[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`,
+        );
         if (!outputSafety.allowed && outputSafety.violation) {
           const v = outputSafety.violation;
           await logStudentError(
@@ -1497,7 +1598,7 @@ chatRouter.post(
             v.code,
             400,
             authMode === "session",
-            machineId
+            machineId,
           ).catch(() => {});
           return c.json(
             { error: { message: v.message, code: v.code, type: v.type } },
@@ -1562,7 +1663,8 @@ chatRouter.post(
         classifierConfidence,
         responseData.choices?.[0]?.message?.tool_calls,
         authMode === "session",
-        machineId
+        machineId,
+        activeConversationId,
       ).catch((err) =>
         console.error("[Logger] Non-stream logging error:", err),
       );
@@ -1637,8 +1739,11 @@ chatRouter.post(
           const outputSafetyStart = performance.now();
           const checkPromise = checkText(completionText)
             .then(async (outputSafety) => {
-              const outputSafetyDuration = performance.now() - outputSafetyStart;
-              console.log(`[Perf] Asynchronous output safety check completed in ${outputSafetyDuration.toFixed(0)}ms`);
+              const outputSafetyDuration =
+                performance.now() - outputSafetyStart;
+              console.log(
+                `[Perf] Asynchronous output safety check completed in ${outputSafetyDuration.toFixed(0)}ms`,
+              );
               if (!outputSafety.allowed && outputSafety.violation) {
                 wasBlockedByGuardrail = true;
                 const v = outputSafety.violation;
@@ -1656,7 +1761,7 @@ chatRouter.post(
                   v.code,
                   400,
                   authMode === "session",
-                  machineId
+                  machineId,
                 ).catch(() => {});
 
                 const errorChunk = {
@@ -1729,7 +1834,9 @@ chatRouter.post(
         receivedChunks++;
         if (receivedChunks === 1) {
           const ttft = performance.now() - startTime;
-          console.log(`[Perf] Time to first token (TTFT): ${ttft.toFixed(0)}ms (including input safety check)`);
+          console.log(
+            `[Perf] Time to first token (TTFT): ${ttft.toFixed(0)}ms (including input safety check)`,
+          );
         }
 
         if (trimmed === "data: [DONE]") {
@@ -2009,7 +2116,8 @@ chatRouter.post(
           classifierConfidence,
           streamToolCalls.filter(Boolean),
           authMode === "session",
-          machineId
+          machineId,
+          activeConversationId,
         ).catch((err) => console.error("[Logger] Stream logging error:", err));
       }
     });

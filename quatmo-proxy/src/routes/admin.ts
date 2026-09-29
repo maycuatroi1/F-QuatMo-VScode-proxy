@@ -734,9 +734,179 @@ adminRouter.get("/students", async (c) => {
       createdBy: account.createdBy || "admin",
       updatedAt: account.updatedAt,
       updatedBy: account.updatedBy || "admin",
+      isDeleted: !!account.isDeleted,
+      deletedAt: account.deletedAt || null,
     });
   }
   return c.json({ success: true, students: list });
+});
+
+adminRouter.delete("/students/:studentId", async (c) => {
+  const caller = requireCaller(c);
+  const studentId = c.req.param("studentId").toUpperCase();
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  let targetKey: string | null = null;
+  let targetAccount: StudentAccount | null = null;
+
+  for (const [key, acc] of studentAccounts.entries()) {
+    if (acc.studentId.toUpperCase() === studentId) {
+      const creator = (acc.createdBy || "admin").toLowerCase();
+      if (callerRole === "admin" || creator === callerUser) {
+        targetKey = key;
+        targetAccount = acc;
+        break;
+      }
+    }
+  }
+
+  if (!targetAccount || !targetKey) {
+    return c.json(
+      { error: `User with ID ${studentId} not found or not authorized.` },
+      404,
+    );
+  }
+
+  // Check if student has ever been linked to any session
+  const isLinkedToAnySession =
+    Array.from(sessions.values()).some((s) => s.allowedStudentIds?.has(studentId)) ||
+    Array.from(sessionStates.values()).some((st) => st.studentId?.toUpperCase() === studentId);
+
+  if (isLinkedToAnySession) {
+    // Soft Delete (Deactivate) to preserve audit trails & exam data
+    targetAccount.isDeleted = true;
+    targetAccount.deletedAt = Date.now();
+    targetAccount.updatedAt = Date.now();
+    targetAccount.updatedBy = caller.username;
+    studentAccounts.set(targetKey, targetAccount);
+
+    return c.json({
+      success: true,
+      action: "soft_deleted",
+      message: `Tài khoản ${studentId} đã từng tham gia kỳ thi nên đã được tạm khóa để bảo toàn dữ liệu.`,
+      studentId,
+    });
+  } else {
+    // Hard Delete: Never participated in any session, no exam records or state
+    studentAccounts.delete(targetKey);
+
+    // Also remove from any studentGroups if present
+    for (const [gKey, group] of studentGroups.entries()) {
+      if (group.userIds && group.userIds.some((uid) => uid.toUpperCase() === studentId)) {
+        group.userIds = group.userIds.filter((uid) => uid.toUpperCase() !== studentId);
+        group.updatedAt = Date.now();
+        group.updatedBy = caller.username;
+        studentGroups.set(gKey, group);
+      }
+    }
+
+    return c.json({
+      success: true,
+      action: "hard_deleted",
+      message: `Tài khoản ${studentId} chưa từng tham gia kỳ thi nào và đã được xóa vĩnh viễn khỏi hệ thống.`,
+      studentId,
+    });
+  }
+});
+
+adminRouter.post("/students/:studentId/restore", async (c) => {
+  const caller = requireCaller(c);
+  const studentId = c.req.param("studentId").toUpperCase();
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  let targetKey: string | null = null;
+  let targetAccount: StudentAccount | null = null;
+
+  for (const [key, acc] of studentAccounts.entries()) {
+    if (acc.studentId.toUpperCase() === studentId) {
+      const creator = (acc.createdBy || "admin").toLowerCase();
+      if (callerRole === "admin" || creator === callerUser) {
+        targetKey = key;
+        targetAccount = acc;
+        break;
+      }
+    }
+  }
+
+  if (!targetAccount || !targetKey) {
+    return c.json(
+      { error: `User with ID ${studentId} not found or not authorized.` },
+      404,
+    );
+  }
+
+  targetAccount.isDeleted = false;
+  targetAccount.deletedAt = null;
+  targetAccount.updatedAt = Date.now();
+  targetAccount.updatedBy = caller.username;
+
+  studentAccounts.set(targetKey, targetAccount);
+
+  return c.json({
+    success: true,
+    message: `User ${studentId} has been restored successfully.`,
+    studentId,
+  });
+});
+
+adminRouter.post("/students/bulk-delete", async (c) => {
+  const caller = requireCaller(c);
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  const body = await c.req.json();
+  const { studentIds } = body as { studentIds?: string[] };
+  if (!Array.isArray(studentIds) || studentIds.length === 0) {
+    return c.json({ error: "studentIds array is required." }, 400);
+  }
+
+  let softDeletedCount = 0;
+  let hardDeletedCount = 0;
+  const now = Date.now();
+
+  for (const rawId of studentIds) {
+    const studentId = String(rawId).trim().toUpperCase();
+    for (const [key, acc] of studentAccounts.entries()) {
+      if (acc.studentId.toUpperCase() === studentId) {
+        const creator = (acc.createdBy || "admin").toLowerCase();
+        if (callerRole === "admin" || creator === callerUser) {
+          const isLinked =
+            Array.from(sessions.values()).some((s) => s.allowedStudentIds?.has(studentId)) ||
+            Array.from(sessionStates.values()).some((st) => st.studentId?.toUpperCase() === studentId);
+
+          if (isLinked) {
+            acc.isDeleted = true;
+            acc.deletedAt = now;
+            acc.updatedAt = now;
+            acc.updatedBy = caller.username;
+            studentAccounts.set(key, acc);
+            softDeletedCount++;
+          } else {
+            studentAccounts.delete(key);
+            for (const [gKey, group] of studentGroups.entries()) {
+              if (group.userIds && group.userIds.some((uid) => uid.toUpperCase() === studentId)) {
+                group.userIds = group.userIds.filter((uid) => uid.toUpperCase() !== studentId);
+                group.updatedAt = Date.now();
+                group.updatedBy = caller.username;
+                studentGroups.set(gKey, group);
+              }
+            }
+            hardDeletedCount++;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return c.json({
+    success: true,
+    message: `Đã xử lý ${softDeletedCount + hardDeletedCount} tài khoản (${softDeletedCount} tạm khóa, ${hardDeletedCount} xóa vĩnh viễn).`,
+    softDeletedCount,
+    hardDeletedCount,
+  });
 });
 
 // ─── SESSION ENDPOINTS ───────────────────────────────────────────────────────
@@ -914,6 +1084,17 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     );
   }
 
+  // Authorization: admin or creator of session
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only update sessions created by you." },
+      403,
+    );
+  }
+
   const body = await c.req.json();
   const {
     durationMinutes,
@@ -926,6 +1107,7 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     examQuestions,
     runtimeConfig,
     assignedGroups,
+    allowedStudentIds,
     createdBy,
   } = body as any;
 
@@ -950,9 +1132,93 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     session.promptMode = promptMode as SessionPromptMode;
   }
   if (Array.isArray(examQuestions)) session.examQuestions = examQuestions;
-  if (Array.isArray(assignedGroups)) session.assignedGroups = assignedGroups;
   if (runtimeConfig && typeof runtimeConfig === "object")
     session.runtimeConfig = runtimeConfig;
+
+  // Flexible Assigned Groups
+  if (Array.isArray(assignedGroups)) {
+    session.assignedGroups = assignedGroups;
+    for (const gName of assignedGroups) {
+      const gMapKey = `${gName}:${(session.createdBy || "admin").toLowerCase()}`;
+      const group =
+        studentGroups.get(gMapKey) || studentGroups.get(`${gName}:admin`);
+      if (group && Array.isArray(group.userIds)) {
+        for (const uid of group.userIds) {
+          const upperUid = uid.toUpperCase();
+          session.allowedStudentIds.add(upperUid);
+          const stateKey = `${sessionCode}:${upperUid}`;
+          if (!sessionStates.has(stateKey)) {
+            sessionStates.set(stateKey, {
+              sessionCode,
+              studentId: upperUid,
+              hasLoggedIn: false,
+              loginTimestamp: 0,
+              tokensConsumed: 0,
+              reassigned: false,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Flexible Allowed Students Management
+  if (Array.isArray(allowedStudentIds)) {
+    const newIdSet = new Set(
+      allowedStudentIds
+        .map((id: string) => String(id).trim().toUpperCase())
+        .filter(Boolean),
+    );
+
+    // Also include members of assigned groups if any
+    if (Array.isArray(session.assignedGroups)) {
+      for (const gName of session.assignedGroups) {
+        const gMapKey = `${gName}:${(session.createdBy || "admin").toLowerCase()}`;
+        const group =
+          studentGroups.get(gMapKey) || studentGroups.get(`${gName}:admin`);
+        if (group && Array.isArray(group.userIds)) {
+          for (const uid of group.userIds) {
+            newIdSet.add(uid.toUpperCase());
+          }
+        }
+      }
+    }
+
+    // Always preserve students who have already joined/logged in
+    for (const state of sessionStates.values()) {
+      if (state.sessionCode === sessionCode && state.hasLoggedIn) {
+        newIdSet.add(state.studentId);
+      }
+    }
+
+    // Clean up state for removed students who NEVER logged in
+    for (const oldId of session.allowedStudentIds) {
+      if (!newIdSet.has(oldId)) {
+        const stateKey = `${sessionCode}:${oldId}`;
+        const state = sessionStates.get(stateKey);
+        if (!state?.hasLoggedIn) {
+          sessionStates.delete(stateKey);
+        }
+      }
+    }
+
+    // Initialize state for newly added students
+    for (const newId of newIdSet) {
+      const stateKey = `${sessionCode}:${newId}`;
+      if (!sessionStates.has(stateKey)) {
+        sessionStates.set(stateKey, {
+          sessionCode,
+          studentId: newId,
+          hasLoggedIn: false,
+          loginTimestamp: 0,
+          tokensConsumed: 0,
+          reassigned: false,
+        });
+      }
+    }
+
+    session.allowedStudentIds = newIdSet;
+  }
 
   if (
     caller.role === "admin" &&
@@ -975,6 +1241,132 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
     },
   });
 });
+
+// DELETE Session endpoint (permitted ONLY if no one has joined)
+adminRouter.delete("/sessions/:sessionCode", async (c) => {
+  const caller = requireCaller(c);
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
+
+  // Authorization: admin or creator of session
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only delete sessions created by you." },
+      403,
+    );
+  }
+
+  // Condition: Check if any student has joined the session
+  const hasAnyoneJoined = Array.from(sessionStates.values()).some(
+    (state) => state.sessionCode === sessionCode && state.hasLoggedIn,
+  );
+
+  if (hasAnyoneJoined) {
+    return c.json(
+      {
+        error: `Cannot delete session ${sessionCode} because one or more students have already joined this session.`,
+      },
+      400,
+    );
+  }
+
+  // Check Redis for active session states
+  if (redis && redis.status === "ready") {
+    try {
+      const keys = await redis.keys(`session:user:${sessionCode}:*`);
+      for (const k of keys) {
+        const val = await redis.hget(k, "hasLoggedIn");
+        if (val === "true") {
+          return c.json(
+            {
+              error: `Cannot delete session ${sessionCode} because active student records exist in Redis.`,
+            },
+            400,
+          );
+        }
+      }
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } catch (err) {
+      console.warn(`[Admin] Redis cleanup warning on session delete:`, err);
+    }
+  }
+
+  // Delete session from store (which cascades delete in SQLite and session_states)
+  sessions.delete(sessionCode);
+
+  return c.json({
+    success: true,
+    message: `Session ${sessionCode} deleted successfully.`,
+    sessionCode,
+  });
+});
+
+// DELETE Student from Session (permitted if student has not joined yet)
+adminRouter.delete(
+  "/sessions/:sessionCode/students/:studentId",
+  async (c) => {
+    const caller = requireCaller(c);
+    const sessionCode = c.req.param("sessionCode").toUpperCase();
+    const studentId = c.req.param("studentId").toUpperCase();
+    const session = sessions.get(sessionCode);
+
+    if (!session) {
+      return c.json(
+        { error: `Session with code ${sessionCode} not found.` },
+        404,
+      );
+    }
+
+    if (
+      caller.role !== "admin" &&
+      (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
+    ) {
+      return c.json(
+        { error: "Unauthorized. You can only manage sessions created by you." },
+        403,
+      );
+    }
+
+    const stateKey = `${sessionCode}:${studentId}`;
+    const state = sessionStates.get(stateKey);
+
+    if (state?.hasLoggedIn) {
+      return c.json(
+        {
+          error: `Cannot remove student ${studentId} because they have already joined this session.`,
+        },
+        400,
+      );
+    }
+
+    session.allowedStudentIds.delete(studentId);
+    session.updatedAt = Date.now();
+    session.updatedBy = caller.username;
+    sessions.set(sessionCode, session);
+
+    if (state) {
+      sessionStates.delete(stateKey);
+    }
+
+    return c.json({
+      success: true,
+      message: `Removed student ${studentId} from session ${sessionCode}.`,
+      totalStudents: session.allowedStudentIds.size,
+    });
+  },
+);
 
 adminRouter.post("/sessions/:sessionCode/students", async (c) => {
   const caller = requireCaller(c);

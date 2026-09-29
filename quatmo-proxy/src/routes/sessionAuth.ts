@@ -480,6 +480,15 @@ sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
     );
   }
 
+  if (account.isDeleted) {
+    return c.json(
+      {
+        error: `Student account for ${studentId} has been deactivated.`,
+      },
+      403,
+    );
+  }
+
   let bearerAuthenticated = false;
   if (bearerStudentId && bearerStudentId.trim().toUpperCase() === studentId) {
     const isPasswordStillFresh =

@@ -379,18 +379,16 @@ export function calculateProgrammaticFeatures(
 
   // t9: minimal_effort_between_turns (weight: 0.55)
   let t9Activation = 0;
-  if (timeDeltaSeconds > 0 && timeDeltaSeconds < 15) {
+  if (timeDeltaSeconds > 0 && timeDeltaSeconds < 12) {
     const hasAiCode =
       lastTurn && extractCodeBlocks(lastTurn.response).trim().length > 0;
     if (hasAiCode) {
-      t9Activation = timeDeltaSeconds < 8 ? 1.0 : 0.5;
+      t9Activation = 1;
     }
   }
   features["t9"] = t9Activation;
 
   // t10: recurring_delegate_across_session (weight: 0.75)
-  // Programmatic detection of explicit delegation directives across the sliding window.
-  // Blended with LLM semantic evaluation via PROG_TRUST[t10] = 0.35.
   const delegatePatterns = [
     /\b(write|generate|create|implement)\b.{0,30}\b(for me|code for me|it for me|solution for me)\b/i,
     /\bwrite (?:it|this|the code|a solution|the solution) for me\b/i,
@@ -407,8 +405,7 @@ export function calculateProgrammaticFeatures(
   const delegatedTurnCount = windowPrompts.filter((turnPrompt) =>
     delegatePatterns.some((pattern) => pattern.test(turnPrompt)),
   ).length;
-  const t10Activation =
-    delegatedTurnCount >= 3 ? 1.0 : delegatedTurnCount === 2 ? 0.75 : delegatedTurnCount === 1 ? 0.25 : 0;
+  const t10Activation = delegatedTurnCount >= 2 ? 1 : 0;
   features["t10"] = t10Activation;
 
   // ─────────────────────────────────────────────────────────────────
@@ -421,15 +418,12 @@ export function calculateProgrammaticFeatures(
     const lastAiCode = extractCodeBlocks(lastTurn.response);
     if (lastAiCode.trim().length > 0) {
       const ratio = fastLineLCS(lastAiCode, clientContext.activeFile.content);
-      if (ratio >= 0.85) c6Activation = 1.0;
-      else if (ratio >= 0.50) c6Activation = 0.5;
-      else if (ratio >= 0.20) c6Activation = 0.25;
+      if (ratio >= 0.70) c6Activation = 1;
     }
   }
   features["c6"] = c6Activation;
 
   // c7: single_large_jump (weight: 0.90)
-  // Signal: code went from nearly empty to nearly complete in one turn
   let c7Activation = 0;
   if (clientContext?.activeFile?.content) {
     const studentLines = clientContext.activeFile.content
@@ -438,14 +432,12 @@ export function calculateProgrammaticFeatures(
       .split(/\r?\n/).filter((l) => l.trim().length > 0).length;
     const linesAdded = studentLines - prevLines;
     if (linesAdded > 40 && prevLines < 15) {
-      c7Activation = linesAdded > 80 ? 1.0 : 0.75;
+      c7Activation = 1;
     }
   }
   features["c7"] = c7Activation;
 
   // c8: structural_identity_with_ai (weight: 0.85)
-  // Signal: after stripping identifiers/values, student code skeleton matches AI output
-  // Catches copy-with-renaming: same logic, different variable names
   let c8Activation = 0;
   if (lastTurn && clientContext?.activeFile?.content) {
     const lastAiCode8 = extractCodeBlocks(lastTurn.response);
@@ -454,73 +446,48 @@ export function calculateProgrammaticFeatures(
       const normStudent = normalizeCodeStructure(clientContext.activeFile.content);
       if (normAi.length > 0 && normStudent.length > 0) {
         const structRatio = fastLineLCS(normAi, normStudent);
-        if (structRatio >= 0.80) c8Activation = 1.0;
-        else if (structRatio >= 0.60) c8Activation = 0.75;
-        else if (structRatio >= 0.40) c8Activation = 0.50;
-        else if (structRatio >= 0.20) c8Activation = 0.25;
+        if (structRatio >= 0.65) c8Activation = 1;
       }
     }
   }
   features["c8"] = c8Activation;
 
   // c9: no_intermediate_edits (weight: 0.80)
-  // Signal: current code ≈ last snapshot + AI paste, no real student editing in between
-  // Two-signal heuristic: stasis (code barely changed) + high exact-copy ratio
   let c9Activation = 0;
   const c6Val = features["c6"] ?? 0;
   if (lastTurn?.codeSnapshot && clientContext?.activeFile?.content) {
     const stasisRatio = fastLineLCS(lastTurn.codeSnapshot, clientContext.activeFile.content);
-    if (stasisRatio >= 0.90 && c6Val >= 0.70) {
-      // Code nearly unchanged from last snapshot AND matches AI closely
-      c9Activation = 1.0;
-    } else if (stasisRatio >= 0.75 && c6Val >= 0.50) {
-      c9Activation = 0.75;
-    } else if (c6Val >= 0.70 && timeDeltaSeconds < 20) {
-      // High copy + very short time between turns
-      c9Activation = timeDeltaSeconds < 10 ? 0.75 : 0.50;
+    if (stasisRatio >= 0.80 && c6Val === 1) {
+      c9Activation = 1;
+    } else if (c6Val === 1 && timeDeltaSeconds > 0 && timeDeltaSeconds < 15) {
+      c9Activation = 1;
     }
-  } else if (c6Val >= 0.85 && timeDeltaSeconds > 0 && timeDeltaSeconds < 10) {
-    // Fallback: near-perfect copy + nearly instant re-prompt
-    c9Activation = 0.50;
+  } else if (c6Val === 1 && timeDeltaSeconds > 0 && timeDeltaSeconds < 10) {
+    c9Activation = 1;
   }
   features["c9"] = c9Activation;
 
   // c10: zero_own_test_activity (weight: 0.65)
-  // Signal: no evidence of test/execution output in any window prompt or IDE terminal.
-  // Ground truth: When IDE terminal telemetry is present, actual script executions and test
-  // runs are directly tracked.
   const testEvidencePatterns = [
-    // Python full traceback — very specific, almost never false-positive
     /traceback \(most recent call last\)/i,
-    // Python exception lines with file/line context (only appears in real tracebacks)
     /File "[^"]+", line \d+/,
-    // Pytest/unittest result summary (specific format: "X failed", "X passed")
     /\b\d+\s+(?:failed|passed|error)(?:\s+in\s+[\d.]+s)?\b/i,
-    // Python assertion output: "AssertionError: X != Y"
     /\bassertionerror:\s*.+/i,
-    // Python REPL prompt at START of line only (prevents matching inside strings)
     /^\s*>>>\s+\S/m,
-    // Output section explicitly labeled (e.g. "Output:\n5\n")
     /\boutput\s*:\s*\n\s*\S/i,
-    // Test case format used in competitive programming judges
     /\btest case \d+:\s*(?:passed|failed|wrong)/i,
   ];
 
   const terminalExecutionPatterns = [
-    // Commands running scripts or tests:
     /(?:^|\n|\$|>)\s*(?:python[0-9.]*|py|pytest|unittest|node|bun|ts-node|npm test|cargo test|go test|javac|java)\b/i,
-    // Python traceback:
     /traceback \(most recent call last\)/i,
     /File "[^"]+", line \d+/,
-    // Test execution summary:
     /\b\d+\s+(?:failed|passed|error)(?:\s+in\s+[\d.]+s)?\b/i,
     /\bRan \d+ tests? in [\d.]+s/i,
     /\bOK(?:\s*\(.*?\))?$/m,
     /\bFAILED\s*\(.*?\)/i,
-    // Assertion or common runtime exceptions:
     /\bassertionerror:\s*.+/i,
     /\b(?:syntaxerror|nameerror|typeerror|indexerror|valueerror|zerodivisionerror|attributeerror):\s*.+/i,
-    // Process exit indicator from TerminalTracker:
     /\[Process exited with code \d+\]/i,
     /\btest case \d+:\s*(?:passed|failed|wrong)/i,
   ];
@@ -572,23 +539,9 @@ export function calculateProgrammaticFeatures(
     features["c10"] = 0;
   } else if (hasTerminalTelemetry) {
     features["_hasTerminalTelemetry"] = 1;
-    // With IDE telemetry, confirmation of zero test activity across turns is ground truth.
-    features["c10"] = hasTestEvidence
-      ? 0
-      : recentTurns.length >= 3
-        ? 1.0
-        : recentTurns.length >= 2
-          ? 0.75
-          : recentTurns.length >= 1
-            ? 0.50
-            : 0.25;
+    features["c10"] = (!hasTestEvidence && recentTurns.length >= 2) ? 1 : 0;
   } else {
-    // Legacy prompt-scan fallback without IDE telemetry (capped at 0.50, only after multiple turns with code)
-    features["c10"] = hasTestEvidence
-      ? 0
-      : recentTurns.length >= 3
-        ? 0.50
-        : 0;
+    features["c10"] = (!hasTestEvidence && recentTurns.length >= 3) ? 1 : 0;
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -596,8 +549,6 @@ export function calculateProgrammaticFeatures(
   // ─────────────────────────────────────────────────────────────────
 
   // c1: high_student_modification_ratio (weight: 0.85)
-  // Signal: current code has significant portions NOT from any AI response in window
-  // Computation: 1 - max(LCS(aiResponse_i, currentCode)) over all window AI responses
   let c1Activation = 0;
   if (clientContext?.activeFile?.content) {
     const studentCode = clientContext.activeFile.content;
@@ -610,20 +561,14 @@ export function calculateProgrammaticFeatures(
         ...allAiCodeBlocks.map((aiCode) => fastLineLCS(aiCode, studentCode)),
       );
       const studentOwnRatio = 1 - maxLcsRatio;
-      if (studentOwnRatio >= 0.75) c1Activation = 1.0;
-      else if (studentOwnRatio >= 0.50) c1Activation = 0.75;
-      else if (studentOwnRatio >= 0.30) c1Activation = 0.50;
-      else if (studentOwnRatio >= 0.10) c1Activation = 0.25;
+      if (studentOwnRatio >= 0.50) c1Activation = 1;
     } else {
-      // No AI code in window → all student's own work
-      c1Activation = 1.0;
+      c1Activation = 1;
     }
   }
   features["c1"] = c1Activation;
 
   // c2: incremental_small_step_changes (weight: 0.75)
-  // Signal: code grows in small, steady increments → consistent with guided effort
-  // Computation: average absolute line-delta between consecutive turn snapshots
   let c2Activation = 0;
   const snapshots = recentTurns
     .filter((t) => t.codeSnapshot && t.codeSnapshot.trim().length > 0)
@@ -635,17 +580,11 @@ export function calculateProgrammaticFeatures(
       deltas.push(Math.abs(snapshots[i] - snapshots[i - 1]));
     }
     const avgDelta = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-    if (avgDelta <= 8) c2Activation = 1.0;
-    else if (avgDelta <= 15) c2Activation = 0.75;
-    else if (avgDelta <= 25) c2Activation = 0.50;
-    else if (avgDelta <= 40) c2Activation = 0.25;
-    // avgDelta > 40 → 0 (large jumps, not incremental)
+    if (avgDelta <= 15) c2Activation = 1;
   }
   features["c2"] = c2Activation;
 
   // c3: structural_divergence_from_ai (weight: 0.70)
-  // Signal: student's function/class signatures differ from the last AI suggestion
-  // Indicates student restructured the solution rather than copying structure verbatim
   let c3Activation = 0;
   if (lastTurn && clientContext?.activeFile?.content) {
     const lastAiCode3 = extractCodeBlocks(lastTurn.response);
@@ -658,13 +597,9 @@ export function calculateProgrammaticFeatures(
         const intersection = [...aiSet].filter((s) => studentSet.has(s)).length;
         const unionSize = Math.max(aiSet.size, studentSet.size);
         const divergenceRatio = unionSize > 0 ? 1 - intersection / unionSize : 0;
-        if (divergenceRatio >= 0.70) c3Activation = 1.0;
-        else if (divergenceRatio >= 0.45) c3Activation = 0.75;
-        else if (divergenceRatio >= 0.25) c3Activation = 0.50;
-        else if (divergenceRatio >= 0.10) c3Activation = 0.25;
+        if (divergenceRatio >= 0.45) c3Activation = 1;
       } else if (aiSigs.length === 0 && studentSigs.length > 0) {
-        // AI gave no named functions but student has own structure → diverged
-        c3Activation = 0.50;
+        c3Activation = 1;
       }
     }
   }
@@ -747,22 +682,22 @@ export function blendFeatures(
     const hasP = key in programmatic;
 
     if (hasP && !hasS) {
-      // Programmatic-only (c6, c7, t9) — pass through
-      result[key] = programmatic[key];
+      // Programmatic-only (c6, c7, t9) — pass through binary
+      result[key] = (programmatic[key] ?? 0) >= 0.5 ? 1 : 0;
     } else if (hasS && !hasP) {
-      // LLM-only (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5) — pass through
-      result[key] = semantic[key];
+      // LLM-only (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5) — pass through binary
+      result[key] = (semantic[key] ?? 0) >= 0.5 ? 1 : 0;
     } else {
-      // Both sources available — weighted blend
+      // Both sources available — weighted blend with binary threshold
       let progTrust = PROG_TRUST[key] ?? 0.50; // default 50/50 for unknown features
       if (key === "c10" && programmatic["_hasTerminalTelemetry"]) {
         progTrust = 0.85; // High confidence when terminal telemetry is present
       }
-      const pVal = programmatic[key];
-      const sVal = semantic[key];
+      const pVal = (programmatic[key] ?? 0) >= 0.5 ? 1 : 0;
+      const sVal = (semantic[key] ?? 0) >= 0.5 ? 1 : 0;
       const blended = Math.min(1.0, Math.max(0.0, progTrust * pVal + (1 - progTrust) * sVal));
-      result[key] = blended;
-      debugLog?.(key, pVal, sVal, blended);
+      result[key] = blended >= 0.5 ? 1 : 0;
+      debugLog?.(key, pVal, sVal, result[key]);
     }
   }
 

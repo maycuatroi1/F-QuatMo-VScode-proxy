@@ -20,6 +20,8 @@ export interface StudentAccount {
   createdBy?: string;
   updatedAt?: number;
   updatedBy?: string;
+  isDeleted?: boolean;
+  deletedAt?: number | null;
 }
 
 export interface ExamQuestion {
@@ -154,6 +156,8 @@ try { db.run("ALTER TABLE student_accounts ADD COLUMN created_by TEXT NOT NULL D
 try { db.run("ALTER TABLE student_accounts ADD COLUMN created_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN is_deleted INTEGER DEFAULT 0"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN deleted_at INTEGER"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -270,8 +274,8 @@ const stmtDeleteLecturer = db.prepare(`
 `);
 
 const stmtSaveStudent = db.prepare(`
-  INSERT OR REPLACE INTO student_accounts (student_id, created_by, password_hash, created_at, updated_at, updated_by)
-  VALUES ($id, $created_by, $hash, $created_at, $updated_at, $updated_by)
+  INSERT OR REPLACE INTO student_accounts (student_id, created_by, password_hash, created_at, updated_at, updated_by, is_deleted, deleted_at)
+  VALUES ($id, $created_by, $hash, $created_at, $updated_at, $updated_by, $is_deleted, $deleted_at)
 `);
 
 const stmtDeleteStudent = db.prepare(`
@@ -349,6 +353,8 @@ export class PersistedStudentAccounts extends Map<string, StudentAccount> {
       $created_at: accToStore.createdAt || now,
       $updated_at: accToStore.updatedAt || now,
       $updated_by: accToStore.updatedBy || creator,
+      $is_deleted: accToStore.isDeleted ? 1 : 0,
+      $deleted_at: accToStore.deletedAt || null,
     });
     return this;
   }
@@ -637,6 +643,8 @@ try {
       createdBy: creator,
       updatedAt: r.updated_at || r.created_at || 0,
       updatedBy: r.updated_by || "admin",
+      isDeleted: r.is_deleted === 1,
+      deletedAt: r.deleted_at || null,
     });
   }
 

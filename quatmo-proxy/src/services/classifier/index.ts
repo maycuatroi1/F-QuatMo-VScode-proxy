@@ -315,14 +315,18 @@ export async function evaluateTurnAndSession(
     const iTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(INSTRUMENTAL_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      iTurnValues.push(act * weight);
+      if (act >= 0.5) {
+        iTurnValues.push(weight);
+      }
     }
     const I_score_Ti = calculateSignalScore(iTurnValues);
 
     const eTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(EXECUTIVE_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      eTurnValues.push(act * weight);
+      if (act >= 0.5) {
+        eTurnValues.push(weight);
+      }
     }
     const E_score_Ti = calculateSignalScore(eTurnValues);
 
@@ -438,37 +442,42 @@ export async function evaluateTurnAndSession(
         }
       }
       if (fs.existsSync(logFilePath)) {
-        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
-        const logs = JSON.parse(fileContent);
-        if (logs.length > 0) {
-          const targetEntry =
-            logs.slice().reverse().find((e: any) => e.prompt === prompt) ||
-            logs[logs.length - 1];
-          targetEntry.classification = {
-            ...(targetEntry.classification || {}),
-            label: overallLabel,
-            overallLabel,
-            currentLabel,
-            trendLabel: overallLabel,
-            confidence,
-            iScoreS: I_score_S,
-            eScoreS: E_score_S,
-            iScoreTurn: I_score_Ti,
-            eScoreTurn: E_score_Ti,
-            windowSize: windowTurns.length,
-            summary: `currentLabel: ${currentLabel} | overallLabel: ${overallLabel} | I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)}`,
-            features: combinedFeatures,
-          };
-          targetEntry.featureVector = combinedFeatures;
-          await fs.promises.writeFile(
-            logFilePath,
-            JSON.stringify(logs, null, 2),
-            "utf-8",
-          );
-          console.log(
-            `[Evaluator] Updated local JSON log file for ${safeStudentId} with currentLabel: ${currentLabel} | overallLabel (top5): ${overallLabel}`,
-          );
-        }
+        await withFileLock(logFilePath, async () => {
+          const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+          const logs = JSON.parse(fileContent);
+          if (logs.length > 0) {
+            const targetEntry =
+              logs.slice().reverse().find((e: any) => e.prompt === prompt) ||
+              logs[logs.length - 1];
+            targetEntry.classification = {
+              ...(targetEntry.classification || {}),
+              label: overallLabel,
+              overallLabel,
+              currentLabel,
+              trendLabel: overallLabel,
+              confidence,
+              iScoreS: I_score_S,
+              eScoreS: E_score_S,
+              iScoreTurn: I_score_Ti,
+              eScoreTurn: E_score_Ti,
+              windowSize: windowTurns.length,
+              summary: `currentLabel: ${currentLabel} | overallLabel: ${overallLabel} | I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)}`,
+              features: combinedFeatures,
+            };
+            targetEntry.featureVector = combinedFeatures;
+            if (conversationId && !targetEntry.conversationId) {
+              targetEntry.conversationId = conversationId;
+            }
+            await fs.promises.writeFile(
+              logFilePath,
+              JSON.stringify(logs, null, 2),
+              "utf-8",
+            );
+            console.log(
+              `[Evaluator] Updated local JSON log file for ${safeStudentId} with currentLabel: ${currentLabel} | overallLabel (top5): ${overallLabel}${conversationId ? ` [Conv: ${conversationId}]` : ""}`,
+            );
+          }
+        });
       }
     } catch (logErr) {
       console.error(
@@ -496,10 +505,29 @@ export async function evaluateTurnAndSession(
   }
 }
 
+const fileLocks = new Map<string, Promise<void>>();
+export async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  const current = fileLocks.get(filePath) || Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  fileLocks.set(filePath, current.then(() => next));
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release!();
+    if (fileLocks.get(filePath) === next) {
+      fileLocks.delete(filePath);
+    }
+  }
+}
+
 /**
- * Enqueues turn evaluation into the Bounded Concurrency Controller.
- * If the system is under high CCU load or queue latency exceeds threshold,
- * it automatically executes via Fast-Track Heuristics with zero timeout.
+ * Enqueues turn evaluation into the Keyed FIFO Concurrency Controller.
+ * Ensures turns for the same student are processed in strict causal sequence,
+ * while independent students run concurrently in parallel.
  */
 export function queueEvaluation(
   sessionCode: string,
@@ -510,7 +538,8 @@ export function queueEvaluation(
   history: Array<{ role: string; content: string }>,
   conversationId?: string,
 ): Promise<EvaluationResult | null> {
-  return classifierConcurrencyController.enqueue((isFastTrack) =>
+  const clientKey = `${(sessionCode || "DEFAULT").toUpperCase()}:${(studentId || "DEFAULT_USER").toUpperCase()}`;
+  return classifierConcurrencyController.enqueue(clientKey, (isFastTrack) =>
     evaluateTurnAndSession(
       sessionCode,
       studentId,
