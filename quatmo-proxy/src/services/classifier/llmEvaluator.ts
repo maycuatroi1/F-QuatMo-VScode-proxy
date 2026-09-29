@@ -123,7 +123,7 @@ export async function evaluateTurnSemanticFeatures(
               ];
               if (turn.terminalOutput) {
                 turnParts.push(
-                  `Terminal Activity: ${turn.lastTerminalCommand ? `(Command: ${turn.lastTerminalCommand}) ` : ""}\n\`\`\`\n${turn.terminalOutput.slice(-500)}\n\`\`\``,
+                  `Terminal Activity: ${turn.lastTerminalCommand ? `(Command: ${turn.lastTerminalCommand}) ` : ""}\n\`\`\`\n${turn.terminalOutput}\n\`\`\``,
                 );
               }
               return turnParts.join("\n");
@@ -131,7 +131,7 @@ export async function evaluateTurnSemanticFeatures(
             .join("\n\n")
         : history
             .map(
-              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content.slice(0, 1000)}`,
+              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content}`,
             )
             .join("\n\n");
 
@@ -166,7 +166,7 @@ export async function evaluateTurnSemanticFeatures(
         recentTerminal.lastCommand ? `Last Command: ${recentTerminal.lastCommand}` : "",
         recentTerminal.exitCode !== undefined ? `Exit Code: ${recentTerminal.exitCode}` : "",
         recentTerminal.output
-          ? `Output:\n\`\`\`\n${recentTerminal.output.slice(-1500)}\n\`\`\``
+          ? `Output:\n\`\`\`\n${recentTerminal.output}\n\`\`\``
           : "",
       ]
         .filter(Boolean)
@@ -190,27 +190,47 @@ export async function evaluateTurnSemanticFeatures(
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: payload },
-        ],
-        temperature: 0,
-      }),
-      signal: AbortSignal.timeout(
-        parseInt(process.env.CLASSIFIER_TIMEOUT_MS || "90000", 10),
-      ),
-    });
+    const timeoutMs = parseInt(
+      process.env.CLASSIFIER_TIMEOUT_MS || "90000",
+      10,
+    );
+    let lastError: any = null;
+    let responseText = "";
 
-    if (!res.ok) {
-      throw new Error(`LLM API returned status ${res.status}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(apiUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: payload },
+            ],
+            temperature: 0,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (!res.ok) {
+          throw new Error(`LLM API returned status ${res.status}`);
+        }
+
+        responseText = await res.text();
+        break;
+      } catch (err: any) {
+        lastError = err;
+        if (attempt < 2) {
+          console.warn(`[Classifier LLM] Attempt ${attempt} failed (${err.message}). Retrying in 1.5s...`);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
     }
 
-    const responseText = await res.text();
+    if (!responseText && lastError) {
+      throw lastError;
+    }
     console.log("[Classifier LLM] Raw Response Text:", responseText);
     let parsed: any = null;
 

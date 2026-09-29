@@ -85,16 +85,6 @@ export async function getStudentTopNClassification(
         iScoreS: I_score_S,
         eScoreS: E_score_S,
       };
-    } else if (conversationId) {
-      // If a specific conversationId is provided and has no turns, it is a brand new conversation!
-      // Must start fresh and not inherit previous conversations' scores.
-      return {
-        label: "mixed",
-        overallLabel: "mixed",
-        confidence: 0.5,
-        source: "new_conversation",
-        windowSize: 0,
-      };
     }
   } catch (err) {
     console.warn(
@@ -103,55 +93,6 @@ export async function getStudentTopNClassification(
     );
   }
 
-  // 2. Check sessionStates (in-memory SQLite persistent map)
-  try {
-    const state = sessionStates.get(stateKey);
-    if (state?.latestClassification && state.latestClassification !== "none") {
-      const norm = state.latestClassification.toLowerCase().trim();
-      if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
-        return {
-          label: norm as IemLabel,
-          overallLabel: norm as IemLabel,
-          confidence: 0.8,
-          source: "session_state",
-        };
-      }
-    }
-  } catch (err) {
-    console.warn(
-      "[Classifier] Failed to check sessionStates for top-N label:",
-      err,
-    );
-  }
-
-  // 3. Check cached classification in Redis / memory by token
-  if (token) {
-    try {
-      const cached = await redisStore.getCachedClassification(token);
-      if (cached?.label && cached.label !== "none") {
-        const norm = cached.label.toLowerCase().trim();
-        if (
-          norm === "instrumental" ||
-          norm === "executive" ||
-          norm === "mixed"
-        ) {
-          return {
-            label: norm as IemLabel,
-            overallLabel: norm as IemLabel,
-            confidence: cached.confidence || 0.8,
-            source: "cached_token",
-          };
-        }
-      }
-    } catch (err) {
-      console.warn(
-        "[Classifier] Failed to get cached classification for top-N label:",
-        err,
-      );
-    }
-  }
-
-  // 4. Fallback to student's saved JSON log file
   try {
     let logFilePath = path.resolve(
       process.cwd(),
@@ -172,8 +113,12 @@ export async function getStudentTopNClassification(
       const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
       const logs = JSON.parse(fileContent);
       if (Array.isArray(logs) && logs.length > 0) {
-        for (let i = logs.length - 1; i >= 0; i--) {
-          const entry = logs[i];
+        const matchingLogs = conversationId
+          ? logs.filter((e: any) => e.conversationId === conversationId)
+          : logs;
+
+        for (let i = matchingLogs.length - 1; i >= 0; i--) {
+          const entry = matchingLogs[i];
           const c = entry?.classification;
           const candidate = c?.trendLabel || c?.label || c?.currentLabel;
           if (candidate && candidate !== "none") {
@@ -189,6 +134,8 @@ export async function getStudentTopNClassification(
                 confidence:
                   typeof c?.confidence === "number" ? c.confidence : 0.8,
                 source: "log_history",
+                windowSize:
+                  typeof c?.windowSize === "number" ? c.windowSize : 1,
               };
             }
           }
@@ -199,12 +146,42 @@ export async function getStudentTopNClassification(
     console.warn("[Classifier] Failed to read log file for top-N label:", err);
   }
 
-  // 5. Default fallback if student has no prior turns
+  if (conversationId) {
+    return {
+      label: "mixed",
+      overallLabel: "mixed",
+      confidence: 0.5,
+      source: "new_conversation",
+      windowSize: 0,
+    };
+  }
+
+  try {
+    const state = sessionStates.get(stateKey);
+    if (state?.latestClassification && state.latestClassification !== "none") {
+      const norm = state.latestClassification.toLowerCase().trim();
+      if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
+        return {
+          label: norm as IemLabel,
+          overallLabel: norm as IemLabel,
+          confidence: 0.8,
+          source: "session_state",
+        };
+      }
+    }
+  } catch (err) {
+    console.warn(
+      "[Classifier] Failed to check sessionStates for top-N label:",
+      err,
+    );
+  }
+
   return {
     label: "mixed",
     overallLabel: "mixed",
     confidence: 0.5,
     source: "default_fallback",
+    windowSize: 0,
   };
 }
 
@@ -415,7 +392,12 @@ export async function evaluateTurnAndSession(
     try {
       const safeSessionCode = (sCode || "DEFAULT").toUpperCase();
       const safeStudentId = (sId || "DEFAULT_USER").toUpperCase();
-      const logDir = path.resolve(process.cwd(), "logs", "sessions", safeSessionCode);
+      const logDir = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        safeSessionCode,
+      );
       let logFilePath = path.resolve(logDir, `${safeStudentId}.json`);
       if (!fs.existsSync(logFilePath)) {
         logFilePath = path.resolve(logDir, `${sId}.json`);
@@ -447,8 +429,16 @@ export async function evaluateTurnAndSession(
           const logs = JSON.parse(fileContent);
           if (logs.length > 0) {
             const targetEntry =
-              logs.slice().reverse().find((e: any) => e.prompt === prompt) ||
-              logs[logs.length - 1];
+              logs
+                .slice()
+                .reverse()
+                .find(
+                  (e: any) =>
+                    e.prompt === prompt &&
+                    (!conversationId ||
+                      !e.conversationId ||
+                      e.conversationId === conversationId),
+                ) || logs[logs.length - 1];
             targetEntry.classification = {
               ...(targetEntry.classification || {}),
               label: overallLabel,
@@ -506,13 +496,19 @@ export async function evaluateTurnAndSession(
 }
 
 const fileLocks = new Map<string, Promise<void>>();
-export async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+export async function withFileLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   const current = fileLocks.get(filePath) || Promise.resolve();
   let release: () => void;
   const next = new Promise<void>((res) => {
     release = res;
   });
-  fileLocks.set(filePath, current.then(() => next));
+  fileLocks.set(
+    filePath,
+    current.then(() => next),
+  );
   await current;
   try {
     return await fn();
@@ -552,4 +548,3 @@ export function queueEvaluation(
     ),
   );
 }
-
