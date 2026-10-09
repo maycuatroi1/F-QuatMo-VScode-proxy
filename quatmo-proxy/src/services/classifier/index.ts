@@ -292,7 +292,7 @@ export async function evaluateTurnAndSession(
     const iTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(INSTRUMENTAL_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      if (act >= 0.5) {
+      if (act > 0) {
         iTurnValues.push(weight);
       }
     }
@@ -301,7 +301,7 @@ export async function evaluateTurnAndSession(
     const eTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(EXECUTIVE_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      if (act >= 0.5) {
+      if (act > 0) {
         eTurnValues.push(weight);
       }
     }

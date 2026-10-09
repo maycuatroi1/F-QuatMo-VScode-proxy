@@ -137,20 +137,27 @@ export class ClassifierConcurrencyController {
         break;
       }
 
-      const isFastTrack = this.circuitBreakerTripped;
+      const targetKey = eligibleClientKey;
+      const itemToRun = nextItem;
+
+      const isWaitTimeout = Date.now() - itemToRun.enqueuedAt > this.maxQueueWaitMs;
+      const isFastTrack = this.circuitBreakerTripped || isWaitTimeout;
 
       if (isFastTrack) {
         this.fastTrackProcessed++;
-        console.warn(
-          `[ConcurrencyLimiter] Circuit breaker tripped for client ${eligibleClientKey}. Running in Fast-Track fallback mode.`,
-        );
+        if (this.circuitBreakerTripped) {
+          console.warn(
+            `[ConcurrencyLimiter] Circuit breaker tripped for client ${eligibleClientKey}. Running in Fast-Track fallback mode.`,
+          );
+        } else {
+          console.warn(
+            `[ConcurrencyLimiter] Task wait time exceeded (${Date.now() - itemToRun.enqueuedAt}ms > ${this.maxQueueWaitMs}ms) for client ${eligibleClientKey}. Running in Fast-Track mode.`,
+          );
+        }
       }
 
       this.activeCount++;
       this.activeClients.add(eligibleClientKey);
-
-      const targetKey = eligibleClientKey;
-      const itemToRun = nextItem;
 
       itemToRun
         .task(isFastTrack)

@@ -1069,15 +1069,23 @@ chatRouter.post(
         firstUserMsg.content.trim()
       ) {
         const cleanRootPrompt = firstUserMsg.content
+          .replace(/\r\n/g, "\n")
           .replace(
-            /Attached Target Workspace Files:[\s\S]*?---------------------/g,
+            /^#\s*(?:Attached target workspace files|Target workspace file|Active editor content)[\s\S]*?\n\n/i,
             "",
           )
           .replace(
-            /--- (?:ACTIVE OPEN EDITOR FILE|ATTACHED TARGET FILE):[\s\S]*?---------------------/g,
+            /\n+Attached (?:Context|Target Workspace) Files:[\s\S]*$/i,
             "",
           )
-          .replace(/\[(?:TARGET|ACTIVE) FILE DIRECTIVE\]:[\s\S]*/g, "")
+          .replace(
+            /\n+(?:---|===)?\s*(?:ACTIVE OPEN EDITOR FILE|ATTACHED TARGET FILE|Attached File|Attached Context Files|Attached Target Workspace Files|Target workspace file|Active editor content)[\s\S]*$/i,
+            "",
+          )
+          .replace(/<selected_code[\s\S]*?<\/selected_code>/gi, "")
+          .replace(/\[(?:TARGET|ACTIVE|MULTI-FILE TARGET) FILE DIRECTIVE\]:[\s\S]*/gi, "")
+          .replace(/\n\s*\[Open Editor Tabs\]:.*$/im, "")
+          .replace(/\n[-=]{3,}\s*$/g, "")
           .trim();
         const baseToHash = cleanRootPrompt || firstUserMsg.content.trim();
         activeConversationId = crypto

@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { INSTRUMENTAL_WEIGHTS, EXECUTIVE_WEIGHTS } from "./features";
 import type { TurnLog } from "./redisStore";
 
 let cachedEvalPrompt = "";
@@ -276,7 +277,8 @@ export async function evaluateTurnSemanticFeatures(
           if (typeof item === "string") {
             const k = item.toLowerCase().trim();
             if (k in defaultFeatures) {
-              result[k] = 1.0;
+              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+              result[k] = weight;
               activeKeys.push(k);
             }
           }
@@ -293,7 +295,8 @@ export async function evaluateTurnSemanticFeatures(
             if (typeof item === "string") {
               const k = item.toLowerCase().trim();
               if (k in defaultFeatures) {
-                result[k] = 1.0;
+                const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+                result[k] = weight;
                 activeKeys.push(k);
               }
             }
@@ -302,20 +305,21 @@ export async function evaluateTurnSemanticFeatures(
           for (const [key, value] of Object.entries(parsed)) {
             const k = key.toLowerCase().trim();
             if (k in defaultFeatures) {
+              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
               if (typeof value === "number") {
                 if (value > 0) {
-                  result[k] = 1.0;
+                  result[k] = weight;
                   activeKeys.push(k);
                 }
               } else if (typeof value === "boolean") {
                 if (value) {
-                  result[k] = 1.0;
+                  result[k] = weight;
                   activeKeys.push(k);
                 }
               } else if (typeof value === "string") {
                 const s = value.toLowerCase().trim();
                 if (s !== "none" && s !== "false" && s !== "0" && s !== "") {
-                  result[k] = 1.0;
+                  result[k] = weight;
                   activeKeys.push(k);
                 }
               }

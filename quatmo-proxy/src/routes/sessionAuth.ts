@@ -601,6 +601,7 @@ sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
     sessionStates.set(stateKey, state);
   }
 
+  const wasReassigned = Boolean(state.reassigned);
   if (state.hasLoggedIn && !state.reassigned) {
     return c.json(
       {
@@ -685,8 +686,148 @@ sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
     aiOption: session.aiOption,
     promptMode: session.promptMode || "scaffolded_code",
     runtimeConfig: session.runtimeConfig,
+    isReassigned: wasReassigned,
+    reassigned: wasReassigned,
   });
 });
+
+async function verifyTokenSignatureOnly(token: string, secretStr: string): Promise<any | null> {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secretStr),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"],
+    );
+    const sig = Buffer.from(sigB64, "base64url");
+    const data = new TextEncoder().encode(headerB64 + "." + payloadB64);
+    const isValid = await crypto.subtle.verify("HMAC", key, sig, data);
+    if (!isValid) return null;
+    return JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+interface JsonlRecord {
+  timestamp: number;
+  type?: string;
+  payload?: any;
+  groupId?: number;
+  [key: string]: any;
+}
+
+function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
+  const existingStr = existingBuf.toString("utf-8");
+  const newStr = newBuf.toString("utf-8");
+  const existingLines = existingStr.split("\n").filter((l) => l.trim().length > 0);
+  const newLines = newStr.split("\n").filter((l) => l.trim().length > 0);
+
+  const parsedRecords: Array<{ record: JsonlRecord; raw?: string; isRaw: boolean }> = [];
+  const seenFingerprints = new Set<string>();
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      const obj = JSON.parse(trimmed) as JsonlRecord;
+      if (typeof obj === "object" && obj !== null && typeof obj.timestamp === "number") {
+        // Construct semantic fingerprint ignoring transient groupId counter
+        const fp = `${obj.type || ""}_${obj.timestamp}_${JSON.stringify(obj.payload ?? "")}`;
+        if (!seenFingerprints.has(fp)) {
+          seenFingerprints.add(fp);
+          parsedRecords.push({ record: obj, isRaw: false });
+        }
+        return;
+      }
+    } catch {
+      // JSON parse failed; fall back to raw string preservation
+    }
+
+    if (!seenFingerprints.has(trimmed)) {
+      seenFingerprints.add(trimmed);
+      parsedRecords.push({
+        record: { timestamp: 0 },
+        raw: trimmed,
+        isRaw: true,
+      });
+    }
+  };
+
+  for (const l of existingLines) {
+    processLine(l);
+  }
+  for (const l of newLines) {
+    processLine(l);
+  }
+
+  // Strictly sort chronologically by timestamp ascending
+  parsedRecords.sort((a, b) => {
+    if (a.isRaw && !b.isRaw) return -1;
+    if (!a.isRaw && b.isRaw) return 1;
+    return a.record.timestamp - b.record.timestamp;
+  });
+
+  // Re-index groupId monotonically across the unified timeline (0, 1, 2, ...)
+  let currentGroupId = 0;
+  const mergedLines: string[] = [];
+
+  for (const item of parsedRecords) {
+    if (item.isRaw && item.raw) {
+      mergedLines.push(item.raw);
+    } else {
+      item.record.groupId = currentGroupId++;
+      mergedLines.push(JSON.stringify(item.record));
+    }
+  }
+
+  return Buffer.from(mergedLines.join("\n") + "\n", "utf-8");
+}
+
+function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
+  try {
+    const existingMeta = JSON.parse(existingBuf.toString("utf-8"));
+    const newMeta = JSON.parse(newBuf.toString("utf-8"));
+
+    const merged = {
+      ...existingMeta,
+      ...newMeta,
+      // Preserve earliest exam start time across all machines
+      examStartAt: Math.min(
+        Number(existingMeta.examStartAt) || Date.now(),
+        Number(newMeta.examStartAt) || Date.now()
+      ),
+      // Set to latest end time if present
+      examEndAt: Math.max(
+        Number(existingMeta.examEndAt) || 0,
+        Number(newMeta.examEndAt) || 0
+      ) || undefined,
+      conversations: [
+        ...(Array.isArray(existingMeta.conversations) ? existingMeta.conversations : []),
+        ...(Array.isArray(newMeta.conversations) ? newMeta.conversations : []),
+      ],
+    };
+
+    if (Array.isArray(merged.conversations)) {
+      const seenConv = new Set<string>();
+      merged.conversations = merged.conversations.filter((c: any) => {
+        const id = c?.id || c?.conversationId || JSON.stringify(c);
+        if (seenConv.has(id)) return false;
+        seenConv.add(id);
+        return true;
+      });
+    }
+
+    return Buffer.from(JSON.stringify(merged, null, 2), "utf-8");
+  } catch {
+    return newBuf;
+  }
+}
+
 
 sessionAuthRouter.post("/upload-logs", async (c) => {
   const authHeader = c.req.header("Authorization");
@@ -699,7 +840,18 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   try {
     tokenPayload = await verify(token, getJwtSecret(), "HS256" as any);
   } catch {
-    return c.json({ error: "Token expired or invalid" }, 401);
+    // If standard verification fails (e.g. token expired because session ended),
+    // verify the cryptographic signature directly to permit valid students to submit their logs.
+    tokenPayload = await verifyTokenSignatureOnly(token, getJwtSecret());
+    if (!tokenPayload) {
+      return c.json({ error: "Token expired or invalid" }, 401);
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const tokenExp = Number(tokenPayload.exp || tokenPayload.sessionEndTime || 0);
+    const maxGraceSeconds = 14 * 24 * 3600; // 14-day upload grace window
+    if (tokenExp > 0 && now > tokenExp + maxGraceSeconds) {
+      return c.json({ error: "Log upload grace period (14 days) has expired" }, 401);
+    }
   }
 
   // Identity comes ONLY from the verified session token. Body fields are accepted
@@ -712,6 +864,7 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
 
   let sessionCode = "";
   let studentId = "";
+  let uploadReason = "";
   interface ParsedUploadFile {
     relativePath: string;
     buffer: Buffer;
@@ -735,6 +888,7 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     )
       .trim()
       .toUpperCase();
+    uploadReason = String(formData.get("uploadReason") || "").trim();
 
     // Parse path mapping if provided as JSON array
     let explicitPaths: string[] = [];
@@ -771,6 +925,7 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     studentId = String(body.studentId || tokenPayload.studentId || "")
       .trim()
       .toUpperCase();
+    uploadReason = String(body.uploadReason || "").trim();
 
     const rawFiles: Array<{
       relativePath: string;
@@ -835,21 +990,41 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     sanitizeFilename(studentId),
   );
 
-  // Overwrite existing folder asynchronously
-  try {
-    await fs.promises.rm(targetDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
   await fs.promises.mkdir(targetDir, { recursive: true });
 
-  // 1. Asynchronous concurrent local disk writes
+  // 1. Asynchronous concurrent local disk writes with JSONL merge support (preserves historical logs across reassignments)
   await Promise.all(
     uploadFiles.map(async (file) => {
       const destPath = resolveInside(targetDir, file.relativePath);
       if (!destPath) return;
       const destDir = path.dirname(destPath);
       await fs.promises.mkdir(destDir, { recursive: true });
+
+      // Preserve baseline initial snapshot: never overwrite start snapshot from machine 1
+      if (file.relativePath.endsWith("snapshot_start.zip") && fs.existsSync(destPath)) {
+        return;
+      }
+
+      if (
+        (file.relativePath.endsWith("events.jsonl") ||
+          file.relativePath.endsWith("ai_interactions.jsonl")) &&
+        fs.existsSync(destPath)
+      ) {
+        try {
+          const existingBuf = await fs.promises.readFile(destPath);
+          file.buffer = mergeJsonlBuffers(existingBuf, file.buffer);
+        } catch (err) {
+          console.warn(`[Logs] Failed to merge existing ${file.relativePath}:`, err);
+        }
+      } else if (file.relativePath.endsWith("metadata.json") && fs.existsSync(destPath)) {
+        try {
+          const existingBuf = await fs.promises.readFile(destPath);
+          file.buffer = mergeMetadataBuffers(existingBuf, file.buffer);
+        } catch (err) {
+          console.warn(`[Logs] Failed to merge existing metadata.json:`, err);
+        }
+      }
+
       await fs.promises.writeFile(destPath, file.buffer);
     }),
   );
@@ -859,6 +1034,7 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   const metaData = {
     studentId,
     sessionCode,
+    uploadReason: uploadReason || undefined,
     uploadTimestamp: Math.floor(Date.now() / 1000),
     uploadTimeISO: new Date().toISOString(),
     filesUploaded: savedCount,

@@ -152,7 +152,7 @@ test("t10 requires delegation to recur across turns", () => {
     priorTurns,
   );
 
-  expect(features.t10).toBe(0.75);
+  expect(features.t10).toBe(1);
 });
 
 test("c10 drops to 0 when student runs test or script in terminal", () => {

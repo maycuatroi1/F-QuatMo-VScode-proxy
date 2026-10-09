@@ -680,23 +680,24 @@ export function blendFeatures(
   for (const key of allKeys) {
     const hasS = key in semantic;
     const hasP = key in programmatic;
+    const weight = INSTRUMENTAL_WEIGHTS[key] ?? EXECUTIVE_WEIGHTS[key] ?? 1.0;
 
     if (hasP && !hasS) {
-      // Programmatic-only (c6, c7, t9) — pass through binary
-      result[key] = (programmatic[key] ?? 0) >= 0.5 ? 1 : 0;
+      // Programmatic-only (c6, c7, t9) — pass through
+      result[key] = (programmatic[key] ?? 0) > 0 ? weight : 0;
     } else if (hasS && !hasP) {
-      // LLM-only (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5) — pass through binary
-      result[key] = (semantic[key] ?? 0) >= 0.5 ? 1 : 0;
+      // LLM-only (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5) — pass through
+      result[key] = (semantic[key] ?? 0) > 0 ? weight : 0;
     } else {
       // Both sources available — weighted blend with binary threshold
       let progTrust = PROG_TRUST[key] ?? 0.50; // default 50/50 for unknown features
       if (key === "c10" && programmatic["_hasTerminalTelemetry"]) {
         progTrust = 0.85; // High confidence when terminal telemetry is present
       }
-      const pVal = (programmatic[key] ?? 0) >= 0.5 ? 1 : 0;
-      const sVal = (semantic[key] ?? 0) >= 0.5 ? 1 : 0;
+      const pVal = (programmatic[key] ?? 0) > 0 ? 1 : 0;
+      const sVal = (semantic[key] ?? 0) > 0 ? 1 : 0;
       const blended = Math.min(1.0, Math.max(0.0, progTrust * pVal + (1 - progTrust) * sVal));
-      result[key] = blended >= 0.5 ? 1 : 0;
+      result[key] = blended >= 0.5 ? weight : 0;
       debugLog?.(key, pVal, sVal, result[key]);
     }
   }
