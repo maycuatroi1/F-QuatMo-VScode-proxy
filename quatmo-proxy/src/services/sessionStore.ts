@@ -57,6 +57,7 @@ export interface Session {
   examQuestions?: ExamQuestion[];
   runtimeConfig?: SessionRuntimeConfig;
   createdAt: number;
+  endedAt?: number;
   createdBy?: string;
   updatedAt?: number;
   updatedBy?: string;

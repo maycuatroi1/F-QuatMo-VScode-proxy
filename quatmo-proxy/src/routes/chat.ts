@@ -439,7 +439,29 @@ async function logStudentInteraction(
   isSession: boolean = true,
   machineId?: string,
   conversationId?: string,
+  requestStartTime?: number,
+  requestEndTime?: number,
 ) {
+  const completedTime = requestEndTime || Date.now();
+  let startTime = requestStartTime || completedTime;
+  if (
+    body?.requestId &&
+    typeof body.requestId === "string" &&
+    body.requestId.startsWith("chat-")
+  ) {
+    const clientTime = parseInt(body.requestId.split("-")[1], 10);
+    if (
+      !isNaN(clientTime) &&
+      clientTime > 1000000000000 &&
+      clientTime <= completedTime
+    ) {
+      startTime = clientTime;
+    }
+  }
+  const createdAtStr = new Date(startTime).toISOString();
+  const completedAtStr = new Date(completedTime).toISOString();
+  const responseDurationMs = Math.max(0, completedTime - startTime);
+
   const userMessages =
     body?.messages?.filter((m: any) => m.role === "user") || [];
   const currentUserMsg =
@@ -578,9 +600,35 @@ async function logStudentInteraction(
       if (fs.existsSync(logFilePath)) {
         try {
           const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
-          logs = JSON.parse(fileContent);
+          const parsed = JSON.parse(fileContent);
+          if (Array.isArray(parsed)) logs = parsed;
         } catch (e) {
-          // file empty or invalid
+          try {
+            const auditLogPath = path.resolve(
+              logDir,
+              `${isSession ? safeStudentId : safeLogIdentifier}.log`,
+            );
+            if (fs.existsSync(auditLogPath)) {
+              const { decryptLogFile } =
+                await import("../services/secureLogger");
+              const candidateKeys = [
+                (process.env.LOG_ENCRYPT_KEY || "").trim(),
+                (process.env.CUSTOM_API_KEY || "").trim(),
+                "1234",
+                "secret",
+              ].filter(Boolean);
+              for (const k of candidateKeys) {
+                const decrypted = decryptLogFile(auditLogPath, k) as any[];
+                const valid = decrypted.filter(
+                  (t) => t && !t._error && t.prompt,
+                );
+                if (valid.length > 0) {
+                  logs = valid;
+                  break;
+                }
+              }
+            }
+          } catch {}
         }
       }
 
@@ -595,7 +643,15 @@ async function logStudentInteraction(
         lastEntry.tokensConsumedTotal += totalConsumed;
         lastEntry.output = cleanCompletion;
         lastEntry.history = cleanHistory;
-        lastEntry.lastUpdated = new Date().toISOString();
+        lastEntry.lastUpdated = completedAtStr;
+        lastEntry.completedAt = completedAtStr;
+        if (!lastEntry.createdAt) {
+          lastEntry.createdAt = createdAtStr;
+        }
+        const initialStart = new Date(lastEntry.createdAt).getTime();
+        lastEntry.responseDurationMs = !isNaN(initialStart)
+          ? Math.max(0, completedTime - initialStart)
+          : responseDurationMs;
         lastEntry.codeSnapshot = codeSnapshot;
         lastEntry.activeFilePath = activeFilePath;
         lastEntry.activeFileLanguageId = activeFileLanguageId;
@@ -635,7 +691,10 @@ async function logStudentInteraction(
         sessionEntry = lastEntry;
       } else {
         const newEntry: any = {
-          timestamp: new Date().toISOString(),
+          timestamp: completedAtStr,
+          createdAt: createdAtStr,
+          completedAt: completedAtStr,
+          responseDurationMs,
           conversationId: conversationId || undefined,
           prompt: currentUserMsg,
           classification: {
@@ -670,11 +729,13 @@ async function logStudentInteraction(
         sessionEntry = newEntry;
       }
 
+      const tmpPath = `${logFilePath}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
       await fs.promises.writeFile(
-        logFilePath,
+        tmpPath,
         JSON.stringify(logs, null, 2),
         "utf-8",
       );
+      await fs.promises.rename(tmpPath, logFilePath);
       currentLogsSnapshot = logs;
     });
 
@@ -909,6 +970,7 @@ chatRouter.post(
   unifiedAuthMiddleware(),
   rateLimitMiddleware(),
   async (c) => {
+    const requestStartTime = Date.now();
     const allowedModesStr = process.env.ALLOWED_MODES || "";
     const allowedModes = allowedModesStr
       .split(",")
@@ -1083,7 +1145,10 @@ chatRouter.post(
             "",
           )
           .replace(/<selected_code[\s\S]*?<\/selected_code>/gi, "")
-          .replace(/\[(?:TARGET|ACTIVE|MULTI-FILE TARGET) FILE DIRECTIVE\]:[\s\S]*/gi, "")
+          .replace(
+            /\[(?:TARGET|ACTIVE|MULTI-FILE TARGET) FILE DIRECTIVE\]:[\s\S]*/gi,
+            "",
+          )
           .replace(/\n\s*\[Open Editor Tabs\]:.*$/im, "")
           .replace(/\n[-=]{3,}\s*$/g, "")
           .trim();
@@ -1657,6 +1722,7 @@ chatRouter.post(
 
       await recordTokenUsage(totalConsumed);
 
+      const requestEndTime = Date.now();
       logStudentInteraction(
         finalSessionCode,
         finalStudentId,
@@ -1673,6 +1739,8 @@ chatRouter.post(
         authMode === "session",
         machineId,
         activeConversationId,
+        requestStartTime,
+        requestEndTime,
       ).catch((err) =>
         console.error("[Logger] Non-stream logging error:", err),
       );
@@ -2110,6 +2178,7 @@ chatRouter.post(
           );
         }
 
+        const requestEndTime = Date.now();
         logStudentInteraction(
           finalSessionCode,
           finalStudentId,
@@ -2126,6 +2195,8 @@ chatRouter.post(
           authMode === "session",
           machineId,
           activeConversationId,
+          requestStartTime,
+          requestEndTime,
         ).catch((err) => console.error("[Logger] Stream logging error:", err));
       }
     });

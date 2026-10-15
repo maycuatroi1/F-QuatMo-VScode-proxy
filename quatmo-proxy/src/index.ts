@@ -11,6 +11,7 @@ import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
 import { syncAllDataToRedis } from "./services/sessionStore";
+import { runTelemetryMigration } from "./services/telemetryMigration";
 import dotenv from "dotenv";
 import { maskSecret, validateSecretsAtStartup } from "./services/security";
 import { logOnce } from "./services/clientGate";
@@ -18,12 +19,17 @@ import { logOnce } from "./services/clientGate";
 dotenv.config();
 validateSecretsAtStartup();
 
+void runTelemetryMigration().catch((err) => {
+  console.warn("[Proxy] Background telemetry migration warning:", err);
+});
+
 /**
  * CORS allowlist. Desktop clients (Node fetch) send no Origin and are unaffected.
  * CORS_ORIGINS: comma-separated exact origins; "*.domain" allows https subdomains.
  */
 const corsPatterns = (
-  process.env.CORS_ORIGINS || "*.iahn.hanoi.vn,vscode-webview://*,vscode-file://*"
+  process.env.CORS_ORIGINS ||
+  "*.iahn.hanoi.vn,vscode-webview://*,vscode-file://*"
 )
   .split(",")
   .map((o) => o.trim().toLowerCase())
@@ -33,7 +39,8 @@ function isAllowedOrigin(origin: string): boolean {
   const o = origin.toLowerCase();
   for (const p of corsPatterns) {
     if (p === o) return true;
-    if (p === "vscode-webview://*" && o.startsWith("vscode-webview://")) return true;
+    if (p === "vscode-webview://*" && o.startsWith("vscode-webview://"))
+      return true;
     if (p === "vscode-file://*" && o.startsWith("vscode-file://")) return true;
     if (
       p === o.replace(/^https?:\/\//, "") ||
@@ -57,9 +64,12 @@ function isAllowedOrigin(origin: string): boolean {
     // Wildcard origin matching (e.g. http://localhost:* or *.domain.com)
     if (p.includes("*")) {
       const regex = new RegExp(
-        "^" + p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$",
+        "^" +
+          p.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") +
+          "$",
       );
-      if (regex.test(o) || regex.test(o.replace(/^https?:\/\//, ""))) return true;
+      if (regex.test(o) || regex.test(o.replace(/^https?:\/\//, "")))
+        return true;
     }
   }
   // Surface misconfiguration (e.g. admin UI hosted on a domain not in CORS_ORIGINS).
@@ -151,7 +161,8 @@ console.log(
 );
 console.log(
   `[Proxy] Access key: ${
-    proxyKeyConfig.source === "generated" && process.env.NODE_ENV !== "production"
+    proxyKeyConfig.source === "generated" &&
+    process.env.NODE_ENV !== "production"
       ? proxyKeyConfig.value
       : maskSecret(proxyKeyConfig.value)
   }`,
@@ -186,6 +197,9 @@ export default {
   hostname: "0.0.0.0",
   idleTimeout: 0,
   // Hard cap on request bodies (uploads, chat). Default 128MB in Bun.
-  maxRequestBodySize: parseInt(process.env.MAX_REQUEST_BODY_BYTES || String(110 * 1024 * 1024), 10),
+  maxRequestBodySize: parseInt(
+    process.env.MAX_REQUEST_BODY_BYTES || String(110 * 1024 * 1024),
+    10,
+  ),
   fetch: app.fetch,
 };

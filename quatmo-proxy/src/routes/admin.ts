@@ -1,6 +1,10 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { getTrustedClientIP, readZipTextEntriesSafely, safeEqual } from "../services/security";
+import {
+  getTrustedClientIP,
+  readZipTextEntriesSafely,
+  safeEqual,
+} from "../services/security";
 import {
   checkLockout,
   recordFailedAttempt,
@@ -26,6 +30,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { s3Storage } from "../services/s3Storage";
+import { reconcileStudentPromptTurns } from "../services/telemetryMigration";
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -59,7 +64,11 @@ const adminRouter = new Hono<{ Variables: AdminVariables }>();
 const ADMIN_LOGIN_PATHS = new Set(["/admin/login", "/v1/admin/login"]);
 
 /** Returns the authenticated caller or aborts with 401 (never defaults to admin). */
-function requireCaller(c: any): { username: string; role: string; name: string } {
+function requireCaller(c: any): {
+  username: string;
+  role: string;
+  name: string;
+} {
   const caller = c.get("caller");
   if (!caller || !caller.role || !caller.username) {
     throw new HTTPException(401, { message: "Unauthorized" });
@@ -224,7 +233,10 @@ adminRouter.post("/login", async (c) => {
   const expectedPassword = getAdminPassword();
 
   // 1. Check Super Admin credentials
-  if (safeEqual(inputUser, expectedUsername) && safeEqual(password, expectedPassword)) {
+  if (
+    safeEqual(inputUser, expectedUsername) &&
+    safeEqual(password, expectedPassword)
+  ) {
     await recordSuccessfulLogin(ip, inputUser);
     const jwtSecret = getJwtSecret();
     const payload = {
@@ -770,8 +782,12 @@ adminRouter.delete("/students/:studentId", async (c) => {
 
   // Check if student has ever been linked to any session
   const isLinkedToAnySession =
-    Array.from(sessions.values()).some((s) => s.allowedStudentIds?.has(studentId)) ||
-    Array.from(sessionStates.values()).some((st) => st.studentId?.toUpperCase() === studentId);
+    Array.from(sessions.values()).some((s) =>
+      s.allowedStudentIds?.has(studentId),
+    ) ||
+    Array.from(sessionStates.values()).some(
+      (st) => st.studentId?.toUpperCase() === studentId,
+    );
 
   if (isLinkedToAnySession) {
     // Soft Delete (Deactivate) to preserve audit trails & exam data
@@ -793,8 +809,13 @@ adminRouter.delete("/students/:studentId", async (c) => {
 
     // Also remove from any studentGroups if present
     for (const [gKey, group] of studentGroups.entries()) {
-      if (group.userIds && group.userIds.some((uid) => uid.toUpperCase() === studentId)) {
-        group.userIds = group.userIds.filter((uid) => uid.toUpperCase() !== studentId);
+      if (
+        group.userIds &&
+        group.userIds.some((uid) => uid.toUpperCase() === studentId)
+      ) {
+        group.userIds = group.userIds.filter(
+          (uid) => uid.toUpperCase() !== studentId,
+        );
         group.updatedAt = Date.now();
         group.updatedBy = caller.username;
         studentGroups.set(gKey, group);
@@ -873,8 +894,12 @@ adminRouter.post("/students/bulk-delete", async (c) => {
         const creator = (acc.createdBy || "admin").toLowerCase();
         if (callerRole === "admin" || creator === callerUser) {
           const isLinked =
-            Array.from(sessions.values()).some((s) => s.allowedStudentIds?.has(studentId)) ||
-            Array.from(sessionStates.values()).some((st) => st.studentId?.toUpperCase() === studentId);
+            Array.from(sessions.values()).some((s) =>
+              s.allowedStudentIds?.has(studentId),
+            ) ||
+            Array.from(sessionStates.values()).some(
+              (st) => st.studentId?.toUpperCase() === studentId,
+            );
 
           if (isLinked) {
             acc.isDeleted = true;
@@ -886,8 +911,13 @@ adminRouter.post("/students/bulk-delete", async (c) => {
           } else {
             studentAccounts.delete(key);
             for (const [gKey, group] of studentGroups.entries()) {
-              if (group.userIds && group.userIds.some((uid) => uid.toUpperCase() === studentId)) {
-                group.userIds = group.userIds.filter((uid) => uid.toUpperCase() !== studentId);
+              if (
+                group.userIds &&
+                group.userIds.some((uid) => uid.toUpperCase() === studentId)
+              ) {
+                group.userIds = group.userIds.filter(
+                  (uid) => uid.toUpperCase() !== studentId,
+                );
                 group.updatedAt = Date.now();
                 group.updatedBy = caller.username;
                 studentGroups.set(gKey, group);
@@ -1087,7 +1117,8 @@ adminRouter.patch("/sessions/:sessionCode", async (c) => {
   // Authorization: admin or creator of session
   if (
     caller.role !== "admin" &&
-    (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
   ) {
     return c.json(
       { error: "Unauthorized. You can only update sessions created by you." },
@@ -1258,7 +1289,8 @@ adminRouter.delete("/sessions/:sessionCode", async (c) => {
   // Authorization: admin or creator of session
   if (
     caller.role !== "admin" &&
-    (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
   ) {
     return c.json(
       { error: "Unauthorized. You can only delete sessions created by you." },
@@ -1314,59 +1346,57 @@ adminRouter.delete("/sessions/:sessionCode", async (c) => {
 });
 
 // DELETE Student from Session (permitted if student has not joined yet)
-adminRouter.delete(
-  "/sessions/:sessionCode/students/:studentId",
-  async (c) => {
-    const caller = requireCaller(c);
-    const sessionCode = c.req.param("sessionCode").toUpperCase();
-    const studentId = c.req.param("studentId").toUpperCase();
-    const session = sessions.get(sessionCode);
+adminRouter.delete("/sessions/:sessionCode/students/:studentId", async (c) => {
+  const caller = requireCaller(c);
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const studentId = c.req.param("studentId").toUpperCase();
+  const session = sessions.get(sessionCode);
 
-    if (!session) {
-      return c.json(
-        { error: `Session with code ${sessionCode} not found.` },
-        404,
-      );
-    }
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
 
-    if (
-      caller.role !== "admin" &&
-      (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()
-    ) {
-      return c.json(
-        { error: "Unauthorized. You can only manage sessions created by you." },
-        403,
-      );
-    }
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only manage sessions created by you." },
+      403,
+    );
+  }
 
-    const stateKey = `${sessionCode}:${studentId}`;
-    const state = sessionStates.get(stateKey);
+  const stateKey = `${sessionCode}:${studentId}`;
+  const state = sessionStates.get(stateKey);
 
-    if (state?.hasLoggedIn) {
-      return c.json(
-        {
-          error: `Cannot remove student ${studentId} because they have already joined this session.`,
-        },
-        400,
-      );
-    }
+  if (state?.hasLoggedIn) {
+    return c.json(
+      {
+        error: `Cannot remove student ${studentId} because they have already joined this session.`,
+      },
+      400,
+    );
+  }
 
-    session.allowedStudentIds.delete(studentId);
-    session.updatedAt = Date.now();
-    session.updatedBy = caller.username;
-    sessions.set(sessionCode, session);
+  session.allowedStudentIds.delete(studentId);
+  session.updatedAt = Date.now();
+  session.updatedBy = caller.username;
+  sessions.set(sessionCode, session);
 
-    if (state) {
-      sessionStates.delete(stateKey);
-    }
+  if (state) {
+    sessionStates.delete(stateKey);
+  }
 
-    return c.json({
-      success: true,
-      message: `Removed student ${studentId} from session ${sessionCode}.`,
-      totalStudents: session.allowedStudentIds.size,
-    });
-  },
-);
+  return c.json({
+    success: true,
+    message: `Removed student ${studentId} from session ${sessionCode}.`,
+    totalStudents: session.allowedStudentIds.size,
+  });
+});
 
 adminRouter.post("/sessions/:sessionCode/students", async (c) => {
   const caller = requireCaller(c);
@@ -1634,6 +1664,40 @@ const handleSessionLogDownload = async (c: any) => {
     "sessions",
     sessionCode,
   );
+
+  try {
+    const session = sessions.get(sessionCode);
+    const manifestPath = path.join(sessionLogDir, "session_manifest.json");
+    const manifestStudents: any[] = [];
+    if (session) {
+      for (const studentId of session.allowedStudentIds) {
+        const stateKey = `${sessionCode}:${studentId}`;
+        const state = sessionStates.get(stateKey);
+        manifestStudents.push({
+          studentId,
+          loginTimestamp: state?.loginTimestamp || 0,
+          tokensConsumed: state?.tokensConsumed || 0,
+          latestClassification: state?.latestClassification,
+        });
+      }
+    }
+    await fs.promises.writeFile(
+      manifestPath,
+      JSON.stringify(
+        {
+          sessionCode,
+          createdAt: session?.createdAt,
+          endedAt: session?.endedAt,
+          durationMinutes: session?.durationMinutes,
+          exportedAt: Date.now(),
+          students: manifestStudents,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  } catch {}
 
   return await sendDirectoryZip(
     sessionLogDir,
@@ -2099,39 +2163,27 @@ adminRouter.get(
     const sessionCode = sanitizeFilename(
       c.req.param("sessionCode"),
     ).toUpperCase();
-    const studentId = sanitizeFilename(c.req.param("studentId"));
-    const jsonPath = path.resolve(
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const sessionDir = path.resolve(
       process.cwd(),
       "logs",
       "sessions",
       sessionCode,
-      `${studentId}.json`,
     );
 
     let turns: any[] = [];
-    if (fs.existsSync(jsonPath)) {
-      try {
-        const raw = await fs.promises.readFile(jsonPath, "utf-8");
-        const parsed = JSON.parse(raw);
-        turns = Array.isArray(parsed) ? parsed : [];
-      } catch (err: any) {
-        return c.json({ error: `Failed to parse log` }, 500);
-      }
-    } else {
-      const altJsonPath = path.resolve(
-        process.cwd(),
-        "logs",
-        "sessions",
+    try {
+      const reconciled = await reconcileStudentPromptTurns(
         sessionCode,
-        `${studentId.toUpperCase()}.json`,
+        studentId,
+        sessionDir,
       );
-      if (fs.existsSync(altJsonPath)) {
-        try {
-          const raw = await fs.promises.readFile(altJsonPath, "utf-8");
-          const parsed = JSON.parse(raw);
-          turns = Array.isArray(parsed) ? parsed : [];
-        } catch {}
-      }
+      turns = reconciled.turns || [];
+    } catch (err: any) {
+      console.warn(
+        `[Visualize] Reconcile error for ${sessionCode}/${studentId}:`,
+        err?.message || err,
+      );
     }
 
     if (turns.length > 0) {
@@ -2171,30 +2223,6 @@ adminRouter.get(
         studentId,
         turns,
       });
-    }
-
-    // Check .log file
-    const logPath = path.resolve(
-      process.cwd(),
-      "logs",
-      "sessions",
-      sessionCode,
-      `${studentId}.log`,
-    );
-    if (fs.existsSync(logPath)) {
-      try {
-        const raw = await fs.promises.readFile(logPath, "utf-8");
-        const lines = raw.split("\n").filter((l) => l.trim().length > 0);
-        const turns: any[] = [];
-        for (const line of lines) {
-          try {
-            turns.push(JSON.parse(line));
-          } catch {}
-        }
-        return c.json({ sessionCode, studentId, turns });
-      } catch (err: any) {
-        return c.json({ error: `Failed to read log` }, 500);
-      }
     }
 
     // Check S3 if not found locally
@@ -2323,13 +2351,33 @@ adminRouter.get(
       c.req.param("sessionCode"),
     ).toUpperCase();
     const studentId = sanitizeFilename(c.req.param("studentId"));
-    const studentDir = path.resolve(
+    let studentDir = path.resolve(
       process.cwd(),
       "logs",
       "sessions",
       sessionCode,
       studentId,
     );
+
+    if (!fs.existsSync(studentDir)) {
+      const sessionDir = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        sessionCode,
+      );
+      if (fs.existsSync(sessionDir)) {
+        try {
+          const entries = await fs.promises.readdir(sessionDir);
+          const match = entries.find(
+            (e) => e.toLowerCase() === studentId.toLowerCase(),
+          );
+          if (match) {
+            studentDir = path.join(sessionDir, match);
+          }
+        } catch {}
+      }
+    }
 
     if (!fs.existsSync(studentDir)) {
       // Check S3 if no local student directory
@@ -2445,6 +2493,97 @@ adminRouter.get(
         }
       }
 
+      const session = sessions.get(sessionCode);
+      const stateKey = `${sessionCode}:${studentId}`;
+      const state = sessionStates.get(stateKey);
+
+      let loginTimestamp: number | null =
+        state?.loginTimestamp && state.loginTimestamp > 0
+          ? state.loginTimestamp
+          : null;
+      if (!loginTimestamp && redis && redis.status === "ready") {
+        try {
+          const rTime = await redis.hget(
+            `session:user:${sessionCode}:${studentId}`,
+            "loginTime",
+          );
+          if (rTime) {
+            const parsed = parseInt(rTime, 10);
+            if (!isNaN(parsed) && parsed > 0) loginTimestamp = parsed;
+          }
+        } catch {}
+      }
+
+      let uploadTimestamp: number | null = null;
+      let uploadTimeISO: string | null = null;
+      const uploadInfoPath = path.join(studentDir, "upload_info.json");
+      if (fs.existsSync(uploadInfoPath)) {
+        try {
+          const uInfo = JSON.parse(
+            await fs.promises.readFile(uploadInfoPath, "utf-8"),
+          );
+          if (uInfo.uploadTimestamp) {
+            const rawTs = Number(uInfo.uploadTimestamp);
+            uploadTimestamp = rawTs < 1_000_000_000_000 ? rawTs * 1000 : rawTs;
+          }
+          if (uInfo.uploadTimeISO) uploadTimeISO = uInfo.uploadTimeISO;
+        } catch {}
+      }
+
+      if (!loginTimestamp && uploadTimeISO) {
+        const sessionDate = new Date(uploadTimeISO);
+        const sessionDayStart = new Date(
+          sessionDate.getFullYear(),
+          sessionDate.getMonth(),
+          sessionDate.getDate(),
+          0,
+          0,
+          0,
+          0,
+        ).getTime();
+        const firstDayEvent = coreRecords.find(
+          (e) => Number(e.timestamp) >= sessionDayStart,
+        );
+        if (firstDayEvent) {
+          loginTimestamp = Number(firstDayEvent.timestamp);
+        }
+      }
+
+      let sessionEndTime: number | null = uploadTimestamp;
+      if (!sessionEndTime && session) {
+        if (session.endedAt && session.endedAt > 0) {
+          sessionEndTime = session.endedAt;
+        } else if (session.createdAt && session.durationMinutes) {
+          sessionEndTime =
+            session.createdAt +
+            session.durationMinutes * 60 * 1000 +
+            10 * 60 * 1000;
+        }
+      }
+
+      const unclamped = c.req.query("unclamped") === "true";
+      const clampedCoreRecords =
+        !unclamped && loginTimestamp && loginTimestamp > 0
+          ? coreRecords.filter((ev) => {
+              const t = Number(ev.timestamp);
+              if (!t) return true;
+              if (loginTimestamp && t < loginTimestamp) return false;
+              if (sessionEndTime && t > sessionEndTime) return false;
+              return true;
+            })
+          : coreRecords;
+
+      const clampedAiRecords =
+        !unclamped && loginTimestamp && loginTimestamp > 0
+          ? aiRecords.filter((ev) => {
+              const t = Number(ev.timestamp);
+              if (!t) return true;
+              if (loginTimestamp && t < loginTimestamp) return false;
+              if (sessionEndTime && t > sessionEndTime) return false;
+              return true;
+            })
+          : aiRecords;
+
       return c.json({
         sessionCode,
         studentId,
@@ -2452,13 +2591,22 @@ adminRouter.get(
         availableRecords,
         metadata: metadata || {
           examSessionId: path.basename(activeRecordDir),
-          examStartAt: coreRecords[0]?.timestamp || Date.now(),
+          examStartAt:
+            clampedCoreRecords[0]?.timestamp || loginTimestamp || Date.now(),
           examEndAt:
-            coreRecords[coreRecords.length - 1]?.timestamp || Date.now(),
+            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
+            sessionEndTime ||
+            Date.now(),
         },
-        coreRecords,
-        aiRecords,
+        coreRecords: clampedCoreRecords,
+        aiRecords: clampedAiRecords,
         initialFiles,
+        loginTimestamp,
+        sessionEndTime,
+        totalRawEvents: coreRecords.length,
+        clampedEventsCount: clampedCoreRecords.length,
+        isClamped:
+          !unclamped && coreRecords.length !== clampedCoreRecords.length,
       });
     } catch (err: any) {
       return c.json({ error: `Failed to load event log` }, 500);
