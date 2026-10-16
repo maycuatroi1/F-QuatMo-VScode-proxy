@@ -1900,9 +1900,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
           sessionName: code,
           promptLogCount,
           eventLogCount,
-          lastActivity:
-            lastActivity ||
-            (sCreated ? sCreated : Date.now()),
+          lastActivity: lastActivity || (sCreated ? sCreated : Date.now()),
           studentCount: studentIds.size,
           startTime: sStart || sCreated || undefined,
           createdAt: sCreated || sStart || undefined,
@@ -2414,7 +2412,13 @@ function sliceRecordsByTimeRange<T extends { timestamp?: any }>(
   outsideDateCount: number;
 } {
   if (!records || records.length === 0) {
-    return { sliced: [], totalRaw: 0, preCount: 0, postCount: 0, outsideDateCount: 0 };
+    return {
+      sliced: [],
+      totalRaw: 0,
+      preCount: 0,
+      postCount: 0,
+      outsideDateCount: 0,
+    };
   }
 
   // Ensure chronological sort (stable check)
@@ -2430,7 +2434,9 @@ function sliceRecordsByTimeRange<T extends { timestamp?: any }>(
 
   const sorted = isSorted
     ? records
-    : [...records].sort((a, b) => (toMs(a.timestamp) || 0) - (toMs(b.timestamp) || 0));
+    : [...records].sort(
+        (a, b) => (toMs(a.timestamp) || 0) - (toMs(b.timestamp) || 0),
+      );
 
   // Binary search to find startIdx (first record >= startMs)
   let startIdx = 0;
@@ -2715,9 +2721,14 @@ adminRouter.get(
       }
 
       // 1. Resolve Authoritative Session Boundaries [T_signin, T_expire + grace]
-      let sessionBeginTime: number | null = toMs(validityWindow?.signinTimestamp) || null;
+      let sessionBeginTime: number | null =
+        toMs(validityWindow?.signinTimestamp) || null;
 
-      if (!sessionBeginTime && state?.loginTimestamp && state.loginTimestamp > 0) {
+      if (
+        !sessionBeginTime &&
+        state?.loginTimestamp &&
+        state.loginTimestamp > 0
+      ) {
         sessionBeginTime = toMs(state.loginTimestamp);
       }
       if (!sessionBeginTime && redis && redis.status === "ready") {
@@ -2784,7 +2795,10 @@ adminRouter.get(
       }
 
       const durationMin =
-        session?.durationMinutes || manifest?.durationMinutes || validityWindow?.durationMinutes || 90;
+        session?.durationMinutes ||
+        manifest?.durationMinutes ||
+        validityWindow?.durationMinutes ||
+        90;
 
       if (!sessionBeginTime && uploadTimestamp) {
         sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
@@ -2794,19 +2808,51 @@ adminRouter.get(
       }
 
       // 2. Resolve Authoritative Session Expiration Boundary
-      let sessionEndTime: number | null = toMs(validityWindow?.expireTimestamp) || null;
+      let sessionEndTime: number | null =
+        toMs(validityWindow?.expireTimestamp) || null;
+
+      if (
+        uploadTimestamp &&
+        sessionBeginTime &&
+        uploadTimestamp >= sessionBeginTime
+      ) {
+        if (
+          !sessionEndTime ||
+          durationMin >= 180 ||
+          uploadTimestamp < sessionEndTime
+        ) {
+          sessionEndTime = uploadTimestamp;
+        }
+      }
+
+      if (metadata?.examEndAt) {
+        const metaEnd = toMs(metadata.examEndAt);
+        if (metaEnd && sessionBeginTime && metaEnd >= sessionBeginTime) {
+          if (
+            !sessionEndTime ||
+            durationMin >= 180 ||
+            metaEnd < sessionEndTime
+          ) {
+            sessionEndTime = metaEnd;
+          }
+        }
+      }
+
       if (!sessionEndTime) {
         if (session?.endedAt && session.endedAt > 0) {
           sessionEndTime = toMs(session.endedAt);
         } else if (manifest?.endedAt && manifest.endedAt > 0) {
           sessionEndTime = toMs(manifest.endedAt);
         } else if (sessionBeginTime) {
-          sessionEndTime = sessionBeginTime + durationMin * 60 * 1000;
+          sessionEndTime =
+            sessionBeginTime + Math.min(durationMin, 180) * 60 * 1000;
         }
       }
 
       const graceMs = 60 * 1000; // 60s network/flush tolerance buffer
-      const effectiveUpperBound = sessionEndTime ? sessionEndTime + graceMs : null;
+      const effectiveUpperBound = sessionEndTime
+        ? sessionEndTime + graceMs
+        : null;
 
       // 3. Session Calendar Date Isolation
       const sessionCreationMs =
@@ -2823,26 +2869,59 @@ adminRouter.get(
           allowedDates.add(new Date(sessionEndTime).toISOString().slice(0, 10));
         }
       } else if (sessionCreationMs) {
-        allowedDates.add(new Date(sessionCreationMs).toISOString().slice(0, 10));
-        allowedDates.add(new Date(sessionCreationMs + durationMin * 60 * 1000).toISOString().slice(0, 10));
+        allowedDates.add(
+          new Date(sessionCreationMs).toISOString().slice(0, 10),
+        );
+        allowedDates.add(
+          new Date(sessionCreationMs + durationMin * 60 * 1000)
+            .toISOString()
+            .slice(0, 10),
+        );
       } else if (uploadTimeISO) {
         allowedDates.add(uploadTimeISO.slice(0, 10));
       }
 
-      const unclamped = c.req.query("unclamped") === "true" || c.req.query("mode") === "full_raw";
+      const unclamped =
+        c.req.query("unclamped") === "true" ||
+        c.req.query("mode") === "full_raw";
 
       let clampedCoreRecords = coreRecords;
       let clampedAiRecords = aiRecords;
-      let coreStats = { totalRaw: coreRecords.length, preCount: 0, postCount: 0, outsideDateCount: 0 };
-      let aiStats = { totalRaw: aiRecords.length, preCount: 0, postCount: 0, outsideDateCount: 0 };
+      let coreStats = {
+        totalRaw: coreRecords.length,
+        preCount: 0,
+        postCount: 0,
+        outsideDateCount: 0,
+      };
+      let aiStats = {
+        totalRaw: aiRecords.length,
+        preCount: 0,
+        postCount: 0,
+        outsideDateCount: 0,
+      };
 
       // 4. O(log N) High-Performance Binary Search Slicing
-      if (!unclamped && (sessionBeginTime !== null || effectiveUpperBound !== null || allowedDates.size > 0)) {
-        const coreRes = sliceRecordsByTimeRange(coreRecords, sessionBeginTime, effectiveUpperBound, allowedDates);
+      if (
+        !unclamped &&
+        (sessionBeginTime !== null ||
+          effectiveUpperBound !== null ||
+          allowedDates.size > 0)
+      ) {
+        const coreRes = sliceRecordsByTimeRange(
+          coreRecords,
+          sessionBeginTime,
+          effectiveUpperBound,
+          allowedDates,
+        );
         clampedCoreRecords = coreRes.sliced;
         coreStats = coreRes;
 
-        const aiRes = sliceRecordsByTimeRange(aiRecords, sessionBeginTime, effectiveUpperBound, allowedDates);
+        const aiRes = sliceRecordsByTimeRange(
+          aiRecords,
+          sessionBeginTime,
+          effectiveUpperBound,
+          allowedDates,
+        );
         clampedAiRecords = aiRes.sliced;
         aiStats = aiRes;
       }
@@ -2855,8 +2934,12 @@ adminRouter.get(
         validityWindow: {
           signinTimestamp: sessionBeginTime,
           expireTimestamp: sessionEndTime,
-          signinISO: sessionBeginTime ? new Date(sessionBeginTime).toISOString() : null,
-          expireISO: sessionEndTime ? new Date(sessionEndTime).toISOString() : null,
+          signinISO: sessionBeginTime
+            ? new Date(sessionBeginTime).toISOString()
+            : null,
+          expireISO: sessionEndTime
+            ? new Date(sessionEndTime).toISOString()
+            : null,
           durationMinutes: durationMin,
           graceSeconds: 60,
         },

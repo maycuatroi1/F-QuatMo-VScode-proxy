@@ -31,7 +31,10 @@ import { evaluateClient, readClientIdentity } from "../services/clientGate";
 import { normalizeUploadRelPath, resolveInside } from "../services/security";
 
 const MAX_UPLOAD_FILES = parseInt(process.env.MAX_UPLOAD_FILES || "5000", 10);
-const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || String(100 * 1024 * 1024), 10);
+const MAX_UPLOAD_BYTES = parseInt(
+  process.env.MAX_UPLOAD_BYTES || String(100 * 1024 * 1024),
+  10,
+);
 
 function sanitizeFilename(str: string): string {
   return str.replace(/[^a-zA-Z0-9_\-]/g, "_");
@@ -671,7 +674,8 @@ sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
     exp: sessionEndTime,
     // cgv = client-gate-verified: this token was issued to a client that passed
     // the version/checksum gate, so chat requests with it are not re-checked.
-    ...(evaluateClient(readClientIdentity((n) => c.req.header(n))).status === "ok"
+    ...(evaluateClient(readClientIdentity((n) => c.req.header(n))).status ===
+    "ok"
       ? { cgv: 1 }
       : {}),
   };
@@ -691,7 +695,10 @@ sessionAuthRouter.post("/login", clientVersionGate(), async (c) => {
   });
 });
 
-async function verifyTokenSignatureOnly(token: string, secretStr: string): Promise<any | null> {
+async function verifyTokenSignatureOnly(
+  token: string,
+  secretStr: string,
+): Promise<any | null> {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
@@ -756,7 +763,11 @@ function sanitizeJsonlBuffer(
     totalLines++;
     try {
       const obj = JSON.parse(trimmed);
-      if (typeof obj === "object" && obj !== null && typeof obj.timestamp === "number") {
+      if (
+        typeof obj === "object" &&
+        obj !== null &&
+        typeof obj.timestamp === "number"
+      ) {
         const t = toMs(obj.timestamp);
         if (t) {
           if (allowedDates && allowedDates.size > 0) {
@@ -783,7 +794,10 @@ function sanitizeJsonlBuffer(
   }
 
   return {
-    buffer: Buffer.from(keptLines.join("\n") + (keptLines.length > 0 ? "\n" : ""), "utf-8"),
+    buffer: Buffer.from(
+      keptLines.join("\n") + (keptLines.length > 0 ? "\n" : ""),
+      "utf-8",
+    ),
     totalLines,
     inWindowLines: keptLines.length,
     droppedPreSigninLines,
@@ -795,10 +809,16 @@ function sanitizeJsonlBuffer(
 function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
   const existingStr = existingBuf.toString("utf-8");
   const newStr = newBuf.toString("utf-8");
-  const existingLines = existingStr.split("\n").filter((l) => l.trim().length > 0);
+  const existingLines = existingStr
+    .split("\n")
+    .filter((l) => l.trim().length > 0);
   const newLines = newStr.split("\n").filter((l) => l.trim().length > 0);
 
-  const parsedRecords: Array<{ record: JsonlRecord; raw?: string; isRaw: boolean }> = [];
+  const parsedRecords: Array<{
+    record: JsonlRecord;
+    raw?: string;
+    isRaw: boolean;
+  }> = [];
   const seenFingerprints = new Set<string>();
 
   const processLine = (line: string) => {
@@ -806,7 +826,11 @@ function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
     if (!trimmed) return;
     try {
       const obj = JSON.parse(trimmed) as JsonlRecord;
-      if (typeof obj === "object" && obj !== null && typeof obj.timestamp === "number") {
+      if (
+        typeof obj === "object" &&
+        obj !== null &&
+        typeof obj.timestamp === "number"
+      ) {
         // Construct semantic fingerprint ignoring transient groupId counter
         const fp = `${obj.type || ""}_${obj.timestamp}_${JSON.stringify(obj.payload ?? "")}`;
         if (!seenFingerprints.has(fp)) {
@@ -870,15 +894,18 @@ function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
       // Preserve earliest exam start time across all machines
       examStartAt: Math.min(
         Number(existingMeta.examStartAt) || Date.now(),
-        Number(newMeta.examStartAt) || Date.now()
+        Number(newMeta.examStartAt) || Date.now(),
       ),
       // Set to latest end time if present
-      examEndAt: Math.max(
-        Number(existingMeta.examEndAt) || 0,
-        Number(newMeta.examEndAt) || 0
-      ) || undefined,
+      examEndAt:
+        Math.max(
+          Number(existingMeta.examEndAt) || 0,
+          Number(newMeta.examEndAt) || 0,
+        ) || undefined,
       conversations: [
-        ...(Array.isArray(existingMeta.conversations) ? existingMeta.conversations : []),
+        ...(Array.isArray(existingMeta.conversations)
+          ? existingMeta.conversations
+          : []),
         ...(Array.isArray(newMeta.conversations) ? newMeta.conversations : []),
       ],
     };
@@ -899,7 +926,6 @@ function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
   }
 }
 
-
 sessionAuthRouter.post("/upload-logs", async (c) => {
   const authHeader = c.req.header("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -918,19 +944,31 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
       return c.json({ error: "Token expired or invalid" }, 401);
     }
     const now = Math.floor(Date.now() / 1000);
-    const tokenExp = Number(tokenPayload.exp || tokenPayload.sessionEndTime || 0);
+    const tokenExp = Number(
+      tokenPayload.exp || tokenPayload.sessionEndTime || 0,
+    );
     const maxGraceSeconds = 14 * 24 * 3600; // 14-day upload grace window
     if (tokenExp > 0 && now > tokenExp + maxGraceSeconds) {
-      return c.json({ error: "Log upload grace period (14 days) has expired" }, 401);
+      return c.json(
+        { error: "Log upload grace period (14 days) has expired" },
+        401,
+      );
     }
   }
 
   // Identity comes ONLY from the verified session token. Body fields are accepted
   // for backward compatibility but must match the token.
-  const tokenSessionCode = String(tokenPayload?.sessionCode || "").trim().toUpperCase();
-  const tokenStudentId = String(tokenPayload?.studentId || "").trim().toUpperCase();
+  const tokenSessionCode = String(tokenPayload?.sessionCode || "")
+    .trim()
+    .toUpperCase();
+  const tokenStudentId = String(tokenPayload?.studentId || "")
+    .trim()
+    .toUpperCase();
   if (!tokenSessionCode || !tokenStudentId) {
-    return c.json({ error: "A session token is required to upload logs." }, 403);
+    return c.json(
+      { error: "A session token is required to upload logs." },
+      403,
+    );
   }
 
   let sessionCode = "";
@@ -1019,7 +1057,10 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
   sessionCode = sessionCode || tokenSessionCode;
   studentId = studentId || tokenStudentId;
   if (sessionCode !== tokenSessionCode || studentId !== tokenStudentId) {
-    return c.json({ error: "sessionCode/studentId do not match your session token." }, 403);
+    return c.json(
+      { error: "sessionCode/studentId do not match your session token." },
+      403,
+    );
   }
 
   if (uploadFiles.length > MAX_UPLOAD_FILES) {
@@ -1050,7 +1091,10 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     }
   }
   if (totalBytes > MAX_UPLOAD_BYTES) {
-    return c.json({ error: `Upload too large (max ${MAX_UPLOAD_BYTES} bytes).` }, 413);
+    return c.json(
+      { error: `Upload too large (max ${MAX_UPLOAD_BYTES} bytes).` },
+      413,
+    );
   }
 
   const targetDir = path.resolve(
@@ -1087,6 +1131,11 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     expireTimeMs = signinTimeMs + durationMin * 60 * 1000;
   }
 
+  const nowMs = Date.now();
+  if (expireTimeMs && (durationMin >= 180 || expireTimeMs > nowMs)) {
+    expireTimeMs = Math.min(expireTimeMs, nowMs);
+  }
+
   const minUploadTimestampMs = signinTimeMs ? signinTimeMs : null;
   const maxUploadTimestampMs = expireTimeMs ? expireTimeMs + graceMs : null;
 
@@ -1116,7 +1165,10 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
       await fs.promises.mkdir(destDir, { recursive: true });
 
       // Preserve baseline initial snapshot: never overwrite start snapshot from machine 1
-      if (file.relativePath.endsWith("snapshot_start.zip") && fs.existsSync(destPath)) {
+      if (
+        file.relativePath.endsWith("snapshot_start.zip") &&
+        fs.existsSync(destPath)
+      ) {
         return;
       }
 
@@ -1136,9 +1188,12 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
         if (file.relativePath.endsWith("events.jsonl")) {
           logSanitizeMetrics.totalRawEvents = sanitizeRes.totalLines;
           logSanitizeMetrics.inWindowEvents = sanitizeRes.inWindowLines;
-          logSanitizeMetrics.droppedPreSigninEvents = sanitizeRes.droppedPreSigninLines;
-          logSanitizeMetrics.droppedPostExpireEvents = sanitizeRes.droppedPostExpireLines;
-          logSanitizeMetrics.droppedOutsideDateEvents = sanitizeRes.droppedOutsideDateLines;
+          logSanitizeMetrics.droppedPreSigninEvents =
+            sanitizeRes.droppedPreSigninLines;
+          logSanitizeMetrics.droppedPostExpireEvents =
+            sanitizeRes.droppedPostExpireLines;
+          logSanitizeMetrics.droppedOutsideDateEvents =
+            sanitizeRes.droppedOutsideDateLines;
         }
 
         if (fs.existsSync(destPath)) {
@@ -1150,12 +1205,21 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
               maxUploadTimestampMs,
               allowedDates,
             );
-            file.buffer = mergeJsonlBuffers(sanitizedExisting.buffer, file.buffer);
+            file.buffer = mergeJsonlBuffers(
+              sanitizedExisting.buffer,
+              file.buffer,
+            );
           } catch (err) {
-            console.warn(`[Logs] Failed to merge existing ${file.relativePath}:`, err);
+            console.warn(
+              `[Logs] Failed to merge existing ${file.relativePath}:`,
+              err,
+            );
           }
         }
-      } else if (file.relativePath.endsWith("metadata.json") && fs.existsSync(destPath)) {
+      } else if (
+        file.relativePath.endsWith("metadata.json") &&
+        fs.existsSync(destPath)
+      ) {
         try {
           const existingBuf = await fs.promises.readFile(destPath);
           file.buffer = mergeMetadataBuffers(existingBuf, file.buffer);
@@ -1181,8 +1245,12 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     validityWindow: {
       signinTimestamp: signinTimeMs || undefined,
       expireTimestamp: expireTimeMs || undefined,
-      signinISO: signinTimeMs ? new Date(signinTimeMs).toISOString() : undefined,
-      expireISO: expireTimeMs ? new Date(expireTimeMs).toISOString() : undefined,
+      signinISO: signinTimeMs
+        ? new Date(signinTimeMs).toISOString()
+        : undefined,
+      expireISO: expireTimeMs
+        ? new Date(expireTimeMs).toISOString()
+        : undefined,
       durationMinutes: durationMin,
       graceSeconds: 60,
     },
