@@ -2045,6 +2045,23 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     }
   >();
 
+  const sessionObj = sessions.get(sessionCode);
+  let manifest: any = null;
+  const manifestPath = path.join(sessionLogDir, "manifest.json");
+  if (fs.existsSync(manifestPath)) {
+    try {
+      manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf-8"));
+    } catch {}
+  }
+  const sessionCreationMs =
+    toMs(sessionObj?.startTime) ||
+    toMs(sessionObj?.createdAt) ||
+    toMs(manifest?.createdAt) ||
+    toMs(manifest?.startTime) ||
+    null;
+  const durationMin =
+    sessionObj?.durationMinutes || manifest?.durationMinutes || 90;
+
   if (fs.existsSync(sessionLogDir)) {
     try {
       const entries = await fs.promises.readdir(sessionLogDir, {
@@ -2086,27 +2103,116 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
           let totalEvents = 0;
           let foundEvents = false;
 
-          async function findEvents(dir: string) {
-            const sub = await fs.promises.readdir(dir, {
-              withFileTypes: true,
-            });
-            for (const s of sub) {
-              const full = path.join(dir, s.name);
-              if (s.isDirectory()) {
-                await findEvents(full);
-              } else if (s.name === "events.jsonl") {
-                foundEvents = true;
-                try {
-                  const content = await fs.promises.readFile(full, "utf-8");
-                  const lines = content
-                    .split("\n")
-                    .filter((l) => l.trim().length > 0);
-                  totalEvents += lines.length;
-                } catch {}
-              }
+          // 1. Check upload_info.json (authoritative in-window event metrics)
+          let uploadInfoData: any = null;
+          const directUploadInfo = path.join(entryPath, "upload_info.json");
+          if (fs.existsSync(directUploadInfo)) {
+            try {
+              uploadInfoData = JSON.parse(
+                await fs.promises.readFile(directUploadInfo, "utf-8"),
+              );
+            } catch {}
+          }
+          if (!uploadInfoData) {
+            const examRecordsDir = path.join(entryPath, "exam_records");
+            if (fs.existsSync(examRecordsDir)) {
+              try {
+                const recs = await fs.promises.readdir(examRecordsDir);
+                for (const r of recs.sort().reverse()) {
+                  const rUploadInfo = path.join(examRecordsDir, r, "upload_info.json");
+                  if (fs.existsSync(rUploadInfo)) {
+                    uploadInfoData = JSON.parse(
+                      await fs.promises.readFile(rUploadInfo, "utf-8"),
+                    );
+                    break;
+                  }
+                }
+              } catch {}
             }
           }
-          await findEvents(entryPath);
+
+          if (
+            uploadInfoData?.metrics &&
+            typeof uploadInfoData.metrics.inWindowEvents === "number"
+          ) {
+            totalEvents = uploadInfoData.metrics.inWindowEvents;
+            foundEvents = true;
+          } else {
+            // 2. Fallback: parse events.jsonl and slice strictly by session window
+            const sessionBeginTime =
+              toMs(uploadInfoData?.validityWindow?.signinTimestamp) ||
+              sessionCreationMs;
+            let sessionEndTime =
+              toMs(uploadInfoData?.validityWindow?.expireTimestamp);
+            const uploadTime = toMs(uploadInfoData?.uploadTimestamp);
+
+            if (
+              durationMin >= 180 ||
+              (sessionEndTime && uploadTime && uploadTime < sessionEndTime)
+            ) {
+              sessionEndTime = uploadTime || sessionEndTime;
+            }
+            if (!sessionEndTime && sessionBeginTime) {
+              sessionEndTime =
+                sessionBeginTime + Math.min(durationMin, 180) * 60 * 1000;
+            }
+
+            const allowedDates = new Set<string>();
+            if (sessionBeginTime) {
+              allowedDates.add(
+                new Date(sessionBeginTime).toISOString().slice(0, 10),
+              );
+            }
+            if (sessionEndTime) {
+              allowedDates.add(
+                new Date(sessionEndTime).toISOString().slice(0, 10),
+              );
+            }
+
+            async function findEvents(dir: string) {
+              const sub = await fs.promises.readdir(dir, {
+                withFileTypes: true,
+              });
+              for (const s of sub) {
+                const full = path.join(dir, s.name);
+                if (s.isDirectory()) {
+                  await findEvents(full);
+                } else if (s.name === "events.jsonl") {
+                  foundEvents = true;
+                  try {
+                    const content = await fs.promises.readFile(full, "utf-8");
+                    const lines = content.split("\n");
+                    const recs: any[] = [];
+                    for (const l of lines) {
+                      const trimmed = l.trim();
+                      if (!trimmed) continue;
+                      try {
+                        recs.push(JSON.parse(trimmed));
+                      } catch {}
+                    }
+                    if (recs.length > 0) {
+                      if (
+                        sessionBeginTime ||
+                        sessionEndTime ||
+                        allowedDates.size > 0
+                      ) {
+                        const sliced = sliceRecordsByTimeRange(
+                          recs,
+                          sessionBeginTime,
+                          sessionEndTime,
+                          allowedDates,
+                        );
+                        totalEvents += sliced.sliced.length;
+                      } else {
+                        totalEvents += recs.length;
+                      }
+                    }
+                  } catch {}
+                }
+              }
+            }
+            await findEvents(entryPath);
+          }
 
           const acc = accountMap.get(studentId) || {
             studentId,
@@ -2127,7 +2233,6 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
   }
 
   // Include in-memory session students if allowed
-  const sessionObj = sessions.get(sessionCode);
   if (sessionObj && sessionObj.allowedStudentIds) {
     for (const sid of sessionObj.allowedStudentIds) {
       if (!accountMap.has(sid)) {
@@ -2149,26 +2254,76 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     try {
       const s3Students =
         await s3Storage.listStudentsInSessionFromS3(sessionCode);
-      for (const s of s3Students) {
-        const existing = accountMap.get(s.studentId);
-        if (!existing) {
-          accountMap.set(s.studentId, {
-            studentId: s.studentId,
-            hasPromptLog: s.hasPromptLog,
-            hasEventLog: s.hasEventLog,
-            promptTurnsCount: s.hasPromptLog ? 1 : 0,
-            eventCount: s.hasEventLog ? 1 : 0,
-            lastActivity: s.lastActivity || Date.now(),
-            hasErrors: false,
-          });
-        } else {
-          existing.hasPromptLog = existing.hasPromptLog || s.hasPromptLog;
-          existing.hasEventLog = existing.hasEventLog || s.hasEventLog;
-          if (s.lastActivity && s.lastActivity > existing.lastActivity) {
-            existing.lastActivity = s.lastActivity;
+      await Promise.all(
+        s3Students.map(async (s) => {
+          let s3EventCount: number | null = null;
+          if (s.hasEventLog) {
+            try {
+              const uRaw = await s3Storage.getStudentFile(
+                sessionCode,
+                s.studentId,
+                "upload_info.json",
+              );
+              if (typeof uRaw === "string") {
+                const uInfo = JSON.parse(uRaw);
+                if (
+                  uInfo?.metrics &&
+                  typeof uInfo.metrics.inWindowEvents === "number"
+                ) {
+                  s3EventCount = uInfo.metrics.inWindowEvents;
+                }
+              }
+              if (s3EventCount === null) {
+                const s3Records = await s3Storage.listStudentExamRecords(
+                  sessionCode,
+                  s.studentId,
+                );
+                if (s3Records && s3Records.length > 0) {
+                  const targetRec = s3Records[0];
+                  const recURaw = await s3Storage.getExamRecordArtifact(
+                    sessionCode,
+                    s.studentId,
+                    targetRec,
+                    "upload_info.json",
+                  );
+                  if (typeof recURaw === "string") {
+                    const uInfo = JSON.parse(recURaw);
+                    if (
+                      uInfo?.metrics &&
+                      typeof uInfo.metrics.inWindowEvents === "number"
+                    ) {
+                      s3EventCount = uInfo.metrics.inWindowEvents;
+                    }
+                  }
+                }
+              }
+            } catch {}
           }
-        }
-      }
+
+          const existing = accountMap.get(s.studentId);
+          if (!existing) {
+            accountMap.set(s.studentId, {
+              studentId: s.studentId,
+              hasPromptLog: s.hasPromptLog,
+              hasEventLog: s.hasEventLog,
+              promptTurnsCount: s.hasPromptLog ? 1 : 0,
+              eventCount:
+                s3EventCount !== null ? s3EventCount : s.hasEventLog ? 1 : 0,
+              lastActivity: s.lastActivity || Date.now(),
+              hasErrors: false,
+            });
+          } else {
+            existing.hasPromptLog = existing.hasPromptLog || s.hasPromptLog;
+            existing.hasEventLog = existing.hasEventLog || s.hasEventLog;
+            if (s3EventCount !== null && s3EventCount > 0) {
+              existing.eventCount = s3EventCount;
+            }
+            if (s.lastActivity && s.lastActivity > existing.lastActivity) {
+              existing.lastActivity = s.lastActivity;
+            }
+          }
+        }),
+      );
     } catch (err) {
       console.error("[Visualize] S3 students listing error:", err);
     }
