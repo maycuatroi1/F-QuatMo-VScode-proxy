@@ -934,13 +934,6 @@ async function getSystemPromptForIem(
     if (!fs.existsSync(targetPath)) {
       targetPath = path.join(baseDir, folderName, fallbackFile);
     }
-    // Backward compatibility fallback to root src/systemPrompts/
-    if (!fs.existsSync(targetPath)) {
-      targetPath = path.join(baseDir, filename);
-    }
-    if (!fs.existsSync(targetPath)) {
-      targetPath = path.join(baseDir, "python_tutor.md");
-    }
 
     if (fs.existsSync(targetPath)) {
       const prompt = await fs.promises.readFile(targetPath, "utf-8");
@@ -964,6 +957,26 @@ async function getSystemPromptForIem(
     ? "You are Quạt Mo, an expert Socratic programming tutor. Never provide direct code solutions; guide the student conceptually through inquiry."
     : "You are Quạt Mo, an intelligent, helpful, and supportive AI programming tutor at FPT University.";
 }
+
+export const CLIENT_COMMAND_PRECEDENCE_DIRECTIVE =
+  "\n\n================================================================================\n" +
+  "UNIVERSAL SYSTEM DIRECTIVE: CLIENT COMMAND PRECEDENCE OVER ATTACHED CONTEXT\n" +
+  "================================================================================\n" +
+  "1. PRIORITIZE CLIENT PROMPT OVER ATTACHED FILES:\n" +
+  "   - Your highest priority is to attend strictly to the student's/client's explicit command.\n" +
+  "   - Attached files, active editor contents, and workspace tabs are PASSIVE BACKGROUND REFERENCE MATERIAL only.\n" +
+  "   - Do NOT proactively dissect, solve, rewrite, or debug attached files unless the client's explicit command directly instructs you to do so.\n" +
+  "   - If the client's message is a greeting, conceptual question, vague, or unrelated to editing the attached file, respond directly to their message and DO NOT touch or regenerate the attached file.\n" +
+  "2. STRICT SCOPE BOUNDING (ZERO PROACTIVE EXTRAPOLATION):\n" +
+  "   - Adhere strictly to the requested scope with 100% fidelity.\n" +
+  "   - If an attached file contains multiple questions, exercises, or tasks (e.g., Question 1, Question 2, Question 3) and the client asks ONLY about a specific item (e.g., 'Question 1' or 'câu 1'):\n" +
+  "     * You MUST address ONLY that specific requested question or task.\n" +
+  "     * You are STRICTLY FORBIDDEN from proactively solving, implementing, answering, or referencing Question 2, Question 3, or any unrequested parts in the file.\n" +
+  "     * Never extrapolate or solve ahead.\n" +
+  "3. SEPARATION OF SCOPE VS. TUTOR POLICY:\n" +
+  "   - The client's command determines the active TOPIC and SCOPE (e.g., focusing on Question 1).\n" +
+  "   - The active Tutor Policy strictly governs your RESPONSE METHOD (e.g., in Socratic mode, you guide conceptually and refuse runnable code; in Scaffolded mode, you provide modular assistance upon request).\n" +
+  "================================================================================\n";
 
 chatRouter.post(
   "/completions",
@@ -1258,11 +1271,11 @@ chatRouter.post(
           "- Respond 100% in English only.";
       } else if (promptMode === "socratic_tutor") {
         runtimePolicy =
-          "\n\nRUNTIME TUTOR POLICY (STRICT SOCRATIC TUTOR - ZERO CODE GENERATION):\n" +
-          "- CRITICAL ENFORCEMENT: You are STRICTLY FORBIDDEN from generating runnable solution code, complete functions, copy-pasteable blocks, or direct code corrections.\n" +
+          "\n\nRUNTIME TUTOR POLICY (STRICT SOCRATIC TUTOR - ZERO REAL CODE GENERATION):\n" +
+          "- CRITICAL ENFORCEMENT: You are STRICTLY FORBIDDEN from generating real, runnable solution code, complete functions, copy-pasteable blocks, or direct code corrections for the student's assignment.\n" +
           "- Guide the student exclusively through Socratic questioning, algorithmic decomposition, boundary case analysis, and conceptual frameworks.\n" +
           "- If the student demands direct code, politely explain that you are here to guide their reasoning so they master the concept themselves, then ask an illuminating question about their logic or approach.\n" +
-          "- High-level conceptual pseudocode is permitted ONLY if essential to illustrate structure, but NEVER runnable programming language code.\n" +
+          "- ONLY high-level conceptual pseudocode or minimal dummy code fragments with placeholders (e.g. `# TODO: fill condition`) are permitted if essential to illustrate structure, but NEVER real runnable programming language code solving their assignment.\n" +
           "- Keep inquiries focused, concise, and intellectually engaging.\n" +
           "- Respond 100% in English only.";
       } else {
@@ -1327,6 +1340,7 @@ chatRouter.post(
         content:
           tutorPrompt +
           runtimePolicy +
+          CLIENT_COMMAND_PRECEDENCE_DIRECTIVE +
           sessionContextBlock +
           warningText +
           ENGLISH_ONLY_SYSTEM_INSTRUCTION,
