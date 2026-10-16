@@ -1937,30 +1937,38 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
-  // Include S3 sessions (lightweight session index - returns in ~50ms)
+  // Include S3 sessions
   if (s3Storage.isAvailable()) {
     try {
       const s3SessionCodes = await s3Storage.listSessionsFromS3();
-      const newCodes = s3SessionCodes.filter((code) => !scannedCodes.has(code));
-      newCodes.forEach((code) => scannedCodes.add(code));
-
-      for (const code of newCodes) {
-        const sessionObj = sessions.get(code);
-        const sStart = toMs(sessionObj?.startTime);
-        const sCreated = toMs(sessionObj?.createdAt);
-        const sEnd = toMs(sessionObj?.endedAt);
-        resultSessions.push({
-          sessionCode: code,
-          sessionName: code,
-          promptLogCount: 0,
-          eventLogCount: 0,
-          lastActivity: sCreated || Date.now(),
-          studentCount: sessionObj?.allowedStudentIds?.size || 0,
-          startTime: sStart || sCreated || undefined,
-          createdAt: sCreated || sStart || undefined,
-          durationMinutes: sessionObj?.durationMinutes || 90,
-          endedAt: sEnd || undefined,
-        });
+      for (const code of s3SessionCodes) {
+        if (!scannedCodes.has(code)) {
+          scannedCodes.add(code);
+          const students = await s3Storage.listStudentsInSessionFromS3(code);
+          const sessionObj = sessions.get(code);
+          const promptLogCount = students.filter((s) => s.hasPromptLog).length;
+          const eventLogCount = students.filter((s) => s.hasEventLog).length;
+          const sStart = toMs(sessionObj?.startTime);
+          const sCreated = toMs(sessionObj?.createdAt);
+          const sEnd = toMs(sessionObj?.endedAt);
+          const lastActivity = Math.max(
+            ...students.map((s) => s.lastActivity || 0),
+            sCreated || Date.now(),
+          );
+          resultSessions.push({
+            sessionCode: code,
+            sessionName: code,
+            promptLogCount,
+            eventLogCount,
+            lastActivity,
+            studentCount:
+              students.length || sessionObj?.allowedStudentIds?.size || 0,
+            startTime: sStart || sCreated || undefined,
+            createdAt: sCreated || sStart || undefined,
+            durationMinutes: sessionObj?.durationMinutes || 90,
+            endedAt: sEnd || undefined,
+          });
+        }
       }
     } catch (err) {
       console.error("[Visualize] S3 sessions listing error:", err);
@@ -2005,29 +2013,8 @@ adminRouter.get("/visualize/sessions", async (c) => {
   });
   filteredSessions.sort((a, b) => b.lastActivity - a.lastActivity);
 
-  const page = parseInt(c.req.query("page") || "1", 10);
-  const limit = parseInt(c.req.query("limit") || "0", 10);
-
-  if (limit > 0) {
-    const total = filteredSessions.length;
-    const startIndex = Math.max(0, (page - 1) * limit);
-    const pagedSessions = filteredSessions.slice(startIndex, startIndex + limit);
-    return c.json({
-      sessions: pagedSessions,
-      total,
-      page,
-      limit,
-      hasMore: startIndex + pagedSessions.length < total,
-      guestSummary: {
-        count: guestLogCount,
-        lastActivity: guestLastActivity,
-      },
-    });
-  }
-
   return c.json({
     sessions: filteredSessions,
-    total: filteredSessions.length,
     guestSummary: {
       count: guestLogCount,
       lastActivity: guestLastActivity,
@@ -2371,6 +2358,8 @@ async function loadEventLogFromS3(
 
     let uploadTimestamp: number | null = null;
     let uploadTimeISO: string | null = null;
+    let validityWindow: any = null;
+    let uploadMetrics: any = null;
     if (typeof uploadInfoRaw === "string") {
       try {
         const u = JSON.parse(uploadInfoRaw);
@@ -2379,6 +2368,8 @@ async function loadEventLogFromS3(
           uploadTimestamp = raw < 1e11 ? raw * 1000 : raw;
         }
         if (u.uploadTimeISO) uploadTimeISO = u.uploadTimeISO;
+        if (u.validityWindow) validityWindow = u.validityWindow;
+        if (u.metrics) uploadMetrics = u.metrics;
       } catch {}
     }
 
@@ -2397,11 +2388,110 @@ async function loadEventLogFromS3(
       initialFiles,
       uploadTimestamp,
       uploadTimeISO,
+      validityWindow,
+      uploadMetrics,
     };
   } catch (err: any) {
     console.error("[Visualize] S3 event log fetch error:", err);
     return null;
   }
+}
+
+/**
+ * High-performance O(log N) binary search range slicing for chronological event records.
+ * Slices events strictly within [startMs, endMs] without linear O(N) full-array iteration.
+ */
+function sliceRecordsByTimeRange<T extends { timestamp?: any }>(
+  records: T[],
+  startMs: number | null,
+  endMs: number | null,
+  allowedDates?: Set<string>,
+): {
+  sliced: T[];
+  totalRaw: number;
+  preCount: number;
+  postCount: number;
+  outsideDateCount: number;
+} {
+  if (!records || records.length === 0) {
+    return { sliced: [], totalRaw: 0, preCount: 0, postCount: 0, outsideDateCount: 0 };
+  }
+
+  // Ensure chronological sort (stable check)
+  let isSorted = true;
+  for (let i = 1; i < records.length; i++) {
+    const prev = toMs(records[i - 1].timestamp) || 0;
+    const curr = toMs(records[i].timestamp) || 0;
+    if (curr < prev) {
+      isSorted = false;
+      break;
+    }
+  }
+
+  const sorted = isSorted
+    ? records
+    : [...records].sort((a, b) => (toMs(a.timestamp) || 0) - (toMs(b.timestamp) || 0));
+
+  // Binary search to find startIdx (first record >= startMs)
+  let startIdx = 0;
+  if (startMs !== null) {
+    let low = 0;
+    let high = sorted.length - 1;
+    startIdx = sorted.length;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const t = toMs(sorted[mid].timestamp);
+      if (t !== null && t >= startMs) {
+        startIdx = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+  }
+
+  // Binary search to find endIdx (first record > endMs)
+  let endIdx = sorted.length;
+  if (endMs !== null) {
+    let low = startIdx;
+    let high = sorted.length - 1;
+    endIdx = sorted.length;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const t = toMs(sorted[mid].timestamp);
+      if (t !== null && t > endMs) {
+        endIdx = mid;
+        high = mid - 1;
+      } else {
+        low = mid + 1;
+      }
+    }
+  }
+
+  const candidateSlice = sorted.slice(startIdx, endIdx);
+  let outsideDateCount = 0;
+  let finalSlice: T[] = candidateSlice;
+
+  if (allowedDates && allowedDates.size > 0) {
+    finalSlice = candidateSlice.filter((item) => {
+      const t = toMs(item.timestamp);
+      if (!t) return false;
+      const dateStr = new Date(t).toISOString().slice(0, 10);
+      if (!allowedDates.has(dateStr)) {
+        outsideDateCount++;
+        return false;
+      }
+      return true;
+    });
+  }
+
+  return {
+    sliced: finalSlice,
+    totalRaw: sorted.length,
+    preCount: startIdx,
+    postCount: sorted.length - endIdx,
+    outsideDateCount,
+  };
 }
 
 // 4. Get student event log
@@ -2448,6 +2538,8 @@ adminRouter.get(
     let initialFiles: Record<string, string> = {};
     let uploadTimestamp: number | null = null;
     let uploadTimeISO: string | null = null;
+    let validityWindow: any = null;
+    let uploadMetrics: any = null;
 
     if (!fs.existsSync(studentDir)) {
       // Check S3 if no local student directory
@@ -2465,6 +2557,8 @@ adminRouter.get(
         initialFiles = s3Result.initialFiles || {};
         uploadTimestamp = s3Result.uploadTimestamp;
         uploadTimeISO = s3Result.uploadTimeISO;
+        validityWindow = s3Result.validityWindow;
+        uploadMetrics = s3Result.uploadMetrics;
       } else {
         return c.json({
           sessionCode,
@@ -2560,6 +2654,8 @@ adminRouter.get(
               uploadTimestamp = rawTs < 1e11 ? rawTs * 1000 : rawTs;
             }
             if (uInfo.uploadTimeISO) uploadTimeISO = uInfo.uploadTimeISO;
+            if (uInfo.validityWindow) validityWindow = uInfo.validityWindow;
+            if (uInfo.metrics) uploadMetrics = uInfo.metrics;
           } catch {}
         }
 
@@ -2583,6 +2679,12 @@ adminRouter.get(
             if (!uploadTimestamp && s3Result.uploadTimestamp) {
               uploadTimestamp = s3Result.uploadTimestamp;
               uploadTimeISO = s3Result.uploadTimeISO;
+            }
+            if (!validityWindow && s3Result.validityWindow) {
+              validityWindow = s3Result.validityWindow;
+            }
+            if (!uploadMetrics && s3Result.uploadMetrics) {
+              uploadMetrics = s3Result.uploadMetrics;
             }
           }
         }
@@ -2612,8 +2714,10 @@ adminRouter.get(
         } catch {}
       }
 
-      let sessionBeginTime: number | null = null;
-      if (state?.loginTimestamp && state.loginTimestamp > 0) {
+      // 1. Resolve Authoritative Session Boundaries [T_signin, T_expire + grace]
+      let sessionBeginTime: number | null = toMs(validityWindow?.signinTimestamp) || null;
+
+      if (!sessionBeginTime && state?.loginTimestamp && state.loginTimestamp > 0) {
         sessionBeginTime = toMs(state.loginTimestamp);
       }
       if (!sessionBeginTime && redis && redis.status === "ready") {
@@ -2679,51 +2783,32 @@ adminRouter.get(
         } catch {}
       }
 
-      const metaStart = toMs(metadata?.examStartAt);
-      if (metaStart) {
-        if (uploadTimestamp) {
-          const diff = uploadTimestamp - metaStart;
-          if (diff > 0 && diff <= 4 * 3600 * 1000) {
-            sessionBeginTime = sessionBeginTime
-              ? Math.min(sessionBeginTime, metaStart)
-              : metaStart;
-          }
-        } else if (sessionBeginTime) {
-          const diff = Math.abs(metaStart - sessionBeginTime);
-          if (diff <= 2 * 3600 * 1000) {
-            sessionBeginTime = metaStart;
-          }
-        }
-      }
+      const durationMin =
+        session?.durationMinutes || manifest?.durationMinutes || validityWindow?.durationMinutes || 90;
 
       if (!sessionBeginTime && uploadTimestamp) {
-        const durationMin =
-          session?.durationMinutes || manifest?.durationMinutes || 90;
         sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
+      } else if (!sessionBeginTime) {
+        const metaStart = toMs(metadata?.examStartAt);
+        if (metaStart) sessionBeginTime = metaStart;
       }
 
-      let sessionEndTime: number | null = null;
-      if (uploadTimestamp) {
-        sessionEndTime = uploadTimestamp + 30 * 1000; // 30s buffer for finishing log sync
+      // 2. Resolve Authoritative Session Expiration Boundary
+      let sessionEndTime: number | null = toMs(validityWindow?.expireTimestamp) || null;
+      if (!sessionEndTime) {
         if (session?.endedAt && session.endedAt > 0) {
-          const sEnd = toMs(session.endedAt);
-          if (sEnd) sessionEndTime = Math.min(sessionEndTime, sEnd);
+          sessionEndTime = toMs(session.endedAt);
         } else if (manifest?.endedAt && manifest.endedAt > 0) {
-          const mEnd = toMs(manifest.endedAt);
-          if (mEnd) sessionEndTime = Math.min(sessionEndTime, mEnd);
+          sessionEndTime = toMs(manifest.endedAt);
+        } else if (sessionBeginTime) {
+          sessionEndTime = sessionBeginTime + durationMin * 60 * 1000;
         }
-      } else if (session?.endedAt && session.endedAt > 0) {
-        sessionEndTime = toMs(session.endedAt);
-      } else if (manifest?.endedAt && manifest.endedAt > 0) {
-        sessionEndTime = toMs(manifest.endedAt);
-      } else if (sessionBeginTime) {
-        const durationMin =
-          session?.durationMinutes || manifest?.durationMinutes || 90;
-        sessionEndTime =
-          sessionBeginTime + durationMin * 60 * 1000 + 10 * 60 * 1000;
       }
 
-      // Calendar date isolation & session creation boundary
+      const graceMs = 60 * 1000; // 60s network/flush tolerance buffer
+      const effectiveUpperBound = sessionEndTime ? sessionEndTime + graceMs : null;
+
+      // 3. Session Calendar Date Isolation
       const sessionCreationMs =
         toMs(session?.createdAt) ||
         toMs(session?.startTime) ||
@@ -2732,52 +2817,61 @@ adminRouter.get(
         sessionBeginTime;
 
       const allowedDates = new Set<string>();
-      if (sessionCreationMs) {
-        allowedDates.add(new Date(sessionCreationMs).toISOString().slice(0, 10));
-        const durMin = session?.durationMinutes || manifest?.durationMinutes || 1440;
-        allowedDates.add(new Date(sessionCreationMs + durMin * 60 * 1000).toISOString().slice(0, 10));
-      } else if (sessionBeginTime) {
+      if (sessionBeginTime) {
         allowedDates.add(new Date(sessionBeginTime).toISOString().slice(0, 10));
-        const durMin = session?.durationMinutes || manifest?.durationMinutes || 90;
-        allowedDates.add(new Date(sessionBeginTime + durMin * 60 * 1000).toISOString().slice(0, 10));
+        if (sessionEndTime) {
+          allowedDates.add(new Date(sessionEndTime).toISOString().slice(0, 10));
+        }
+      } else if (sessionCreationMs) {
+        allowedDates.add(new Date(sessionCreationMs).toISOString().slice(0, 10));
+        allowedDates.add(new Date(sessionCreationMs + durationMin * 60 * 1000).toISOString().slice(0, 10));
       } else if (uploadTimeISO) {
         allowedDates.add(uploadTimeISO.slice(0, 10));
       }
 
-      const unclamped = c.req.query("unclamped") === "true";
-      const filterRecord = (ev: any) => {
-        const t = toMs(ev.timestamp);
-        if (!t) return false;
-        // 1. Session date isolation: never include events from another calendar day
-        if (allowedDates.size > 0) {
-          const evDateStr = new Date(t).toISOString().slice(0, 10);
-          if (!allowedDates.has(evDateStr)) return false;
-        }
-        // 2. Never include events from before session creation (with a 15m tolerance)
-        if (sessionCreationMs && t < sessionCreationMs - 15 * 60 * 1000) {
-          return false;
-        }
-        // 3. Clamping against session begin / end window
-        if (sessionBeginTime && t < sessionBeginTime) return false;
-        if (sessionEndTime && t > sessionEndTime) return false;
-        return true;
-      };
+      const unclamped = c.req.query("unclamped") === "true" || c.req.query("mode") === "full_raw";
 
-      const clampedCoreRecords =
-        !unclamped && (sessionBeginTime || sessionEndTime || allowedDates.size > 0)
-          ? coreRecords.filter(filterRecord)
-          : coreRecords;
+      let clampedCoreRecords = coreRecords;
+      let clampedAiRecords = aiRecords;
+      let coreStats = { totalRaw: coreRecords.length, preCount: 0, postCount: 0, outsideDateCount: 0 };
+      let aiStats = { totalRaw: aiRecords.length, preCount: 0, postCount: 0, outsideDateCount: 0 };
 
-      const clampedAiRecords =
-        !unclamped && (sessionBeginTime || sessionEndTime || allowedDates.size > 0)
-          ? aiRecords.filter(filterRecord)
-          : aiRecords;
+      // 4. O(log N) High-Performance Binary Search Slicing
+      if (!unclamped && (sessionBeginTime !== null || effectiveUpperBound !== null || allowedDates.size > 0)) {
+        const coreRes = sliceRecordsByTimeRange(coreRecords, sessionBeginTime, effectiveUpperBound, allowedDates);
+        clampedCoreRecords = coreRes.sliced;
+        coreStats = coreRes;
+
+        const aiRes = sliceRecordsByTimeRange(aiRecords, sessionBeginTime, effectiveUpperBound, allowedDates);
+        clampedAiRecords = aiRes.sliced;
+        aiStats = aiRes;
+      }
 
       return c.json({
         sessionCode,
         studentId,
         activeRecordDir: path.basename(activeRecordDir),
         availableRecords,
+        validityWindow: {
+          signinTimestamp: sessionBeginTime,
+          expireTimestamp: sessionEndTime,
+          signinISO: sessionBeginTime ? new Date(sessionBeginTime).toISOString() : null,
+          expireISO: sessionEndTime ? new Date(sessionEndTime).toISOString() : null,
+          durationMinutes: durationMin,
+          graceSeconds: 60,
+        },
+        rangeApplied: {
+          from: sessionBeginTime,
+          to: effectiveUpperBound,
+          mode: unclamped ? "full_raw" : "session_validity",
+        },
+        stats: {
+          totalRawEvents: coreRecords.length,
+          inWindowEvents: clampedCoreRecords.length,
+          preSessionEvents: coreStats.preCount,
+          postSessionEvents: coreStats.postCount,
+          outsideDateEvents: coreStats.outsideDateCount,
+        },
         metadata: metadata || {
           examSessionId: path.basename(activeRecordDir),
           examStartAt:

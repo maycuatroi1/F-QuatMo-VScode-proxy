@@ -727,18 +727,33 @@ function toMs(ts: any): number | null {
   return n < 1e11 ? n * 1000 : n;
 }
 
+interface SanitizeResult {
+  buffer: Buffer;
+  totalLines: number;
+  inWindowLines: number;
+  droppedPreSigninLines: number;
+  droppedPostExpireLines: number;
+  droppedOutsideDateLines: number;
+}
+
 function sanitizeJsonlBuffer(
   buf: Buffer,
   minTimestampMs?: number | null,
+  maxTimestampMs?: number | null,
   allowedDates?: Set<string>,
-): Buffer {
+): SanitizeResult {
   const str = buf.toString("utf-8");
   const lines = str.split("\n");
   const keptLines: string[] = [];
+  let totalLines = 0;
+  let droppedPreSigninLines = 0;
+  let droppedPostExpireLines = 0;
+  let droppedOutsideDateLines = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    totalLines++;
     try {
       const obj = JSON.parse(trimmed);
       if (typeof obj === "object" && obj !== null && typeof obj.timestamp === "number") {
@@ -747,11 +762,17 @@ function sanitizeJsonlBuffer(
           if (allowedDates && allowedDates.size > 0) {
             const evDate = new Date(t).toISOString().slice(0, 10);
             if (!allowedDates.has(evDate)) {
+              droppedOutsideDateLines++;
               continue; // Drop event from outside allowed session dates
             }
           }
           if (minTimestampMs && t < minTimestampMs) {
+            droppedPreSigninLines++;
             continue; // Drop event prior to session boundary
+          }
+          if (maxTimestampMs && t > maxTimestampMs) {
+            droppedPostExpireLines++;
+            continue; // Drop event after session expiry boundary
           }
         }
       }
@@ -761,7 +782,14 @@ function sanitizeJsonlBuffer(
     }
   }
 
-  return Buffer.from(keptLines.join("\n") + (keptLines.length > 0 ? "\n" : ""), "utf-8");
+  return {
+    buffer: Buffer.from(keptLines.join("\n") + (keptLines.length > 0 ? "\n" : ""), "utf-8"),
+    totalLines,
+    inWindowLines: keptLines.length,
+    droppedPreSigninLines,
+    droppedPostExpireLines,
+    droppedOutsideDateLines,
+  };
 }
 
 function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
@@ -1035,27 +1063,49 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
 
   await fs.promises.mkdir(targetDir, { recursive: true });
 
-  // Resolve session temporal boundaries for log sanitization
+  // Resolve authoritative session temporal boundaries for log sanitization [T_signin, T_expire + grace]
   const session = sessions.get(sessionCode);
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
-  const sessionCreationMs =
-    toMs(session?.createdAt) ||
+
+  const signinTimeMs =
+    toMs(tokenPayload?.loginTime) ||
+    toMs(tokenPayload?.loginTimestamp) ||
+    toMs(state?.loginTimestamp) ||
     toMs(session?.startTime) ||
-    toMs(state?.loginTimestamp);
+    toMs(session?.createdAt);
+
+  const durationMin = session?.durationMinutes || 90;
+  const graceMs = 60 * 1000; // 60s network/flush grace window
+
+  let expireTimeMs: number | null = null;
+  if (tokenPayload?.sessionEndTime) {
+    expireTimeMs = toMs(tokenPayload.sessionEndTime);
+  } else if (session?.endedAt && session.endedAt > 0) {
+    expireTimeMs = toMs(session.endedAt);
+  } else if (signinTimeMs) {
+    expireTimeMs = signinTimeMs + durationMin * 60 * 1000;
+  }
+
+  const minUploadTimestampMs = signinTimeMs ? signinTimeMs : null;
+  const maxUploadTimestampMs = expireTimeMs ? expireTimeMs + graceMs : null;
 
   let allowedDates: Set<string> | undefined = undefined;
-  let minUploadTimestampMs: number | null = null;
-
-  if (sessionCreationMs) {
+  if (signinTimeMs) {
     allowedDates = new Set<string>();
-    const startD = new Date(sessionCreationMs).toISOString().slice(0, 10);
-    allowedDates.add(startD);
-    const durMin = session?.durationMinutes || 1440;
-    const endD = new Date(sessionCreationMs + durMin * 60 * 1000).toISOString().slice(0, 10);
-    allowedDates.add(endD);
-    minUploadTimestampMs = sessionCreationMs - 15 * 60 * 1000;
+    allowedDates.add(new Date(signinTimeMs).toISOString().slice(0, 10));
+    if (expireTimeMs) {
+      allowedDates.add(new Date(expireTimeMs).toISOString().slice(0, 10));
+    }
   }
+
+  const logSanitizeMetrics = {
+    totalRawEvents: 0,
+    inWindowEvents: 0,
+    droppedPreSigninEvents: 0,
+    droppedPostExpireEvents: 0,
+    droppedOutsideDateEvents: 0,
+  };
 
   // 1. Asynchronous concurrent local disk writes with JSONL merge support (preserves historical logs across reassignments)
   await Promise.all(
@@ -1074,14 +1124,33 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
         file.relativePath.endsWith("events.jsonl") ||
         file.relativePath.endsWith("ai_interactions.jsonl")
       ) {
-        // Sanitize incoming uploaded buffer first (strips leftover events from earlier days/sessions on student machine)
-        file.buffer = sanitizeJsonlBuffer(file.buffer, minUploadTimestampMs, allowedDates);
+        // Sanitize incoming uploaded buffer strictly against [T_signin, T_expire + grace]
+        const sanitizeRes = sanitizeJsonlBuffer(
+          file.buffer,
+          minUploadTimestampMs,
+          maxUploadTimestampMs,
+          allowedDates,
+        );
+        file.buffer = sanitizeRes.buffer;
+
+        if (file.relativePath.endsWith("events.jsonl")) {
+          logSanitizeMetrics.totalRawEvents = sanitizeRes.totalLines;
+          logSanitizeMetrics.inWindowEvents = sanitizeRes.inWindowLines;
+          logSanitizeMetrics.droppedPreSigninEvents = sanitizeRes.droppedPreSigninLines;
+          logSanitizeMetrics.droppedPostExpireEvents = sanitizeRes.droppedPostExpireLines;
+          logSanitizeMetrics.droppedOutsideDateEvents = sanitizeRes.droppedOutsideDateLines;
+        }
 
         if (fs.existsSync(destPath)) {
           try {
             const existingBuf = await fs.promises.readFile(destPath);
-            const sanitizedExisting = sanitizeJsonlBuffer(existingBuf, minUploadTimestampMs, allowedDates);
-            file.buffer = mergeJsonlBuffers(sanitizedExisting, file.buffer);
+            const sanitizedExisting = sanitizeJsonlBuffer(
+              existingBuf,
+              minUploadTimestampMs,
+              maxUploadTimestampMs,
+              allowedDates,
+            );
+            file.buffer = mergeJsonlBuffers(sanitizedExisting.buffer, file.buffer);
           } catch (err) {
             console.warn(`[Logs] Failed to merge existing ${file.relativePath}:`, err);
           }
@@ -1109,6 +1178,15 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
     uploadTimeISO: new Date().toISOString(),
     filesUploaded: savedCount,
     ip: c.req.header("x-forwarded-for") || "local",
+    validityWindow: {
+      signinTimestamp: signinTimeMs || undefined,
+      expireTimestamp: expireTimeMs || undefined,
+      signinISO: signinTimeMs ? new Date(signinTimeMs).toISOString() : undefined,
+      expireISO: expireTimeMs ? new Date(expireTimeMs).toISOString() : undefined,
+      durationMinutes: durationMin,
+      graceSeconds: 60,
+    },
+    metrics: logSanitizeMetrics,
   };
   await fs.promises.writeFile(
     metaPath,
