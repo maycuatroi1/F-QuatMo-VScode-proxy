@@ -521,58 +521,80 @@ export class S3StorageService {
         }),
       );
 
-      const result: Array<{
+      if (!resp.CommonPrefixes || resp.CommonPrefixes.length === 0) {
+        return [];
+      }
+
+      const studentTasks = resp.CommonPrefixes.map(async (cp: any) => {
+        if (!cp.Prefix) return null;
+        const parts = cp.Prefix.replace(/\/$/, "").split("/");
+        const studentId = parts[parts.length - 1];
+        if (!studentId) return null;
+
+        const promptLogKey = `${cp.Prefix}prompt_turns.json`;
+        let hasPromptLog = false;
+        let lastActivity: number | undefined;
+
+        const [headResult, examRecords] = await Promise.all([
+          this.sendCommand(
+            new HeadObjectCommand({
+              Bucket: this.bucket,
+              Key: promptLogKey,
+            }),
+          )
+            .then((head) => {
+              hasPromptLog = true;
+              if (head.LastModified) {
+                lastActivity = head.LastModified.getTime();
+              }
+            })
+            .catch(() => {}),
+          this.listStudentExamRecords(safeSession, studentId),
+        ]);
+
+        const hasEventLog = Array.isArray(examRecords) && examRecords.length > 0;
+
+        return {
+          studentId,
+          hasPromptLog,
+          hasEventLog,
+          lastActivity: lastActivity || Date.now(),
+        };
+      });
+
+      const students = await Promise.all(studentTasks);
+      return students.filter(Boolean) as Array<{
         studentId: string;
         hasPromptLog: boolean;
         hasEventLog: boolean;
         lastActivity?: number;
-      }> = [];
-
-      if (resp.CommonPrefixes) {
-        for (const cp of resp.CommonPrefixes) {
-          if (!cp.Prefix) continue;
-          const parts = cp.Prefix.replace(/\/$/, "").split("/");
-          const studentId = parts[parts.length - 1];
-          if (!studentId) continue;
-
-          const promptLogKey = `${cp.Prefix}prompt_turns.json`;
-          let hasPromptLog = false;
-          let lastActivity: number | undefined;
-
-          try {
-            const head = await this.sendCommand(
-              new HeadObjectCommand({
-                Bucket: this.bucket,
-                Key: promptLogKey,
-              }),
-            );
-            hasPromptLog = true;
-            if (head.LastModified) {
-              lastActivity = head.LastModified.getTime();
-            }
-          } catch {}
-
-          const examRecords = await this.listStudentExamRecords(
-            safeSession,
-            studentId,
-          );
-          const hasEventLog = examRecords.length > 0;
-
-          result.push({
-            studentId,
-            hasPromptLog,
-            hasEventLog,
-            lastActivity: lastActivity || Date.now(),
-          });
-        }
-      }
-      return result;
+      }>;
     } catch (err) {
       console.error(
         `[S3 Storage] Failed to list students for session ${sessionCode}:`,
         err,
       );
       return [];
+    }
+  }
+
+  public async countStudentsInSessionFromS3(
+    sessionCode: string,
+  ): Promise<number> {
+    if (!this.isAvailable() || !this.client) return 0;
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const studentsPrefix = `sessions/${safeSession}/students/`;
+    try {
+      const resp = await this.sendCommand(
+        new ListObjectsV2Command({
+          Bucket: this.bucket,
+          Prefix: studentsPrefix,
+          Delimiter: "/",
+        }),
+      );
+      return resp.CommonPrefixes?.length || 0;
+    } catch {
+      return 0;
     }
   }
 
