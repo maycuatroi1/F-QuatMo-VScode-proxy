@@ -36,6 +36,12 @@ function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
 }
 
+function toMs(ts: any): number | null {
+  const n = Number(ts);
+  if (!n || isNaN(n)) return null;
+  return n < 1e11 ? n * 1000 : n;
+}
+
 declare const Bun: any;
 import {
   lecturerAccounts,
@@ -1837,6 +1843,10 @@ adminRouter.get("/visualize/sessions", async (c) => {
     eventLogCount: number;
     lastActivity: number;
     studentCount: number;
+    startTime?: number;
+    createdAt?: number;
+    durationMinutes?: number;
+    endedAt?: number;
   }> = [];
 
   const scannedCodes = new Set<string>();
@@ -1882,6 +1892,9 @@ adminRouter.get("/visualize/sessions", async (c) => {
           }
         } catch {}
 
+        const sStart = toMs(sessionObj?.startTime);
+        const sCreated = toMs(sessionObj?.createdAt);
+        const sEnd = toMs(sessionObj?.endedAt);
         resultSessions.push({
           sessionCode: code,
           sessionName: code,
@@ -1889,8 +1902,12 @@ adminRouter.get("/visualize/sessions", async (c) => {
           eventLogCount,
           lastActivity:
             lastActivity ||
-            (sessionObj?.createdAt ? sessionObj.createdAt : Date.now()),
+            (sCreated ? sCreated : Date.now()),
           studentCount: studentIds.size,
+          startTime: sStart || sCreated || undefined,
+          createdAt: sCreated || sStart || undefined,
+          durationMinutes: sessionObj?.durationMinutes || 90,
+          endedAt: sEnd || undefined,
         });
       }
     } catch {}
@@ -1900,15 +1917,22 @@ adminRouter.get("/visualize/sessions", async (c) => {
   for (const [code, sessionObj] of sessions.entries()) {
     if (!scannedCodes.has(code)) {
       scannedCodes.add(code);
+      const sStart = toMs(sessionObj.startTime);
+      const sCreated = toMs(sessionObj.createdAt);
+      const sEnd = toMs(sessionObj.endedAt);
       resultSessions.push({
         sessionCode: code,
         sessionName: code,
         promptLogCount: 0,
         eventLogCount: 0,
-        lastActivity: sessionObj.createdAt || Date.now(),
+        lastActivity: sCreated || Date.now(),
         studentCount: sessionObj.allowedStudentIds
           ? sessionObj.allowedStudentIds.size
           : 0,
+        startTime: sStart || sCreated || undefined,
+        createdAt: sCreated || sStart || undefined,
+        durationMinutes: sessionObj.durationMinutes || 90,
+        endedAt: sEnd || undefined,
       });
     }
   }
@@ -1924,9 +1948,12 @@ adminRouter.get("/visualize/sessions", async (c) => {
           const sessionObj = sessions.get(code);
           const promptLogCount = students.filter((s) => s.hasPromptLog).length;
           const eventLogCount = students.filter((s) => s.hasEventLog).length;
+          const sStart = toMs(sessionObj?.startTime);
+          const sCreated = toMs(sessionObj?.createdAt);
+          const sEnd = toMs(sessionObj?.endedAt);
           const lastActivity = Math.max(
             ...students.map((s) => s.lastActivity || 0),
-            sessionObj?.createdAt || Date.now(),
+            sCreated || Date.now(),
           );
           resultSessions.push({
             sessionCode: code,
@@ -1936,6 +1963,10 @@ adminRouter.get("/visualize/sessions", async (c) => {
             lastActivity,
             studentCount:
               students.length || sessionObj?.allowedStudentIds?.size || 0,
+            startTime: sStart || sCreated || undefined,
+            createdAt: sCreated || sStart || undefined,
+            durationMinutes: sessionObj?.durationMinutes || 90,
+            endedAt: sEnd || undefined,
           });
         }
       }
@@ -2570,7 +2601,7 @@ adminRouter.get(
 
       let sessionBeginTime: number | null = null;
       if (state?.loginTimestamp && state.loginTimestamp > 0) {
-        sessionBeginTime = state.loginTimestamp;
+        sessionBeginTime = toMs(state.loginTimestamp);
       }
       if (!sessionBeginTime && redis && redis.status === "ready") {
         try {
@@ -2580,7 +2611,7 @@ adminRouter.get(
           );
           if (rTime) {
             const parsed = parseInt(rTime, 10);
-            if (!isNaN(parsed) && parsed > 0) sessionBeginTime = parsed;
+            if (!isNaN(parsed) && parsed > 0) sessionBeginTime = toMs(parsed);
           }
         } catch {}
       }
@@ -2590,7 +2621,7 @@ adminRouter.get(
             (s: any) => s.studentId?.toUpperCase() === studentId.toUpperCase(),
           );
           if (st?.loginTimestamp && st.loginTimestamp > 0) {
-            sessionBeginTime = st.loginTimestamp;
+            sessionBeginTime = toMs(st.loginTimestamp);
           }
         }
       }
@@ -2602,10 +2633,10 @@ adminRouter.get(
           manifest?.startTime)
       ) {
         sessionBeginTime =
-          session?.startTime ||
-          session?.createdAt ||
-          manifest?.createdAt ||
-          manifest?.startTime;
+          toMs(session?.startTime) ||
+          toMs(session?.createdAt) ||
+          toMs(manifest?.createdAt) ||
+          toMs(manifest?.startTime);
       }
 
       if (!sessionBeginTime) {
@@ -2635,8 +2666,8 @@ adminRouter.get(
         } catch {}
       }
 
-      const metaStart = Number(metadata?.examStartAt);
-      if (metaStart && !isNaN(metaStart)) {
+      const metaStart = toMs(metadata?.examStartAt);
+      if (metaStart) {
         if (uploadTimestamp) {
           const diff = uploadTimestamp - metaStart;
           if (diff > 0 && diff <= 4 * 3600 * 1000) {
@@ -2662,14 +2693,16 @@ adminRouter.get(
       if (uploadTimestamp) {
         sessionEndTime = uploadTimestamp + 30 * 1000; // 30s buffer for finishing log sync
         if (session?.endedAt && session.endedAt > 0) {
-          sessionEndTime = Math.min(sessionEndTime, session.endedAt);
+          const sEnd = toMs(session.endedAt);
+          if (sEnd) sessionEndTime = Math.min(sessionEndTime, sEnd);
         } else if (manifest?.endedAt && manifest.endedAt > 0) {
-          sessionEndTime = Math.min(sessionEndTime, manifest.endedAt);
+          const mEnd = toMs(manifest.endedAt);
+          if (mEnd) sessionEndTime = Math.min(sessionEndTime, mEnd);
         }
       } else if (session?.endedAt && session.endedAt > 0) {
-        sessionEndTime = session.endedAt;
+        sessionEndTime = toMs(session.endedAt);
       } else if (manifest?.endedAt && manifest.endedAt > 0) {
-        sessionEndTime = manifest.endedAt;
+        sessionEndTime = toMs(manifest.endedAt);
       } else if (sessionBeginTime) {
         const durationMin =
           session?.durationMinutes || manifest?.durationMinutes || 90;
@@ -2677,27 +2710,54 @@ adminRouter.get(
           sessionBeginTime + durationMin * 60 * 1000 + 10 * 60 * 1000;
       }
 
+      // Calendar date isolation & session creation boundary
+      const sessionCreationMs =
+        toMs(session?.createdAt) ||
+        toMs(session?.startTime) ||
+        toMs(manifest?.createdAt) ||
+        toMs(manifest?.startTime) ||
+        sessionBeginTime;
+
+      const allowedDates = new Set<string>();
+      if (sessionCreationMs) {
+        allowedDates.add(new Date(sessionCreationMs).toISOString().slice(0, 10));
+        const durMin = session?.durationMinutes || manifest?.durationMinutes || 1440;
+        allowedDates.add(new Date(sessionCreationMs + durMin * 60 * 1000).toISOString().slice(0, 10));
+      } else if (sessionBeginTime) {
+        allowedDates.add(new Date(sessionBeginTime).toISOString().slice(0, 10));
+        const durMin = session?.durationMinutes || manifest?.durationMinutes || 90;
+        allowedDates.add(new Date(sessionBeginTime + durMin * 60 * 1000).toISOString().slice(0, 10));
+      } else if (uploadTimeISO) {
+        allowedDates.add(uploadTimeISO.slice(0, 10));
+      }
+
       const unclamped = c.req.query("unclamped") === "true";
+      const filterRecord = (ev: any) => {
+        const t = toMs(ev.timestamp);
+        if (!t) return false;
+        // 1. Session date isolation: never include events from another calendar day
+        if (allowedDates.size > 0) {
+          const evDateStr = new Date(t).toISOString().slice(0, 10);
+          if (!allowedDates.has(evDateStr)) return false;
+        }
+        // 2. Never include events from before session creation (with a 15m tolerance)
+        if (sessionCreationMs && t < sessionCreationMs - 15 * 60 * 1000) {
+          return false;
+        }
+        // 3. Clamping against session begin / end window
+        if (sessionBeginTime && t < sessionBeginTime) return false;
+        if (sessionEndTime && t > sessionEndTime) return false;
+        return true;
+      };
+
       const clampedCoreRecords =
-        !unclamped && (sessionBeginTime || sessionEndTime)
-          ? coreRecords.filter((ev) => {
-              const t = Number(ev.timestamp);
-              if (!t) return true;
-              if (sessionBeginTime && t < sessionBeginTime) return false;
-              if (sessionEndTime && t > sessionEndTime) return false;
-              return true;
-            })
+        !unclamped && (sessionBeginTime || sessionEndTime || allowedDates.size > 0)
+          ? coreRecords.filter(filterRecord)
           : coreRecords;
 
       const clampedAiRecords =
-        !unclamped && (sessionBeginTime || sessionEndTime)
-          ? aiRecords.filter((ev) => {
-              const t = Number(ev.timestamp);
-              if (!t) return true;
-              if (sessionBeginTime && t < sessionBeginTime) return false;
-              if (sessionEndTime && t > sessionEndTime) return false;
-              return true;
-            })
+        !unclamped && (sessionBeginTime || sessionEndTime || allowedDates.size > 0)
+          ? aiRecords.filter(filterRecord)
           : aiRecords;
 
       return c.json({

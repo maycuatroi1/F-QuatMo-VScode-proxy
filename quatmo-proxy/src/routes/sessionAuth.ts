@@ -721,6 +721,49 @@ interface JsonlRecord {
   [key: string]: any;
 }
 
+function toMs(ts: any): number | null {
+  const n = Number(ts);
+  if (!n || isNaN(n)) return null;
+  return n < 1e11 ? n * 1000 : n;
+}
+
+function sanitizeJsonlBuffer(
+  buf: Buffer,
+  minTimestampMs?: number | null,
+  allowedDates?: Set<string>,
+): Buffer {
+  const str = buf.toString("utf-8");
+  const lines = str.split("\n");
+  const keptLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed);
+      if (typeof obj === "object" && obj !== null && typeof obj.timestamp === "number") {
+        const t = toMs(obj.timestamp);
+        if (t) {
+          if (allowedDates && allowedDates.size > 0) {
+            const evDate = new Date(t).toISOString().slice(0, 10);
+            if (!allowedDates.has(evDate)) {
+              continue; // Drop event from outside allowed session dates
+            }
+          }
+          if (minTimestampMs && t < minTimestampMs) {
+            continue; // Drop event prior to session boundary
+          }
+        }
+      }
+      keptLines.push(trimmed);
+    } catch {
+      keptLines.push(trimmed);
+    }
+  }
+
+  return Buffer.from(keptLines.join("\n") + (keptLines.length > 0 ? "\n" : ""), "utf-8");
+}
+
 function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
   const existingStr = existingBuf.toString("utf-8");
   const newStr = newBuf.toString("utf-8");
@@ -992,6 +1035,28 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
 
   await fs.promises.mkdir(targetDir, { recursive: true });
 
+  // Resolve session temporal boundaries for log sanitization
+  const session = sessions.get(sessionCode);
+  const stateKey = `${sessionCode}:${studentId}`;
+  const state = sessionStates.get(stateKey);
+  const sessionCreationMs =
+    toMs(session?.createdAt) ||
+    toMs(session?.startTime) ||
+    toMs(state?.loginTimestamp);
+
+  let allowedDates: Set<string> | undefined = undefined;
+  let minUploadTimestampMs: number | null = null;
+
+  if (sessionCreationMs) {
+    allowedDates = new Set<string>();
+    const startD = new Date(sessionCreationMs).toISOString().slice(0, 10);
+    allowedDates.add(startD);
+    const durMin = session?.durationMinutes || 1440;
+    const endD = new Date(sessionCreationMs + durMin * 60 * 1000).toISOString().slice(0, 10);
+    allowedDates.add(endD);
+    minUploadTimestampMs = sessionCreationMs - 15 * 60 * 1000;
+  }
+
   // 1. Asynchronous concurrent local disk writes with JSONL merge support (preserves historical logs across reassignments)
   await Promise.all(
     uploadFiles.map(async (file) => {
@@ -1006,15 +1071,20 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
       }
 
       if (
-        (file.relativePath.endsWith("events.jsonl") ||
-          file.relativePath.endsWith("ai_interactions.jsonl")) &&
-        fs.existsSync(destPath)
+        file.relativePath.endsWith("events.jsonl") ||
+        file.relativePath.endsWith("ai_interactions.jsonl")
       ) {
-        try {
-          const existingBuf = await fs.promises.readFile(destPath);
-          file.buffer = mergeJsonlBuffers(existingBuf, file.buffer);
-        } catch (err) {
-          console.warn(`[Logs] Failed to merge existing ${file.relativePath}:`, err);
+        // Sanitize incoming uploaded buffer first (strips leftover events from earlier days/sessions on student machine)
+        file.buffer = sanitizeJsonlBuffer(file.buffer, minUploadTimestampMs, allowedDates);
+
+        if (fs.existsSync(destPath)) {
+          try {
+            const existingBuf = await fs.promises.readFile(destPath);
+            const sanitizedExisting = sanitizeJsonlBuffer(existingBuf, minUploadTimestampMs, allowedDates);
+            file.buffer = mergeJsonlBuffers(sanitizedExisting, file.buffer);
+          } catch (err) {
+            console.warn(`[Logs] Failed to merge existing ${file.relativePath}:`, err);
+          }
         }
       } else if (file.relativePath.endsWith("metadata.json") && fs.existsSync(destPath)) {
         try {
