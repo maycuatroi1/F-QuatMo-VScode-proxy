@@ -277,6 +277,44 @@ export class S3StorageService {
     }
   }
 
+  public async getStudentFile(
+    sessionCode: string,
+    studentId: string,
+    relativePath: string,
+  ): Promise<string | Buffer | null> {
+    if (!this.isAvailable() || !this.client) return null;
+
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const safeStudent = sanitizeSegment(studentId).toUpperCase();
+    const cleanRelPath = relativePath.replace(/\\/g, "/").replace(/^\/+/, "");
+    const key = `sessions/${safeSession}/students/${safeStudent}/${cleanRelPath}`;
+
+    try {
+      const resp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        }),
+      );
+      if (!resp.Body) return null;
+      if (
+        cleanRelPath.endsWith(".json") ||
+        cleanRelPath.endsWith(".jsonl") ||
+        cleanRelPath.endsWith(".txt")
+      ) {
+        return await resp.Body.transformToString("utf-8");
+      }
+      const bytes = await resp.Body.transformToByteArray();
+      return Buffer.from(bytes);
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.error(`[S3 Storage] Failed to get student file ${key}:`, err);
+      return null;
+    }
+  }
+
   public async uploadExamRecordFile(
     sessionCode: string,
     studentId: string,

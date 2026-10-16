@@ -2261,32 +2261,34 @@ async function loadEventLogFromS3(
         ? reqRecordId
         : s3Records[0];
 
-    const [eventsRaw, aiRaw, metaRaw, zipBuffer] = await Promise.all([
-      s3Storage.getExamRecordArtifact(
-        sessionCode,
-        studentId,
-        targetRecordId,
-        "events.jsonl",
-      ),
-      s3Storage.getExamRecordArtifact(
-        sessionCode,
-        studentId,
-        targetRecordId,
-        "ai_interactions.jsonl",
-      ),
-      s3Storage.getExamRecordArtifact(
-        sessionCode,
-        studentId,
-        targetRecordId,
-        "metadata.json",
-      ),
-      s3Storage.getExamRecordArtifact(
-        sessionCode,
-        studentId,
-        targetRecordId,
-        "snapshot_start.zip",
-      ),
-    ]);
+    const [eventsRaw, aiRaw, metaRaw, zipBuffer, uploadInfoRaw] =
+      await Promise.all([
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "events.jsonl",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "ai_interactions.jsonl",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "metadata.json",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "snapshot_start.zip",
+        ),
+        s3Storage.getStudentFile(sessionCode, studentId, "upload_info.json"),
+      ]);
 
     const coreRecords: any[] = [];
     const aiRecords: any[] = [];
@@ -2323,6 +2325,19 @@ async function loadEventLogFromS3(
       } catch {}
     }
 
+    let uploadTimestamp: number | null = null;
+    let uploadTimeISO: string | null = null;
+    if (typeof uploadInfoRaw === "string") {
+      try {
+        const u = JSON.parse(uploadInfoRaw);
+        if (u.uploadTimestamp) {
+          const raw = Number(u.uploadTimestamp);
+          uploadTimestamp = raw < 1e11 ? raw * 1000 : raw;
+        }
+        if (u.uploadTimeISO) uploadTimeISO = u.uploadTimeISO;
+      } catch {}
+    }
+
     return {
       sessionCode,
       studentId,
@@ -2336,6 +2351,8 @@ async function loadEventLogFromS3(
       coreRecords,
       aiRecords,
       initialFiles,
+      uploadTimestamp,
+      uploadTimeISO,
     };
   } catch (err: any) {
     console.error("[Visualize] S3 event log fetch error:", err);
@@ -2379,6 +2396,15 @@ adminRouter.get(
       }
     }
 
+    let availableRecords: string[] = [];
+    let activeRecordDir = studentDir;
+    let coreRecords: any[] = [];
+    let aiRecords: any[] = [];
+    let metadata: any = null;
+    let initialFiles: Record<string, string> = {};
+    let uploadTimestamp: number | null = null;
+    let uploadTimeISO: string | null = null;
+
     if (!fs.existsSync(studentDir)) {
       // Check S3 if no local student directory
       const s3Result = await loadEventLogFromS3(
@@ -2387,121 +2413,166 @@ adminRouter.get(
         c.req.query("recordId"),
       );
       if (s3Result) {
-        return c.json(s3Result);
+        availableRecords = s3Result.availableRecords || [];
+        activeRecordDir = s3Result.activeRecordDir || "";
+        coreRecords = s3Result.coreRecords || [];
+        aiRecords = s3Result.aiRecords || [];
+        metadata = s3Result.metadata;
+        initialFiles = s3Result.initialFiles || {};
+        uploadTimestamp = s3Result.uploadTimestamp;
+        uploadTimeISO = s3Result.uploadTimeISO;
+      } else {
+        return c.json({
+          sessionCode,
+          studentId,
+          metadata: null,
+          coreRecords: [],
+          aiRecords: [],
+          availableRecords: [],
+          initialFiles: {},
+        });
       }
+    } else {
+      try {
+        const examRecordsDir = path.join(studentDir, "exam_records");
+        if (fs.existsSync(examRecordsDir)) {
+          const recEntries = await fs.promises.readdir(examRecordsDir, {
+            withFileTypes: true,
+          });
+          for (const r of recEntries) {
+            if (r.isDirectory()) {
+              availableRecords.push(r.name);
+            }
+          }
+          if (availableRecords.length > 0) {
+            availableRecords.sort().reverse();
+            const reqRecordId = c.req.query("recordId");
+            const targetRecordId =
+              reqRecordId && availableRecords.includes(reqRecordId)
+                ? reqRecordId
+                : availableRecords[0];
+            activeRecordDir = path.join(examRecordsDir, targetRecordId);
+          }
+        }
 
-      return c.json({
-        sessionCode,
-        studentId,
-        metadata: null,
-        coreRecords: [],
-        aiRecords: [],
-        availableRecords: [],
-        initialFiles: {},
-      });
+        const eventsPath = path.join(activeRecordDir, "events.jsonl");
+        const aiPath = path.join(activeRecordDir, "ai_interactions.jsonl");
+        const metadataPath = path.join(activeRecordDir, "metadata.json");
+        const snapshotZipPath = path.join(
+          activeRecordDir,
+          "snapshot_start.zip",
+        );
+
+        if (fs.existsSync(metadataPath)) {
+          try {
+            const raw = await fs.promises.readFile(metadataPath, "utf-8");
+            metadata = JSON.parse(raw);
+          } catch {}
+        }
+
+        if (fs.existsSync(eventsPath)) {
+          try {
+            const content = await fs.promises.readFile(eventsPath, "utf-8");
+            const lines = content.split("\n");
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                coreRecords.push(JSON.parse(trimmed));
+              } catch {}
+            }
+          } catch {}
+        }
+
+        if (fs.existsSync(aiPath)) {
+          try {
+            const content = await fs.promises.readFile(aiPath, "utf-8");
+            const lines = content.split("\n");
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                aiRecords.push(JSON.parse(trimmed));
+              } catch {}
+            }
+          } catch {}
+        }
+
+        if (fs.existsSync(snapshotZipPath)) {
+          try {
+            const zip = new AdmZip(snapshotZipPath);
+            Object.assign(initialFiles, readZipTextEntriesSafely(zip));
+          } catch {}
+        }
+
+        const uploadInfoPath = path.join(studentDir, "upload_info.json");
+        if (fs.existsSync(uploadInfoPath)) {
+          try {
+            const uInfo = JSON.parse(
+              await fs.promises.readFile(uploadInfoPath, "utf-8"),
+            );
+            if (uInfo.uploadTimestamp) {
+              const rawTs = Number(uInfo.uploadTimestamp);
+              uploadTimestamp = rawTs < 1e11 ? rawTs * 1000 : rawTs;
+            }
+            if (uInfo.uploadTimeISO) uploadTimeISO = uInfo.uploadTimeISO;
+          } catch {}
+        }
+
+        if (
+          availableRecords.length === 0 &&
+          coreRecords.length === 0 &&
+          s3Storage.isAvailable()
+        ) {
+          const s3Result = await loadEventLogFromS3(
+            sessionCode,
+            studentId,
+            c.req.query("recordId"),
+          );
+          if (s3Result) {
+            availableRecords = s3Result.availableRecords || [];
+            activeRecordDir = s3Result.activeRecordDir || "";
+            coreRecords = s3Result.coreRecords || [];
+            aiRecords = s3Result.aiRecords || [];
+            metadata = s3Result.metadata;
+            initialFiles = s3Result.initialFiles || {};
+            if (!uploadTimestamp && s3Result.uploadTimestamp) {
+              uploadTimestamp = s3Result.uploadTimestamp;
+              uploadTimeISO = s3Result.uploadTimeISO;
+            }
+          }
+        }
+      } catch (err: any) {
+        return c.json({ error: `Failed to load event log` }, 500);
+      }
     }
 
     try {
-      const availableRecords: string[] = [];
-      let activeRecordDir = studentDir;
-
-      const examRecordsDir = path.join(studentDir, "exam_records");
-      if (fs.existsSync(examRecordsDir)) {
-        const recEntries = await fs.promises.readdir(examRecordsDir, {
-          withFileTypes: true,
-        });
-        for (const r of recEntries) {
-          if (r.isDirectory()) {
-            availableRecords.push(r.name);
-          }
-        }
-        if (availableRecords.length > 0) {
-          availableRecords.sort().reverse();
-          const reqRecordId = c.req.query("recordId");
-          const targetRecordId =
-            reqRecordId && availableRecords.includes(reqRecordId)
-              ? reqRecordId
-              : availableRecords[0];
-          activeRecordDir = path.join(examRecordsDir, targetRecordId);
-        }
-      }
-
-      const eventsPath = path.join(activeRecordDir, "events.jsonl");
-      const aiPath = path.join(activeRecordDir, "ai_interactions.jsonl");
-      const metadataPath = path.join(activeRecordDir, "metadata.json");
-      const snapshotZipPath = path.join(activeRecordDir, "snapshot_start.zip");
-
-      const coreRecords: any[] = [];
-      const aiRecords: any[] = [];
-      let metadata: any = null;
-      const initialFiles: Record<string, string> = {};
-
-      if (fs.existsSync(metadataPath)) {
-        try {
-          const raw = await fs.promises.readFile(metadataPath, "utf-8");
-          metadata = JSON.parse(raw);
-        } catch {}
-      }
-
-      if (fs.existsSync(eventsPath)) {
-        try {
-          const content = await fs.promises.readFile(eventsPath, "utf-8");
-          const lines = content.split("\n");
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              coreRecords.push(JSON.parse(trimmed));
-            } catch {}
-          }
-        } catch {}
-      }
-
-      if (fs.existsSync(aiPath)) {
-        try {
-          const content = await fs.promises.readFile(aiPath, "utf-8");
-          const lines = content.split("\n");
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              aiRecords.push(JSON.parse(trimmed));
-            } catch {}
-          }
-        } catch {}
-      }
-
-      if (fs.existsSync(snapshotZipPath)) {
-        try {
-          const zip = new AdmZip(snapshotZipPath);
-          Object.assign(initialFiles, readZipTextEntriesSafely(zip));
-        } catch {}
-      }
-
-      if (
-        availableRecords.length === 0 &&
-        coreRecords.length === 0 &&
-        s3Storage.isAvailable()
-      ) {
-        const s3Result = await loadEventLogFromS3(
-          sessionCode,
-          studentId,
-          c.req.query("recordId"),
-        );
-        if (s3Result) {
-          return c.json(s3Result);
-        }
-      }
-
       const session = sessions.get(sessionCode);
       const stateKey = `${sessionCode}:${studentId}`;
       const state = sessionStates.get(stateKey);
 
-      let loginTimestamp: number | null =
-        state?.loginTimestamp && state.loginTimestamp > 0
-          ? state.loginTimestamp
-          : null;
-      if (!loginTimestamp && redis && redis.status === "ready") {
+      let manifest: any = null;
+      const manifestPath = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        sessionCode,
+        "session_manifest.json",
+      );
+      if (fs.existsSync(manifestPath)) {
+        try {
+          manifest = JSON.parse(
+            await fs.promises.readFile(manifestPath, "utf-8"),
+          );
+        } catch {}
+      }
+
+      let sessionBeginTime: number | null = null;
+      if (state?.loginTimestamp && state.loginTimestamp > 0) {
+        sessionBeginTime = state.loginTimestamp;
+      }
+      if (!sessionBeginTime && redis && redis.status === "ready") {
         try {
           const rTime = await redis.hget(
             `session:user:${sessionCode}:${studentId}`,
@@ -2509,76 +2580,121 @@ adminRouter.get(
           );
           if (rTime) {
             const parsed = parseInt(rTime, 10);
-            if (!isNaN(parsed) && parsed > 0) loginTimestamp = parsed;
+            if (!isNaN(parsed) && parsed > 0) sessionBeginTime = parsed;
           }
         } catch {}
       }
-
-      let uploadTimestamp: number | null = null;
-      let uploadTimeISO: string | null = null;
-      const uploadInfoPath = path.join(studentDir, "upload_info.json");
-      if (fs.existsSync(uploadInfoPath)) {
-        try {
-          const uInfo = JSON.parse(
-            await fs.promises.readFile(uploadInfoPath, "utf-8"),
+      if (!sessionBeginTime && manifest) {
+        if (Array.isArray(manifest.students)) {
+          const st = manifest.students.find(
+            (s: any) => s.studentId?.toUpperCase() === studentId.toUpperCase(),
           );
-          if (uInfo.uploadTimestamp) {
-            const rawTs = Number(uInfo.uploadTimestamp);
-            uploadTimestamp = rawTs < 1_000_000_000_000 ? rawTs * 1000 : rawTs;
+          if (st?.loginTimestamp && st.loginTimestamp > 0) {
+            sessionBeginTime = st.loginTimestamp;
           }
-          if (uInfo.uploadTimeISO) uploadTimeISO = uInfo.uploadTimeISO;
+        }
+      }
+      if (
+        !sessionBeginTime &&
+        (session?.startTime ||
+          session?.createdAt ||
+          manifest?.createdAt ||
+          manifest?.startTime)
+      ) {
+        sessionBeginTime =
+          session?.startTime ||
+          session?.createdAt ||
+          manifest?.createdAt ||
+          manifest?.startTime;
+      }
+
+      if (!sessionBeginTime) {
+        try {
+          const studentJsonPath = path.resolve(
+            process.cwd(),
+            "logs",
+            "sessions",
+            sessionCode,
+            `${studentId}.json`,
+          );
+          if (fs.existsSync(studentJsonPath)) {
+            const pTurns = JSON.parse(
+              await fs.promises.readFile(studentJsonPath, "utf-8"),
+            );
+            if (
+              Array.isArray(pTurns) &&
+              pTurns.length > 0 &&
+              pTurns[0].timestamp
+            ) {
+              const firstTurnMs = new Date(pTurns[0].timestamp).getTime();
+              if (!isNaN(firstTurnMs) && firstTurnMs > 0) {
+                sessionBeginTime = firstTurnMs - 10 * 60 * 1000;
+              }
+            }
+          }
         } catch {}
       }
 
-      if (!loginTimestamp && uploadTimeISO) {
-        const sessionDate = new Date(uploadTimeISO);
-        const sessionDayStart = new Date(
-          sessionDate.getFullYear(),
-          sessionDate.getMonth(),
-          sessionDate.getDate(),
-          0,
-          0,
-          0,
-          0,
-        ).getTime();
-        const firstDayEvent = coreRecords.find(
-          (e) => Number(e.timestamp) >= sessionDayStart,
-        );
-        if (firstDayEvent) {
-          loginTimestamp = Number(firstDayEvent.timestamp);
+      const metaStart = Number(metadata?.examStartAt);
+      if (metaStart && !isNaN(metaStart)) {
+        if (uploadTimestamp) {
+          const diff = uploadTimestamp - metaStart;
+          if (diff > 0 && diff <= 4 * 3600 * 1000) {
+            sessionBeginTime = sessionBeginTime
+              ? Math.min(sessionBeginTime, metaStart)
+              : metaStart;
+          }
+        } else if (sessionBeginTime) {
+          const diff = Math.abs(metaStart - sessionBeginTime);
+          if (diff <= 2 * 3600 * 1000) {
+            sessionBeginTime = metaStart;
+          }
         }
       }
 
-      let sessionEndTime: number | null = uploadTimestamp;
-      if (!sessionEndTime && session) {
-        if (session.endedAt && session.endedAt > 0) {
-          sessionEndTime = session.endedAt;
-        } else if (session.createdAt && session.durationMinutes) {
-          sessionEndTime =
-            session.createdAt +
-            session.durationMinutes * 60 * 1000 +
-            10 * 60 * 1000;
+      if (!sessionBeginTime && uploadTimestamp) {
+        const durationMin =
+          session?.durationMinutes || manifest?.durationMinutes || 90;
+        sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
+      }
+
+      let sessionEndTime: number | null = null;
+      if (uploadTimestamp) {
+        sessionEndTime = uploadTimestamp + 30 * 1000; // 30s buffer for finishing log sync
+        if (session?.endedAt && session.endedAt > 0) {
+          sessionEndTime = Math.min(sessionEndTime, session.endedAt);
+        } else if (manifest?.endedAt && manifest.endedAt > 0) {
+          sessionEndTime = Math.min(sessionEndTime, manifest.endedAt);
         }
+      } else if (session?.endedAt && session.endedAt > 0) {
+        sessionEndTime = session.endedAt;
+      } else if (manifest?.endedAt && manifest.endedAt > 0) {
+        sessionEndTime = manifest.endedAt;
+      } else if (sessionBeginTime) {
+        const durationMin =
+          session?.durationMinutes || manifest?.durationMinutes || 90;
+        sessionEndTime =
+          sessionBeginTime + durationMin * 60 * 1000 + 10 * 60 * 1000;
       }
 
       const unclamped = c.req.query("unclamped") === "true";
       const clampedCoreRecords =
-        !unclamped && loginTimestamp && loginTimestamp > 0
+        !unclamped && (sessionBeginTime || sessionEndTime)
           ? coreRecords.filter((ev) => {
               const t = Number(ev.timestamp);
               if (!t) return true;
-              if (loginTimestamp && t < loginTimestamp) return false;
+              if (sessionBeginTime && t < sessionBeginTime) return false;
               if (sessionEndTime && t > sessionEndTime) return false;
               return true;
             })
           : coreRecords;
 
       const clampedAiRecords =
-        !unclamped && loginTimestamp && loginTimestamp > 0
+        !unclamped && (sessionBeginTime || sessionEndTime)
           ? aiRecords.filter((ev) => {
               const t = Number(ev.timestamp);
               if (!t) return true;
-              if (loginTimestamp && t < loginTimestamp) return false;
+              if (sessionBeginTime && t < sessionBeginTime) return false;
               if (sessionEndTime && t > sessionEndTime) return false;
               return true;
             })
@@ -2592,21 +2708,23 @@ adminRouter.get(
         metadata: metadata || {
           examSessionId: path.basename(activeRecordDir),
           examStartAt:
-            clampedCoreRecords[0]?.timestamp || loginTimestamp || Date.now(),
+            sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
           examEndAt:
-            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
             sessionEndTime ||
+            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
             Date.now(),
         },
         coreRecords: clampedCoreRecords,
         aiRecords: clampedAiRecords,
         initialFiles,
-        loginTimestamp,
+        loginTimestamp: sessionBeginTime,
         sessionEndTime,
         totalRawEvents: coreRecords.length,
         clampedEventsCount: clampedCoreRecords.length,
         isClamped:
-          !unclamped && coreRecords.length !== clampedCoreRecords.length,
+          !unclamped &&
+          (coreRecords.length !== clampedCoreRecords.length ||
+            aiRecords.length !== clampedAiRecords.length),
       });
     } catch (err: any) {
       return c.json({ error: `Failed to load event log` }, 500);
