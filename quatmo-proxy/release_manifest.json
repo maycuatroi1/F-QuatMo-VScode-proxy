@@ -1,0 +1,17 @@
+{
+  "version": "1.96.8",
+  "commit": "0c305f1b8afea035cdb283bef94edb88b7029f98",
+  "updateType": "patch",
+  "productVersion": "1.96.8",
+  "releasedAt": "2026-10-09T03:58:44.198Z",
+  "mandatory": true,
+  "notes": "Update monitor log save",
+  "filename": "Fvscode-Patch-1.96.8.zip",
+  "s3Key": "releases/Fvscode-Patch-1.96.8.zip",
+  "downloadUrl": "https://fvscode-proxy.iahn.hanoi.vn/v1/releases/Fvscode-Patch-1.96.8.zip",
+  "sha256hash": "fe7fa7cd8e013e4ee84ca691bb217f80bceaa4abdbea50314e05b604324a16eb",
+  "sizeBytes": 36621595,
+  "sizeMB": 34.93,
+  "buildHash": "b7646fb5eed6c6401786547e9a3f86d1e58c8fecababd6338a1367be70694ae3",
+  "signature": "ed25519:REupxZE0ppdMH5IO8Zp/XOLCjaXDrq/Oa56uc7QMros6GvoxSTaD/Lktt0LKOXGAN2RXHr75oLrtz0SD9CbkDA=="
+}

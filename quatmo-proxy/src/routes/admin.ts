@@ -1,4 +1,10 @@
 import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
+import {
+  getTrustedClientIP,
+  readZipTextEntriesSafely,
+  safeEqual,
+} from "../services/security";
 import {
   checkLockout,
   recordFailedAttempt,
@@ -8,15 +14,7 @@ import {
 } from "../services/rateLimiter";
 
 export function getClientIP(c: any): string {
-  const forwarded = c.req.header("x-forwarded-for");
-  if (forwarded) {
-    return forwarded.split(",")[0].trim();
-  }
-  const realIp = c.req.header("x-real-ip");
-  if (realIp) {
-    return realIp.trim();
-  }
-  return "127.0.0.1";
+  return getTrustedClientIP((n) => c.req.header(n));
 }
 import { getProxyApiKey } from "../services/proxyKey";
 import {
@@ -24,12 +22,15 @@ import {
   getAdminPassword,
 } from "../services/adminCredentials";
 import { redis } from "../services/redis";
+import { redisStore } from "../services/classifier/redisStore";
 import { sign, verify } from "hono/jwt";
 import { getJwtSecret } from "../services/jwtKey";
 import AdmZip from "adm-zip";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import { s3Storage } from "../services/s3Storage";
+import { reconcileStudentPromptTurns } from "../services/telemetryMigration";
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -47,6 +48,8 @@ import {
   type LecturerAccount,
   type Group,
   type StudentAccount,
+  type SessionRuntimeConfig,
+  type SessionPromptMode,
 } from "../services/sessionStore";
 
 type AdminVariables = {
@@ -58,24 +61,34 @@ const adminRouter = new Hono<{ Variables: AdminVariables }>();
 // ─── FLOW ────────────────────────────────────────────────────────────────────
 //  Middleware protecting Admin data endpoints via PROXY_API_KEY or Admin/Lecturer JWT Token
 // ─────────────────────────────────────────────────────────────────────────────
+const ADMIN_LOGIN_PATHS = new Set(["/admin/login", "/v1/admin/login"]);
+
+/** Returns the authenticated caller or aborts with 401 (never defaults to admin). */
+function requireCaller(c: any): {
+  username: string;
+  role: string;
+  name: string;
+} {
+  const caller = c.get("caller");
+  if (!caller || !caller.role || !caller.username) {
+    throw new HTTPException(401, { message: "Unauthorized" });
+  }
+  return caller;
+}
+
 adminRouter.use("*", async (c, next) => {
-  const path = c.req.path;
-  const url = c.req.url;
-  if (
-    c.req.method === "OPTIONS" ||
-    path.includes("/login") ||
-    url.includes("/login")
-  ) {
+  // Only the exact login routes are public. Never match on the raw URL/query string
+  // (e.g. "/admin/lecturers?x=/login" used to bypass authentication).
+  if (c.req.method === "OPTIONS" || ADMIN_LOGIN_PATHS.has(c.req.path)) {
     await next();
     return;
   }
 
   const masterKey = getProxyApiKey();
-  const xApiKey = c.req.header("x-api-key") || c.req.header("X-API-Key");
+  const xApiKey = (c.req.header("x-api-key") || "").trim();
   const authHeader = c.req.header("Authorization");
 
-  // If x-api-key is supplied, validate it against masterKey
-  if (xApiKey && xApiKey.trim() !== masterKey) {
+  if (xApiKey && !safeEqual(xApiKey, masterKey)) {
     return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
   }
 
@@ -84,7 +97,7 @@ adminRouter.use("*", async (c, next) => {
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7).trim();
 
-    if (token === masterKey) {
+    if (safeEqual(token, masterKey)) {
       caller = { username: "admin", role: "admin", name: "Super Admin" };
     } else {
       try {
@@ -93,21 +106,51 @@ adminRouter.use("*", async (c, next) => {
           getJwtSecret(),
           "HS256" as any,
         );
-        if (decoded && (decoded.role || decoded.username)) {
+        // Only tokens minted by /admin/login are accepted: explicit role + username,
+        // and never student/session tokens (which share the same signing secret).
+        if (
+          decoded &&
+          (decoded.role === "admin" || decoded.role === "lecturer") &&
+          typeof decoded.username === "string" &&
+          decoded.username &&
+          !decoded.studentId &&
+          !decoded.sessionCode
+        ) {
+          if (decoded.role === "lecturer") {
+            const lec = lecturerAccounts.get(decoded.username);
+            if (!lec || lec.status === "inactive") {
+              return c.json(
+                { error: "Lecturer account is inactive or no longer exists." },
+                401,
+              );
+            }
+          }
           caller = {
-            username: decoded.username || "admin",
-            role: decoded.role || "admin",
-            name: decoded.name || decoded.username || "Admin",
+            username: decoded.username,
+            role: decoded.role,
+            name: decoded.name || decoded.username,
           };
         }
       } catch {
-        // Invalid JWT
+        // JWT verification failed
+      }
+
+      // A Bearer token was present but invalid or expired.
+      // NEVER fall back to admin identity via x-api-key when a token was provided —
+      // this would silently promote a lecturer's expired session into admin and corrupt
+      // data isolation (createdBy field gets stamped as "admin" instead of the lecturer).
+      if (!caller) {
+        return c.json(
+          {
+            error:
+              "Unauthorized. Session expired or invalid token. Please sign in again.",
+          },
+          401,
+        );
       }
     }
-  }
-
-  // If no valid JWT token in Authorization header, check x-api-key
-  if (!caller && xApiKey && xApiKey.trim() === masterKey) {
+  } else if (xApiKey && safeEqual(xApiKey, masterKey)) {
+    // Pure API-key-only access (no Bearer token): for server-to-server scripts or curl.
     caller = { username: "admin", role: "admin", name: "Super Admin" };
   }
 
@@ -117,8 +160,43 @@ adminRouter.use("*", async (c, next) => {
     return;
   }
 
-  return c.json({ error: "Unauthorized. Invalid Proxy API Key" }, 401);
+  return c.json({ error: "Unauthorized. Invalid Token or Proxy API Key" }, 401);
 });
+
+// ─── Role / ownership guards ─────────────────────────────────────────────────
+const requireSuperAdmin = async (c: any, next: any) => {
+  const caller = requireCaller(c);
+  if (caller.role !== "admin") {
+    return c.json({ error: "Forbidden. Super Admin access required." }, 403);
+  }
+  await next();
+};
+
+/** Lecturers may only touch sessions they created; super admin may touch all. */
+const requireSessionOwner = async (c: any, next: any) => {
+  const caller = requireCaller(c);
+  if (caller.role === "admin") {
+    await next();
+    return;
+  }
+  const code = String(c.req.param("sessionCode") || "").toUpperCase();
+  const session = sessions.get(code);
+  const owner = (session?.createdBy || "admin").toLowerCase();
+  if (!session || owner !== caller.username.toLowerCase()) {
+    return c.json({ error: "Forbidden. You do not own this session." }, 403);
+  }
+  await next();
+};
+
+adminRouter.use("/sessions/:sessionCode", requireSessionOwner);
+adminRouter.use("/sessions/:sessionCode/*", requireSessionOwner);
+adminRouter.use("/visualize/sessions/:sessionCode/*", requireSessionOwner);
+adminRouter.use("/logs/*", requireSuperAdmin);
+adminRouter.use("/guests/*", requireSuperAdmin);
+adminRouter.use("/visualize/guests", requireSuperAdmin);
+adminRouter.use("/visualize/guests/*", requireSuperAdmin);
+adminRouter.use("/s3/*", requireSuperAdmin);
+adminRouter.use("/security/*", requireSuperAdmin);
 
 // Admin / Lecturer login endpoint validating credentials and returning signed JWT token
 adminRouter.post("/login", async (c) => {
@@ -155,7 +233,10 @@ adminRouter.post("/login", async (c) => {
   const expectedPassword = getAdminPassword();
 
   // 1. Check Super Admin credentials
-  if (inputUser === expectedUsername && password === expectedPassword) {
+  if (
+    safeEqual(inputUser, expectedUsername) &&
+    safeEqual(password, expectedPassword)
+  ) {
     await recordSuccessfulLogin(ip, inputUser);
     const jwtSecret = getJwtSecret();
     const payload = {
@@ -233,7 +314,7 @@ adminRouter.post("/login", async (c) => {
 
 // ─── SECURITY & AUDIT LOCKOUT ENDPOINTS (Super Admin Only) ───────────────────
 adminRouter.get("/security/lockouts", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -243,7 +324,7 @@ adminRouter.get("/security/lockouts", async (c) => {
 });
 
 adminRouter.post("/security/unlock", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -264,7 +345,7 @@ adminRouter.post("/security/unlock", async (c) => {
 
 // ─── LECTURER MANAGEMENT ENDPOINTS (Super Admin Only) ─────────────────────────
 adminRouter.get("/lecturers", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -283,7 +364,7 @@ adminRouter.get("/lecturers", async (c) => {
 });
 
 adminRouter.get("/lecturers/:username/details", async (c) => {
-  const caller = c.get("caller") || { role: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -306,6 +387,10 @@ adminRouter.get("/lecturers/:username/details", async (c) => {
       aiOption: s.aiOption,
       allowedStudentCount: s.allowedStudentIds.size,
       assignedGroups: s.assignedGroups || [],
+      sessionType: s.sessionType || "basic",
+      sessionPrompt: s.sessionPrompt || "",
+      examQuestions: s.examQuestions || [],
+      runtimeConfig: s.runtimeConfig,
       createdAt: s.createdAt,
     }));
 
@@ -350,7 +435,7 @@ adminRouter.get("/lecturers/:username/details", async (c) => {
 });
 
 adminRouter.post("/lecturers", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -408,7 +493,7 @@ adminRouter.post("/lecturers", async (c) => {
 });
 
 adminRouter.patch("/lecturers/:username/status", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -446,7 +531,7 @@ adminRouter.patch("/lecturers/:username/status", async (c) => {
 });
 
 adminRouter.post("/lecturers/:username/reset-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   if (caller.role !== "admin") {
     return c.json({ error: "Forbidden. Super Admin access required." }, 403);
   }
@@ -481,7 +566,7 @@ adminRouter.post("/lecturers/:username/reset-password", async (c) => {
 
 // Self-service change password for logged-in Lecturer / Admin
 adminRouter.post("/change-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { currentPassword, newPassword } = body as {
     currentPassword?: string;
@@ -539,7 +624,7 @@ adminRouter.post("/change-password", async (c) => {
 
 // ─── STUDENT ACCOUNT ENDPOINTS ────────────────────────────────────────────────
 adminRouter.post("/students/:studentId/reset-password", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const rawId = decodeURIComponent(c.req.param("studentId")).trim();
   if (!rawId) {
     return c.json({ error: "Student ID is required." }, 400);
@@ -576,7 +661,7 @@ adminRouter.post("/students/:studentId/reset-password", async (c) => {
 });
 
 const handleStudentImport = async (c: any) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { students } = body as {
     students?: Array<{ studentId: string; password?: string }>;
@@ -646,12 +731,13 @@ adminRouter.post("/students", handleStudentImport);
 adminRouter.post("/students/import", handleStudentImport);
 
 adminRouter.get("/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
   const list: any[] = [];
   for (const account of studentAccounts.values()) {
     const creator = (account.createdBy || "admin").toLowerCase();
-    if (creator !== callerUser) {
+    if (callerRole !== "admin" && creator !== callerUser) {
       continue;
     }
     list.push({
@@ -660,14 +746,202 @@ adminRouter.get("/students", async (c) => {
       createdBy: account.createdBy || "admin",
       updatedAt: account.updatedAt,
       updatedBy: account.updatedBy || "admin",
+      isDeleted: !!account.isDeleted,
+      deletedAt: account.deletedAt || null,
     });
   }
   return c.json({ success: true, students: list });
 });
 
+adminRouter.delete("/students/:studentId", async (c) => {
+  const caller = requireCaller(c);
+  const studentId = c.req.param("studentId").toUpperCase();
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  let targetKey: string | null = null;
+  let targetAccount: StudentAccount | null = null;
+
+  for (const [key, acc] of studentAccounts.entries()) {
+    if (acc.studentId.toUpperCase() === studentId) {
+      const creator = (acc.createdBy || "admin").toLowerCase();
+      if (callerRole === "admin" || creator === callerUser) {
+        targetKey = key;
+        targetAccount = acc;
+        break;
+      }
+    }
+  }
+
+  if (!targetAccount || !targetKey) {
+    return c.json(
+      { error: `User with ID ${studentId} not found or not authorized.` },
+      404,
+    );
+  }
+
+  // Check if student has ever been linked to any session
+  const isLinkedToAnySession =
+    Array.from(sessions.values()).some((s) =>
+      s.allowedStudentIds?.has(studentId),
+    ) ||
+    Array.from(sessionStates.values()).some(
+      (st) => st.studentId?.toUpperCase() === studentId,
+    );
+
+  if (isLinkedToAnySession) {
+    // Soft Delete (Deactivate) to preserve audit trails & exam data
+    targetAccount.isDeleted = true;
+    targetAccount.deletedAt = Date.now();
+    targetAccount.updatedAt = Date.now();
+    targetAccount.updatedBy = caller.username;
+    studentAccounts.set(targetKey, targetAccount);
+
+    return c.json({
+      success: true,
+      action: "soft_deleted",
+      message: `Tài khoản ${studentId} đã từng tham gia kỳ thi nên đã được tạm khóa để bảo toàn dữ liệu.`,
+      studentId,
+    });
+  } else {
+    // Hard Delete: Never participated in any session, no exam records or state
+    studentAccounts.delete(targetKey);
+
+    // Also remove from any studentGroups if present
+    for (const [gKey, group] of studentGroups.entries()) {
+      if (
+        group.userIds &&
+        group.userIds.some((uid) => uid.toUpperCase() === studentId)
+      ) {
+        group.userIds = group.userIds.filter(
+          (uid) => uid.toUpperCase() !== studentId,
+        );
+        group.updatedAt = Date.now();
+        group.updatedBy = caller.username;
+        studentGroups.set(gKey, group);
+      }
+    }
+
+    return c.json({
+      success: true,
+      action: "hard_deleted",
+      message: `Tài khoản ${studentId} chưa từng tham gia kỳ thi nào và đã được xóa vĩnh viễn khỏi hệ thống.`,
+      studentId,
+    });
+  }
+});
+
+adminRouter.post("/students/:studentId/restore", async (c) => {
+  const caller = requireCaller(c);
+  const studentId = c.req.param("studentId").toUpperCase();
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  let targetKey: string | null = null;
+  let targetAccount: StudentAccount | null = null;
+
+  for (const [key, acc] of studentAccounts.entries()) {
+    if (acc.studentId.toUpperCase() === studentId) {
+      const creator = (acc.createdBy || "admin").toLowerCase();
+      if (callerRole === "admin" || creator === callerUser) {
+        targetKey = key;
+        targetAccount = acc;
+        break;
+      }
+    }
+  }
+
+  if (!targetAccount || !targetKey) {
+    return c.json(
+      { error: `User with ID ${studentId} not found or not authorized.` },
+      404,
+    );
+  }
+
+  targetAccount.isDeleted = false;
+  targetAccount.deletedAt = null;
+  targetAccount.updatedAt = Date.now();
+  targetAccount.updatedBy = caller.username;
+
+  studentAccounts.set(targetKey, targetAccount);
+
+  return c.json({
+    success: true,
+    message: `User ${studentId} has been restored successfully.`,
+    studentId,
+  });
+});
+
+adminRouter.post("/students/bulk-delete", async (c) => {
+  const caller = requireCaller(c);
+  const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
+
+  const body = await c.req.json();
+  const { studentIds } = body as { studentIds?: string[] };
+  if (!Array.isArray(studentIds) || studentIds.length === 0) {
+    return c.json({ error: "studentIds array is required." }, 400);
+  }
+
+  let softDeletedCount = 0;
+  let hardDeletedCount = 0;
+  const now = Date.now();
+
+  for (const rawId of studentIds) {
+    const studentId = String(rawId).trim().toUpperCase();
+    for (const [key, acc] of studentAccounts.entries()) {
+      if (acc.studentId.toUpperCase() === studentId) {
+        const creator = (acc.createdBy || "admin").toLowerCase();
+        if (callerRole === "admin" || creator === callerUser) {
+          const isLinked =
+            Array.from(sessions.values()).some((s) =>
+              s.allowedStudentIds?.has(studentId),
+            ) ||
+            Array.from(sessionStates.values()).some(
+              (st) => st.studentId?.toUpperCase() === studentId,
+            );
+
+          if (isLinked) {
+            acc.isDeleted = true;
+            acc.deletedAt = now;
+            acc.updatedAt = now;
+            acc.updatedBy = caller.username;
+            studentAccounts.set(key, acc);
+            softDeletedCount++;
+          } else {
+            studentAccounts.delete(key);
+            for (const [gKey, group] of studentGroups.entries()) {
+              if (
+                group.userIds &&
+                group.userIds.some((uid) => uid.toUpperCase() === studentId)
+              ) {
+                group.userIds = group.userIds.filter(
+                  (uid) => uid.toUpperCase() !== studentId,
+                );
+                group.updatedAt = Date.now();
+                group.updatedBy = caller.username;
+                studentGroups.set(gKey, group);
+              }
+            }
+            hardDeletedCount++;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return c.json({
+    success: true,
+    message: `Đã xử lý ${softDeletedCount + hardDeletedCount} tài khoản (${softDeletedCount} tạm khóa, ${hardDeletedCount} xóa vĩnh viễn).`,
+    softDeletedCount,
+    hardDeletedCount,
+  });
+});
+
 // ─── SESSION ENDPOINTS ───────────────────────────────────────────────────────
 adminRouter.post("/sessions", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const {
     durationMinutes,
@@ -675,12 +949,22 @@ adminRouter.post("/sessions", async (c) => {
     aiValidityMinutes,
     defaultTokenBudget,
     assignedGroups,
+    sessionType,
+    sessionPrompt,
+    promptMode,
+    examQuestions,
+    runtimeConfig,
   } = body as {
     durationMinutes?: number;
     aiOption?: "chatbot" | "agent" | "none";
     aiValidityMinutes?: number;
     defaultTokenBudget?: number;
     assignedGroups?: string[];
+    sessionType?: "basic" | "exam";
+    sessionPrompt?: string;
+    promptMode?: SessionPromptMode;
+    examQuestions?: any[];
+    runtimeConfig?: SessionRuntimeConfig;
   };
 
   if (
@@ -697,6 +981,16 @@ adminRouter.post("/sessions", async (c) => {
       400,
     );
   }
+
+  const validPromptModes: SessionPromptMode[] = [
+    "standard",
+    "scaffolded_code",
+    "socratic_tutor",
+  ];
+  const validatedPromptMode: SessionPromptMode =
+    promptMode && validPromptModes.includes(promptMode)
+      ? promptMode
+      : "scaffolded_code";
 
   let sessionCode = "";
   do {
@@ -727,7 +1021,11 @@ adminRouter.post("/sessions", async (c) => {
       }
       if (!group) {
         for (const g of studentGroups.values()) {
-          if (g.name.toLowerCase() === groupName.toLowerCase() && (g.createdBy || "admin").toLowerCase() === caller.username.toLowerCase()) {
+          if (
+            g.name.toLowerCase() === groupName.toLowerCase() &&
+            (g.createdBy || "admin").toLowerCase() ===
+              caller.username.toLowerCase()
+          ) {
             group = g;
             break;
           }
@@ -761,6 +1059,14 @@ adminRouter.post("/sessions", async (c) => {
     defaultTokenBudget,
     allowedStudentIds,
     assignedGroups: groupNames,
+    sessionType: sessionType || "basic",
+    sessionPrompt: sessionPrompt || "",
+    promptMode: validatedPromptMode,
+    examQuestions: Array.isArray(examQuestions) ? examQuestions : [],
+    runtimeConfig:
+      runtimeConfig && typeof runtimeConfig === "object"
+        ? runtimeConfig
+        : undefined,
     createdAt: now,
     createdBy: caller.username,
     updatedAt: now,
@@ -796,8 +1102,304 @@ adminRouter.post("/sessions", async (c) => {
   });
 });
 
+adminRouter.patch("/sessions/:sessionCode", async (c) => {
+  const caller = requireCaller(c);
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
+
+  // Authorization: admin or creator of session
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only update sessions created by you." },
+      403,
+    );
+  }
+
+  const body = await c.req.json();
+  const {
+    durationMinutes,
+    aiOption,
+    aiValidityMinutes,
+    defaultTokenBudget,
+    sessionType,
+    sessionPrompt,
+    promptMode,
+    examQuestions,
+    runtimeConfig,
+    assignedGroups,
+    allowedStudentIds,
+    createdBy,
+  } = body as any;
+
+  if (typeof durationMinutes === "number")
+    session.durationMinutes = durationMinutes;
+  if (
+    typeof aiOption === "string" &&
+    ["chatbot", "agent", "none"].includes(aiOption)
+  )
+    session.aiOption = aiOption as "chatbot" | "agent" | "none";
+  if (typeof aiValidityMinutes === "number")
+    session.aiValidityMinutes = aiValidityMinutes;
+  if (typeof defaultTokenBudget === "number")
+    session.defaultTokenBudget = defaultTokenBudget;
+  if (sessionType === "basic" || sessionType === "exam")
+    session.sessionType = sessionType;
+  if (typeof sessionPrompt === "string") session.sessionPrompt = sessionPrompt;
+  if (
+    promptMode &&
+    ["standard", "scaffolded_code", "socratic_tutor"].includes(promptMode)
+  ) {
+    session.promptMode = promptMode as SessionPromptMode;
+  }
+  if (Array.isArray(examQuestions)) session.examQuestions = examQuestions;
+  if (runtimeConfig && typeof runtimeConfig === "object")
+    session.runtimeConfig = runtimeConfig;
+
+  // Flexible Assigned Groups
+  if (Array.isArray(assignedGroups)) {
+    session.assignedGroups = assignedGroups;
+    for (const gName of assignedGroups) {
+      const gMapKey = `${gName}:${(session.createdBy || "admin").toLowerCase()}`;
+      const group =
+        studentGroups.get(gMapKey) || studentGroups.get(`${gName}:admin`);
+      if (group && Array.isArray(group.userIds)) {
+        for (const uid of group.userIds) {
+          const upperUid = uid.toUpperCase();
+          session.allowedStudentIds.add(upperUid);
+          const stateKey = `${sessionCode}:${upperUid}`;
+          if (!sessionStates.has(stateKey)) {
+            sessionStates.set(stateKey, {
+              sessionCode,
+              studentId: upperUid,
+              hasLoggedIn: false,
+              loginTimestamp: 0,
+              tokensConsumed: 0,
+              reassigned: false,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Flexible Allowed Students Management
+  if (Array.isArray(allowedStudentIds)) {
+    const newIdSet = new Set(
+      allowedStudentIds
+        .map((id: string) => String(id).trim().toUpperCase())
+        .filter(Boolean),
+    );
+
+    // Also include members of assigned groups if any
+    if (Array.isArray(session.assignedGroups)) {
+      for (const gName of session.assignedGroups) {
+        const gMapKey = `${gName}:${(session.createdBy || "admin").toLowerCase()}`;
+        const group =
+          studentGroups.get(gMapKey) || studentGroups.get(`${gName}:admin`);
+        if (group && Array.isArray(group.userIds)) {
+          for (const uid of group.userIds) {
+            newIdSet.add(uid.toUpperCase());
+          }
+        }
+      }
+    }
+
+    // Always preserve students who have already joined/logged in
+    for (const state of sessionStates.values()) {
+      if (state.sessionCode === sessionCode && state.hasLoggedIn) {
+        newIdSet.add(state.studentId);
+      }
+    }
+
+    // Clean up state for removed students who NEVER logged in
+    for (const oldId of session.allowedStudentIds) {
+      if (!newIdSet.has(oldId)) {
+        const stateKey = `${sessionCode}:${oldId}`;
+        const state = sessionStates.get(stateKey);
+        if (!state?.hasLoggedIn) {
+          sessionStates.delete(stateKey);
+        }
+      }
+    }
+
+    // Initialize state for newly added students
+    for (const newId of newIdSet) {
+      const stateKey = `${sessionCode}:${newId}`;
+      if (!sessionStates.has(stateKey)) {
+        sessionStates.set(stateKey, {
+          sessionCode,
+          studentId: newId,
+          hasLoggedIn: false,
+          loginTimestamp: 0,
+          tokensConsumed: 0,
+          reassigned: false,
+        });
+      }
+    }
+
+    session.allowedStudentIds = newIdSet;
+  }
+
+  if (
+    caller.role === "admin" &&
+    typeof createdBy === "string" &&
+    createdBy.trim()
+  ) {
+    session.createdBy = createdBy.trim();
+  }
+
+  session.updatedAt = Date.now();
+  session.updatedBy = caller.username;
+  sessions.set(sessionCode, session);
+
+  return c.json({
+    success: true,
+    message: `Session ${sessionCode} updated successfully.`,
+    session: {
+      ...session,
+      allowedStudentIds: Array.from(session.allowedStudentIds),
+    },
+  });
+});
+
+// DELETE Session endpoint (permitted ONLY if no one has joined)
+adminRouter.delete("/sessions/:sessionCode", async (c) => {
+  const caller = requireCaller(c);
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
+
+  // Authorization: admin or creator of session
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only delete sessions created by you." },
+      403,
+    );
+  }
+
+  // Condition: Check if any student has joined the session
+  const hasAnyoneJoined = Array.from(sessionStates.values()).some(
+    (state) => state.sessionCode === sessionCode && state.hasLoggedIn,
+  );
+
+  if (hasAnyoneJoined) {
+    return c.json(
+      {
+        error: `Cannot delete session ${sessionCode} because one or more students have already joined this session.`,
+      },
+      400,
+    );
+  }
+
+  // Check Redis for active session states
+  if (redis && redis.status === "ready") {
+    try {
+      const keys = await redis.keys(`session:user:${sessionCode}:*`);
+      for (const k of keys) {
+        const val = await redis.hget(k, "hasLoggedIn");
+        if (val === "true") {
+          return c.json(
+            {
+              error: `Cannot delete session ${sessionCode} because active student records exist in Redis.`,
+            },
+            400,
+          );
+        }
+      }
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    } catch (err) {
+      console.warn(`[Admin] Redis cleanup warning on session delete:`, err);
+    }
+  }
+
+  // Delete session from store (which cascades delete in SQLite and session_states)
+  sessions.delete(sessionCode);
+
+  return c.json({
+    success: true,
+    message: `Session ${sessionCode} deleted successfully.`,
+    sessionCode,
+  });
+});
+
+// DELETE Student from Session (permitted if student has not joined yet)
+adminRouter.delete("/sessions/:sessionCode/students/:studentId", async (c) => {
+  const caller = requireCaller(c);
+  const sessionCode = c.req.param("sessionCode").toUpperCase();
+  const studentId = c.req.param("studentId").toUpperCase();
+  const session = sessions.get(sessionCode);
+
+  if (!session) {
+    return c.json(
+      { error: `Session with code ${sessionCode} not found.` },
+      404,
+    );
+  }
+
+  if (
+    caller.role !== "admin" &&
+    (session.createdBy || "admin").toLowerCase() !==
+      caller.username.toLowerCase()
+  ) {
+    return c.json(
+      { error: "Unauthorized. You can only manage sessions created by you." },
+      403,
+    );
+  }
+
+  const stateKey = `${sessionCode}:${studentId}`;
+  const state = sessionStates.get(stateKey);
+
+  if (state?.hasLoggedIn) {
+    return c.json(
+      {
+        error: `Cannot remove student ${studentId} because they have already joined this session.`,
+      },
+      400,
+    );
+  }
+
+  session.allowedStudentIds.delete(studentId);
+  session.updatedAt = Date.now();
+  session.updatedBy = caller.username;
+  sessions.set(sessionCode, session);
+
+  if (state) {
+    sessionStates.delete(stateKey);
+  }
+
+  return c.json({
+    success: true,
+    message: `Removed student ${studentId} from session ${sessionCode}.`,
+    totalStudents: session.allowedStudentIds.size,
+  });
+});
+
 adminRouter.post("/sessions/:sessionCode/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const sessionCode = c.req.param("sessionCode").toUpperCase();
   const session = sessions.get(sessionCode);
 
@@ -885,13 +1487,15 @@ adminRouter.post(
 );
 
 adminRouter.get("/sessions", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
 
   const allSessions = Array.from(sessions.values());
-  const scopedSessions = allSessions.filter(
-    (s) => (s.createdBy || "admin").toLowerCase() === callerUser,
-  );
+  const scopedSessions = allSessions.filter((s) => {
+    if (callerRole === "admin") return true;
+    return (s.createdBy || "admin").toLowerCase() === callerUser;
+  });
 
   const sessionPromises = scopedSessions.map(async (session) => {
     const code = session.sessionCode;
@@ -947,6 +1551,11 @@ adminRouter.get("/sessions", async (c) => {
       aiValidityMinutes: session.aiValidityMinutes,
       defaultTokenBudget: session.defaultTokenBudget,
       assignedGroups: session.assignedGroups || [],
+      sessionType: session.sessionType || "basic",
+      sessionPrompt: session.sessionPrompt || "",
+      promptMode: session.promptMode || "scaffolded_code",
+      examQuestions: session.examQuestions || [],
+      runtimeConfig: session.runtimeConfig,
       createdAt: session.createdAt || session.startTime * 1000,
       createdBy: session.createdBy || "admin",
       updatedAt: session.updatedAt || session.createdAt || Date.now(),
@@ -960,6 +1569,23 @@ adminRouter.get("/sessions", async (c) => {
 });
 
 // ─── LOG DOWNLOAD HELPER & ENDPOINTS ──────────────────────────────────────────
+
+/** Secrets / databases that must never leave the server through log exports. */
+function isSensitiveLogFile(name: string): boolean {
+  const n = name.toLowerCase();
+  return (
+    n.endsWith(".key") ||
+    n.endsWith(".pem") ||
+    n.startsWith("quatmo.db") ||
+    n.endsWith(".db") ||
+    n.endsWith(".db-wal") ||
+    n.endsWith(".db-shm") ||
+    n.endsWith(".sqlite") ||
+    n === ".env" ||
+    n.startsWith(".env.") ||
+    n === "client_gate_state.json"
+  );
+}
 
 async function sendDirectoryZip(
   dirPath: string,
@@ -988,13 +1614,19 @@ async function sendDirectoryZip(
         if (entry.isDirectory()) {
           await walkAndAdd(entryFullPath, entryRelativePath);
         } else if (entry.isFile()) {
+          if (isSensitiveLogFile(entry.name)) {
+            continue;
+          }
           try {
             const fileBuffer = await fs.promises.readFile(entryFullPath);
             const zipPath = entryRelativePath.replace(/\\/g, "/");
             zip.addFile(zipPath, fileBuffer);
             addedFilesCount++;
           } catch (readErr) {
-            console.error(`[Admin Zip] Failed to read ${entryFullPath}:`, readErr);
+            console.error(
+              `[Admin Zip] Failed to read ${entryFullPath}:`,
+              readErr,
+            );
           }
         }
       }
@@ -1013,7 +1645,7 @@ async function sendDirectoryZip(
     return c.body(zipBuffer);
   } catch (err: any) {
     console.error(`[Admin] Failed to zip logs for ${dirPath}:`, err);
-    return c.json({ error: `Failed to create ZIP: ${err.message}` }, 500);
+    return c.json({ error: `Failed to create ZIP` }, 500);
   }
 }
 
@@ -1033,6 +1665,40 @@ const handleSessionLogDownload = async (c: any) => {
     sessionCode,
   );
 
+  try {
+    const session = sessions.get(sessionCode);
+    const manifestPath = path.join(sessionLogDir, "session_manifest.json");
+    const manifestStudents: any[] = [];
+    if (session) {
+      for (const studentId of session.allowedStudentIds) {
+        const stateKey = `${sessionCode}:${studentId}`;
+        const state = sessionStates.get(stateKey);
+        manifestStudents.push({
+          studentId,
+          loginTimestamp: state?.loginTimestamp || 0,
+          tokensConsumed: state?.tokensConsumed || 0,
+          latestClassification: state?.latestClassification,
+        });
+      }
+    }
+    await fs.promises.writeFile(
+      manifestPath,
+      JSON.stringify(
+        {
+          sessionCode,
+          createdAt: session?.createdAt,
+          endedAt: session?.endedAt,
+          durationMinutes: session?.durationMinutes,
+          exportedAt: Date.now(),
+          students: manifestStudents,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  } catch {}
+
   return await sendDirectoryZip(
     sessionLogDir,
     `session-${sessionCode}-logs.zip`,
@@ -1043,7 +1709,10 @@ const handleSessionLogDownload = async (c: any) => {
 
 adminRouter.get("/sessions/:sessionCode/logs", handleSessionLogDownload);
 adminRouter.get("/sessions/:sessionCode/logs/zip", handleSessionLogDownload);
-adminRouter.get("/sessions/:sessionCode/download-logs", handleSessionLogDownload);
+adminRouter.get(
+  "/sessions/:sessionCode/download-logs",
+  handleSessionLogDownload,
+);
 
 // 2. All logs archive (supports /logs/download-all, /logs/zip, /logs/download)
 const handleAllLogsDownload = async (c: any) => {
@@ -1079,7 +1748,9 @@ adminRouter.get("/guests/logs", handleGuestLogsDownload);
 adminRouter.get(
   "/sessions/:sessionCode/accounts/:studentId/download",
   async (c) => {
-    const sessionCode = sanitizeFilename(c.req.param("sessionCode")).toUpperCase();
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
     const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
     const studentDir = path.resolve(
       process.cwd(),
@@ -1123,7 +1794,9 @@ adminRouter.get(
     }
 
     return c.json(
-      { error: `No logs found for student ${studentId} in session ${sessionCode}.` },
+      {
+        error: `No logs found for student ${studentId} in session ${sessionCode}.`,
+      },
       404,
     );
   },
@@ -1226,6 +1899,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
   // Include in-memory sessions that haven't written to disk yet
   for (const [code, sessionObj] of sessions.entries()) {
     if (!scannedCodes.has(code)) {
+      scannedCodes.add(code);
       resultSessions.push({
         sessionCode: code,
         sessionName: code,
@@ -1236,6 +1910,37 @@ adminRouter.get("/visualize/sessions", async (c) => {
           ? sessionObj.allowedStudentIds.size
           : 0,
       });
+    }
+  }
+
+  // Include S3 sessions
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3SessionCodes = await s3Storage.listSessionsFromS3();
+      for (const code of s3SessionCodes) {
+        if (!scannedCodes.has(code)) {
+          scannedCodes.add(code);
+          const students = await s3Storage.listStudentsInSessionFromS3(code);
+          const sessionObj = sessions.get(code);
+          const promptLogCount = students.filter((s) => s.hasPromptLog).length;
+          const eventLogCount = students.filter((s) => s.hasEventLog).length;
+          const lastActivity = Math.max(
+            ...students.map((s) => s.lastActivity || 0),
+            sessionObj?.createdAt || Date.now(),
+          );
+          resultSessions.push({
+            sessionCode: code,
+            sessionName: code,
+            promptLogCount,
+            eventLogCount,
+            lastActivity,
+            studentCount:
+              students.length || sessionObj?.allowedStudentIds?.size || 0,
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[Visualize] S3 sessions listing error:", err);
     }
   }
 
@@ -1267,7 +1972,7 @@ adminRouter.get("/visualize/sessions", async (c) => {
     }
   }
 
-  const caller = (c.get("caller") as any) || { username: "admin", role: "admin" };
+  const caller = requireCaller(c) as any;
   const callerUser = (caller.username || "admin").toLowerCase();
   const callerRole = (caller.role || "admin").toLowerCase();
   const filteredSessions = resultSessions.filter((s) => {
@@ -1410,6 +2115,36 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     }
   }
 
+  // Include S3 students for this session
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Students =
+        await s3Storage.listStudentsInSessionFromS3(sessionCode);
+      for (const s of s3Students) {
+        const existing = accountMap.get(s.studentId);
+        if (!existing) {
+          accountMap.set(s.studentId, {
+            studentId: s.studentId,
+            hasPromptLog: s.hasPromptLog,
+            hasEventLog: s.hasEventLog,
+            promptTurnsCount: s.hasPromptLog ? 1 : 0,
+            eventCount: s.hasEventLog ? 1 : 0,
+            lastActivity: s.lastActivity || Date.now(),
+            hasErrors: false,
+          });
+        } else {
+          existing.hasPromptLog = existing.hasPromptLog || s.hasPromptLog;
+          existing.hasEventLog = existing.hasEventLog || s.hasEventLog;
+          if (s.lastActivity && s.lastActivity > existing.lastActivity) {
+            existing.lastActivity = s.lastActivity;
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[Visualize] S3 students listing error:", err);
+    }
+  }
+
   const accounts = Array.from(accountMap.values());
   accounts.sort((a, b) => {
     const aHas = a.hasPromptLog || a.hasEventLog ? 1 : 0;
@@ -1428,56 +2163,202 @@ adminRouter.get(
     const sessionCode = sanitizeFilename(
       c.req.param("sessionCode"),
     ).toUpperCase();
-    const studentId = sanitizeFilename(c.req.param("studentId"));
-    const jsonPath = path.resolve(
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const sessionDir = path.resolve(
       process.cwd(),
       "logs",
       "sessions",
       sessionCode,
-      `${studentId}.json`,
     );
 
-    if (fs.existsSync(jsonPath)) {
-      try {
-        const raw = await fs.promises.readFile(jsonPath, "utf-8");
-        const turns = JSON.parse(raw);
-        return c.json({
-          sessionCode,
-          studentId,
-          turns: Array.isArray(turns) ? turns : [],
-        });
-      } catch (err: any) {
-        return c.json({ error: `Failed to parse log: ${err.message}` }, 500);
-      }
+    let turns: any[] = [];
+    try {
+      const reconciled = await reconcileStudentPromptTurns(
+        sessionCode,
+        studentId,
+        sessionDir,
+      );
+      turns = reconciled.turns || [];
+    } catch (err: any) {
+      console.warn(
+        `[Visualize] Reconcile error for ${sessionCode}/${studentId}:`,
+        err?.message || err,
+      );
     }
 
-    // Check .log file
-    const logPath = path.resolve(
-      process.cwd(),
-      "logs",
-      "sessions",
-      sessionCode,
-      `${studentId}.log`,
-    );
-    if (fs.existsSync(logPath)) {
+    if (turns.length > 0) {
       try {
-        const raw = await fs.promises.readFile(logPath, "utf-8");
-        const lines = raw.split("\n").filter((l) => l.trim().length > 0);
-        const turns: any[] = [];
-        for (const line of lines) {
-          try {
-            turns.push(JSON.parse(line));
-          } catch {}
+        const redisTurns = await redisStore.getTurns(sessionCode, studentId);
+        if (redisTurns && redisTurns.length > 0) {
+          for (const t of turns) {
+            const match = redisTurns.find((rt: any) => rt.prompt === t.prompt);
+            if (match) {
+              if (!t.classification) t.classification = {};
+              if (
+                (!t.classification.features ||
+                  Object.keys(t.classification.features).length === 0) &&
+                match.featureVector
+              ) {
+                t.classification.features = match.featureVector;
+              }
+              if (
+                typeof match.I_score === "number" &&
+                typeof t.classification.iScoreTurn !== "number"
+              ) {
+                t.classification.iScoreTurn = match.I_score;
+              }
+              if (
+                typeof match.E_score === "number" &&
+                typeof t.classification.eScoreTurn !== "number"
+              ) {
+                t.classification.eScoreTurn = match.E_score;
+              }
+            }
+          }
         }
-        return c.json({ sessionCode, studentId, turns });
+      } catch {}
+
+      return c.json({
+        sessionCode,
+        studentId,
+        turns,
+      });
+    }
+
+    // Check S3 if not found locally
+    if (s3Storage.isAvailable()) {
+      try {
+        const s3Turns = await s3Storage.getStudentPromptLog(
+          sessionCode,
+          studentId,
+        );
+        if (s3Turns && s3Turns.length > 0) {
+          return c.json({ sessionCode, studentId, turns: s3Turns });
+        }
       } catch (err: any) {
-        return c.json({ error: `Failed to read log: ${err.message}` }, 500);
+        console.error("[Visualize] S3 prompt log fetch error:", err);
       }
     }
 
     return c.json({ sessionCode, studentId, turns: [] });
   },
 );
+
+async function loadEventLogFromS3(
+  sessionCode: string,
+  studentId: string,
+  reqRecordId?: string,
+) {
+  if (!s3Storage.isAvailable()) return null;
+  try {
+    const s3Records = await s3Storage.listStudentExamRecords(
+      sessionCode,
+      studentId,
+    );
+    if (!s3Records || s3Records.length === 0) return null;
+    const targetRecordId =
+      reqRecordId && s3Records.includes(reqRecordId)
+        ? reqRecordId
+        : s3Records[0];
+
+    const [eventsRaw, aiRaw, metaRaw, zipBuffer, uploadInfoRaw] =
+      await Promise.all([
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "events.jsonl",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "ai_interactions.jsonl",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "metadata.json",
+        ),
+        s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          targetRecordId,
+          "snapshot_start.zip",
+        ),
+        s3Storage.getStudentFile(sessionCode, studentId, "upload_info.json"),
+      ]);
+
+    const coreRecords: any[] = [];
+    const aiRecords: any[] = [];
+    let metadata: any = null;
+    const initialFiles: Record<string, string> = {};
+
+    if (typeof metaRaw === "string") {
+      try {
+        metadata = JSON.parse(metaRaw);
+      } catch {}
+    }
+    if (typeof eventsRaw === "string") {
+      for (const line of eventsRaw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          coreRecords.push(JSON.parse(trimmed));
+        } catch {}
+      }
+    }
+    if (typeof aiRaw === "string") {
+      for (const line of aiRaw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          aiRecords.push(JSON.parse(trimmed));
+        } catch {}
+      }
+    }
+    if (Buffer.isBuffer(zipBuffer)) {
+      try {
+        const zip = new AdmZip(zipBuffer);
+        Object.assign(initialFiles, readZipTextEntriesSafely(zip));
+      } catch {}
+    }
+
+    let uploadTimestamp: number | null = null;
+    let uploadTimeISO: string | null = null;
+    if (typeof uploadInfoRaw === "string") {
+      try {
+        const u = JSON.parse(uploadInfoRaw);
+        if (u.uploadTimestamp) {
+          const raw = Number(u.uploadTimestamp);
+          uploadTimestamp = raw < 1e11 ? raw * 1000 : raw;
+        }
+        if (u.uploadTimeISO) uploadTimeISO = u.uploadTimeISO;
+      } catch {}
+    }
+
+    return {
+      sessionCode,
+      studentId,
+      activeRecordDir: targetRecordId,
+      availableRecords: s3Records,
+      metadata: metadata || {
+        examSessionId: targetRecordId,
+        examStartAt: coreRecords[0]?.timestamp || Date.now(),
+        examEndAt: coreRecords[coreRecords.length - 1]?.timestamp || Date.now(),
+      },
+      coreRecords,
+      aiRecords,
+      initialFiles,
+      uploadTimestamp,
+      uploadTimeISO,
+    };
+  } catch (err: any) {
+    console.error("[Visualize] S3 event log fetch error:", err);
+    return null;
+  }
+}
 
 // 4. Get student event log
 adminRouter.get(
@@ -1487,7 +2368,7 @@ adminRouter.get(
       c.req.param("sessionCode"),
     ).toUpperCase();
     const studentId = sanitizeFilename(c.req.param("studentId"));
-    const studentDir = path.resolve(
+    let studentDir = path.resolve(
       process.cwd(),
       "logs",
       "sessions",
@@ -1496,99 +2377,328 @@ adminRouter.get(
     );
 
     if (!fs.existsSync(studentDir)) {
-      return c.json({
+      const sessionDir = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        sessionCode,
+      );
+      if (fs.existsSync(sessionDir)) {
+        try {
+          const entries = await fs.promises.readdir(sessionDir);
+          const match = entries.find(
+            (e) => e.toLowerCase() === studentId.toLowerCase(),
+          );
+          if (match) {
+            studentDir = path.join(sessionDir, match);
+          }
+        } catch {}
+      }
+    }
+
+    let availableRecords: string[] = [];
+    let activeRecordDir = studentDir;
+    let coreRecords: any[] = [];
+    let aiRecords: any[] = [];
+    let metadata: any = null;
+    let initialFiles: Record<string, string> = {};
+    let uploadTimestamp: number | null = null;
+    let uploadTimeISO: string | null = null;
+
+    if (!fs.existsSync(studentDir)) {
+      // Check S3 if no local student directory
+      const s3Result = await loadEventLogFromS3(
         sessionCode,
         studentId,
-        metadata: null,
-        coreRecords: [],
-        aiRecords: [],
-        availableRecords: [],
-        initialFiles: {},
-      });
+        c.req.query("recordId"),
+      );
+      if (s3Result) {
+        availableRecords = s3Result.availableRecords || [];
+        activeRecordDir = s3Result.activeRecordDir || "";
+        coreRecords = s3Result.coreRecords || [];
+        aiRecords = s3Result.aiRecords || [];
+        metadata = s3Result.metadata;
+        initialFiles = s3Result.initialFiles || {};
+        uploadTimestamp = s3Result.uploadTimestamp;
+        uploadTimeISO = s3Result.uploadTimeISO;
+      } else {
+        return c.json({
+          sessionCode,
+          studentId,
+          metadata: null,
+          coreRecords: [],
+          aiRecords: [],
+          availableRecords: [],
+          initialFiles: {},
+        });
+      }
+    } else {
+      try {
+        const examRecordsDir = path.join(studentDir, "exam_records");
+        if (fs.existsSync(examRecordsDir)) {
+          const recEntries = await fs.promises.readdir(examRecordsDir, {
+            withFileTypes: true,
+          });
+          for (const r of recEntries) {
+            if (r.isDirectory()) {
+              availableRecords.push(r.name);
+            }
+          }
+          if (availableRecords.length > 0) {
+            availableRecords.sort().reverse();
+            const reqRecordId = c.req.query("recordId");
+            const targetRecordId =
+              reqRecordId && availableRecords.includes(reqRecordId)
+                ? reqRecordId
+                : availableRecords[0];
+            activeRecordDir = path.join(examRecordsDir, targetRecordId);
+          }
+        }
+
+        const eventsPath = path.join(activeRecordDir, "events.jsonl");
+        const aiPath = path.join(activeRecordDir, "ai_interactions.jsonl");
+        const metadataPath = path.join(activeRecordDir, "metadata.json");
+        const snapshotZipPath = path.join(
+          activeRecordDir,
+          "snapshot_start.zip",
+        );
+
+        if (fs.existsSync(metadataPath)) {
+          try {
+            const raw = await fs.promises.readFile(metadataPath, "utf-8");
+            metadata = JSON.parse(raw);
+          } catch {}
+        }
+
+        if (fs.existsSync(eventsPath)) {
+          try {
+            const content = await fs.promises.readFile(eventsPath, "utf-8");
+            const lines = content.split("\n");
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                coreRecords.push(JSON.parse(trimmed));
+              } catch {}
+            }
+          } catch {}
+        }
+
+        if (fs.existsSync(aiPath)) {
+          try {
+            const content = await fs.promises.readFile(aiPath, "utf-8");
+            const lines = content.split("\n");
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                aiRecords.push(JSON.parse(trimmed));
+              } catch {}
+            }
+          } catch {}
+        }
+
+        if (fs.existsSync(snapshotZipPath)) {
+          try {
+            const zip = new AdmZip(snapshotZipPath);
+            Object.assign(initialFiles, readZipTextEntriesSafely(zip));
+          } catch {}
+        }
+
+        const uploadInfoPath = path.join(studentDir, "upload_info.json");
+        if (fs.existsSync(uploadInfoPath)) {
+          try {
+            const uInfo = JSON.parse(
+              await fs.promises.readFile(uploadInfoPath, "utf-8"),
+            );
+            if (uInfo.uploadTimestamp) {
+              const rawTs = Number(uInfo.uploadTimestamp);
+              uploadTimestamp = rawTs < 1e11 ? rawTs * 1000 : rawTs;
+            }
+            if (uInfo.uploadTimeISO) uploadTimeISO = uInfo.uploadTimeISO;
+          } catch {}
+        }
+
+        if (
+          availableRecords.length === 0 &&
+          coreRecords.length === 0 &&
+          s3Storage.isAvailable()
+        ) {
+          const s3Result = await loadEventLogFromS3(
+            sessionCode,
+            studentId,
+            c.req.query("recordId"),
+          );
+          if (s3Result) {
+            availableRecords = s3Result.availableRecords || [];
+            activeRecordDir = s3Result.activeRecordDir || "";
+            coreRecords = s3Result.coreRecords || [];
+            aiRecords = s3Result.aiRecords || [];
+            metadata = s3Result.metadata;
+            initialFiles = s3Result.initialFiles || {};
+            if (!uploadTimestamp && s3Result.uploadTimestamp) {
+              uploadTimestamp = s3Result.uploadTimestamp;
+              uploadTimeISO = s3Result.uploadTimeISO;
+            }
+          }
+        }
+      } catch (err: any) {
+        return c.json({ error: `Failed to load event log` }, 500);
+      }
     }
 
     try {
-      const availableRecords: string[] = [];
-      let activeRecordDir = studentDir;
+      const session = sessions.get(sessionCode);
+      const stateKey = `${sessionCode}:${studentId}`;
+      const state = sessionStates.get(stateKey);
 
-      const examRecordsDir = path.join(studentDir, "exam_records");
-      if (fs.existsSync(examRecordsDir)) {
-        const recEntries = await fs.promises.readdir(examRecordsDir, {
-          withFileTypes: true,
-        });
-        for (const r of recEntries) {
-          if (r.isDirectory()) {
-            availableRecords.push(r.name);
+      let manifest: any = null;
+      const manifestPath = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        sessionCode,
+        "session_manifest.json",
+      );
+      if (fs.existsSync(manifestPath)) {
+        try {
+          manifest = JSON.parse(
+            await fs.promises.readFile(manifestPath, "utf-8"),
+          );
+        } catch {}
+      }
+
+      let sessionBeginTime: number | null = null;
+      if (state?.loginTimestamp && state.loginTimestamp > 0) {
+        sessionBeginTime = state.loginTimestamp;
+      }
+      if (!sessionBeginTime && redis && redis.status === "ready") {
+        try {
+          const rTime = await redis.hget(
+            `session:user:${sessionCode}:${studentId}`,
+            "loginTime",
+          );
+          if (rTime) {
+            const parsed = parseInt(rTime, 10);
+            if (!isNaN(parsed) && parsed > 0) sessionBeginTime = parsed;
+          }
+        } catch {}
+      }
+      if (!sessionBeginTime && manifest) {
+        if (Array.isArray(manifest.students)) {
+          const st = manifest.students.find(
+            (s: any) => s.studentId?.toUpperCase() === studentId.toUpperCase(),
+          );
+          if (st?.loginTimestamp && st.loginTimestamp > 0) {
+            sessionBeginTime = st.loginTimestamp;
           }
         }
-        if (availableRecords.length > 0) {
-          availableRecords.sort().reverse();
-          const reqRecordId = c.req.query("recordId");
-          const targetRecordId =
-            reqRecordId && availableRecords.includes(reqRecordId)
-              ? reqRecordId
-              : availableRecords[0];
-          activeRecordDir = path.join(examRecordsDir, targetRecordId);
-        }
+      }
+      if (
+        !sessionBeginTime &&
+        (session?.startTime ||
+          session?.createdAt ||
+          manifest?.createdAt ||
+          manifest?.startTime)
+      ) {
+        sessionBeginTime =
+          session?.startTime ||
+          session?.createdAt ||
+          manifest?.createdAt ||
+          manifest?.startTime;
       }
 
-      const eventsPath = path.join(activeRecordDir, "events.jsonl");
-      const aiPath = path.join(activeRecordDir, "ai_interactions.jsonl");
-      const metadataPath = path.join(activeRecordDir, "metadata.json");
-      const snapshotZipPath = path.join(activeRecordDir, "snapshot_start.zip");
-
-      const coreRecords: any[] = [];
-      const aiRecords: any[] = [];
-      let metadata: any = null;
-      const initialFiles: Record<string, string> = {};
-
-      if (fs.existsSync(metadataPath)) {
+      if (!sessionBeginTime) {
         try {
-          const raw = await fs.promises.readFile(metadataPath, "utf-8");
-          metadata = JSON.parse(raw);
-        } catch {}
-      }
-
-      if (fs.existsSync(eventsPath)) {
-        try {
-          const content = await fs.promises.readFile(eventsPath, "utf-8");
-          const lines = content.split("\n");
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              coreRecords.push(JSON.parse(trimmed));
-            } catch {}
-          }
-        } catch {}
-      }
-
-      if (fs.existsSync(aiPath)) {
-        try {
-          const content = await fs.promises.readFile(aiPath, "utf-8");
-          const lines = content.split("\n");
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              aiRecords.push(JSON.parse(trimmed));
-            } catch {}
-          }
-        } catch {}
-      }
-
-      if (fs.existsSync(snapshotZipPath)) {
-        try {
-          const zip = new AdmZip(snapshotZipPath);
-          const zipEntries = zip.getEntries();
-          for (const entry of zipEntries) {
-            if (!entry.isDirectory) {
-              const text = entry.getData().toString("utf-8");
-              initialFiles[entry.entryName.replace(/\\/g, "/")] = text;
+          const studentJsonPath = path.resolve(
+            process.cwd(),
+            "logs",
+            "sessions",
+            sessionCode,
+            `${studentId}.json`,
+          );
+          if (fs.existsSync(studentJsonPath)) {
+            const pTurns = JSON.parse(
+              await fs.promises.readFile(studentJsonPath, "utf-8"),
+            );
+            if (
+              Array.isArray(pTurns) &&
+              pTurns.length > 0 &&
+              pTurns[0].timestamp
+            ) {
+              const firstTurnMs = new Date(pTurns[0].timestamp).getTime();
+              if (!isNaN(firstTurnMs) && firstTurnMs > 0) {
+                sessionBeginTime = firstTurnMs - 10 * 60 * 1000;
+              }
             }
           }
         } catch {}
       }
+
+      const metaStart = Number(metadata?.examStartAt);
+      if (metaStart && !isNaN(metaStart)) {
+        if (uploadTimestamp) {
+          const diff = uploadTimestamp - metaStart;
+          if (diff > 0 && diff <= 4 * 3600 * 1000) {
+            sessionBeginTime = sessionBeginTime
+              ? Math.min(sessionBeginTime, metaStart)
+              : metaStart;
+          }
+        } else if (sessionBeginTime) {
+          const diff = Math.abs(metaStart - sessionBeginTime);
+          if (diff <= 2 * 3600 * 1000) {
+            sessionBeginTime = metaStart;
+          }
+        }
+      }
+
+      if (!sessionBeginTime && uploadTimestamp) {
+        const durationMin =
+          session?.durationMinutes || manifest?.durationMinutes || 90;
+        sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
+      }
+
+      let sessionEndTime: number | null = null;
+      if (uploadTimestamp) {
+        sessionEndTime = uploadTimestamp + 30 * 1000; // 30s buffer for finishing log sync
+        if (session?.endedAt && session.endedAt > 0) {
+          sessionEndTime = Math.min(sessionEndTime, session.endedAt);
+        } else if (manifest?.endedAt && manifest.endedAt > 0) {
+          sessionEndTime = Math.min(sessionEndTime, manifest.endedAt);
+        }
+      } else if (session?.endedAt && session.endedAt > 0) {
+        sessionEndTime = session.endedAt;
+      } else if (manifest?.endedAt && manifest.endedAt > 0) {
+        sessionEndTime = manifest.endedAt;
+      } else if (sessionBeginTime) {
+        const durationMin =
+          session?.durationMinutes || manifest?.durationMinutes || 90;
+        sessionEndTime =
+          sessionBeginTime + durationMin * 60 * 1000 + 10 * 60 * 1000;
+      }
+
+      const unclamped = c.req.query("unclamped") === "true";
+      const clampedCoreRecords =
+        !unclamped && (sessionBeginTime || sessionEndTime)
+          ? coreRecords.filter((ev) => {
+              const t = Number(ev.timestamp);
+              if (!t) return true;
+              if (sessionBeginTime && t < sessionBeginTime) return false;
+              if (sessionEndTime && t > sessionEndTime) return false;
+              return true;
+            })
+          : coreRecords;
+
+      const clampedAiRecords =
+        !unclamped && (sessionBeginTime || sessionEndTime)
+          ? aiRecords.filter((ev) => {
+              const t = Number(ev.timestamp);
+              if (!t) return true;
+              if (sessionBeginTime && t < sessionBeginTime) return false;
+              if (sessionEndTime && t > sessionEndTime) return false;
+              return true;
+            })
+          : aiRecords;
 
       return c.json({
         sessionCode,
@@ -1597,19 +2707,27 @@ adminRouter.get(
         availableRecords,
         metadata: metadata || {
           examSessionId: path.basename(activeRecordDir),
-          examStartAt: coreRecords[0]?.timestamp || Date.now(),
+          examStartAt:
+            sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
           examEndAt:
-            coreRecords[coreRecords.length - 1]?.timestamp || Date.now(),
+            sessionEndTime ||
+            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
+            Date.now(),
         },
-        coreRecords,
-        aiRecords,
+        coreRecords: clampedCoreRecords,
+        aiRecords: clampedAiRecords,
         initialFiles,
+        loginTimestamp: sessionBeginTime,
+        sessionEndTime,
+        totalRawEvents: coreRecords.length,
+        clampedEventsCount: clampedCoreRecords.length,
+        isClamped:
+          !unclamped &&
+          (coreRecords.length !== clampedCoreRecords.length ||
+            aiRecords.length !== clampedAiRecords.length),
       });
     } catch (err: any) {
-      return c.json(
-        { error: `Failed to load event log: ${err.message}` },
-        500,
-      );
+      return c.json({ error: `Failed to load event log` }, 500);
     }
   },
 );
@@ -1676,6 +2794,23 @@ adminRouter.get("/visualize/guests", async (c) => {
     } catch {}
   }
 
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Guests = await s3Storage.listGuestsFromS3();
+      for (const gid of s3Guests) {
+        if (!guestMap.has(gid)) {
+          guestMap.set(gid, {
+            guestId: gid,
+            turnsCount: 1,
+            lastActivity: Date.now(),
+            hasErrors: false,
+            filePath: "",
+          });
+        }
+      }
+    } catch {}
+  }
+
   const guests = Array.from(guestMap.values()).map((g) => ({
     studentId: g.guestId,
     guestId: g.guestId,
@@ -1711,7 +2846,7 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
           turns: Array.isArray(turns) ? turns : [],
         });
       } catch (err: any) {
-        return c.json({ error: `Failed to parse log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to parse log` }, 500);
       }
     }
 
@@ -1728,12 +2863,181 @@ adminRouter.get("/visualize/guests/:guestId/prompt-log", async (c) => {
         }
         return c.json({ guestId, turns });
       } catch (err: any) {
-        return c.json({ error: `Failed to read log: ${err.message}` }, 500);
+        return c.json({ error: `Failed to read log` }, 500);
       }
     }
   }
 
+  // Check S3 if not found locally
+  if (s3Storage.isAvailable()) {
+    try {
+      const s3Turns = await s3Storage.getGuestPromptLog(guestId);
+      if (s3Turns && s3Turns.length > 0) {
+        return c.json({ guestId, turns: s3Turns });
+      }
+    } catch {}
+  }
+
   return c.json({ guestId, turns: [] });
+});
+
+// 7. Upload full exam record for student / session
+adminRouter.post(
+  "/visualize/sessions/:sessionCode/accounts/:studentId/upload-record",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const body = await c.req.json().catch(() => null);
+
+    if (!body || !body.recordId) {
+      return c.json({ error: "Missing recordId in request payload" }, 400);
+    }
+
+    const recordId = sanitizeFilename(body.recordId);
+    const { metadata, events, aiInteractions, snapshotZipBase64 } = body;
+
+    const targetDir = path.resolve(
+      process.cwd(),
+      "logs",
+      "sessions",
+      sessionCode,
+      studentId,
+      "exam_records",
+      recordId,
+    );
+    await fs.promises.mkdir(targetDir, { recursive: true });
+
+    if (metadata) {
+      await fs.promises.writeFile(
+        path.join(targetDir, "metadata.json"),
+        typeof metadata === "string"
+          ? metadata
+          : JSON.stringify(metadata, null, 2),
+        "utf-8",
+      );
+    }
+    if (events) {
+      const content = Array.isArray(events)
+        ? events.map((e) => JSON.stringify(e)).join("\n")
+        : String(events);
+      await fs.promises.writeFile(
+        path.join(targetDir, "events.jsonl"),
+        content,
+        "utf-8",
+      );
+    }
+    if (aiInteractions) {
+      const content = Array.isArray(aiInteractions)
+        ? aiInteractions.map((e) => JSON.stringify(e)).join("\n")
+        : String(aiInteractions);
+      await fs.promises.writeFile(
+        path.join(targetDir, "ai_interactions.jsonl"),
+        content,
+        "utf-8",
+      );
+    }
+    if (snapshotZipBase64) {
+      const buf = Buffer.from(snapshotZipBase64, "base64");
+      await fs.promises.writeFile(
+        path.join(targetDir, "snapshot_start.zip"),
+        buf,
+      );
+    }
+
+    if (s3Storage.isAvailable()) {
+      if (metadata) {
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "metadata.json",
+          typeof metadata === "string"
+            ? metadata
+            : JSON.stringify(metadata, null, 2),
+          "application/json",
+        );
+      }
+      if (events) {
+        const content = Array.isArray(events)
+          ? events.map((e) => JSON.stringify(e)).join("\n")
+          : String(events);
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "events.jsonl",
+          content,
+          "application/x-ndjson",
+        );
+      }
+      if (aiInteractions) {
+        const content = Array.isArray(aiInteractions)
+          ? aiInteractions.map((e) => JSON.stringify(e)).join("\n")
+          : String(aiInteractions);
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "ai_interactions.jsonl",
+          content,
+          "application/x-ndjson",
+        );
+      }
+      if (snapshotZipBase64) {
+        const buf = Buffer.from(snapshotZipBase64, "base64");
+        void s3Storage.uploadExamRecordFile(
+          sessionCode,
+          studentId,
+          recordId,
+          "snapshot_start.zip",
+          buf,
+          "application/zip",
+        );
+      }
+    }
+
+    return c.json({ success: true, sessionCode, studentId, recordId });
+  },
+);
+
+// 8. S3 Storage healthcheck & status
+adminRouter.get("/s3/status", async (c) => {
+  const isAvailable = s3Storage.isAvailable();
+  if (!isAvailable) {
+    return c.json({
+      status: "unconfigured",
+      available: false,
+      message: "S3 credentials are not configured in .env",
+      endpoint: process.env.S3_ENDPOINT || "https://s3-api.iahn.hanoi.vn",
+      bucket: s3Storage.getBucketName(),
+    });
+  }
+
+  try {
+    const sessions = await s3Storage.listSessionsFromS3();
+    const guests = await s3Storage.listGuestsFromS3();
+    return c.json({
+      status: "connected",
+      available: true,
+      endpoint: process.env.S3_ENDPOINT,
+      bucket: s3Storage.getBucketName(),
+      totalSessionsOnS3: sessions.length,
+      sessions,
+      totalGuestsOnS3: guests.length,
+      guests,
+    });
+  } catch (err: any) {
+    return c.json(
+      {
+        status: "error",
+        available: false,
+        error: err?.message || String(err),
+      },
+      500,
+    );
+  }
 });
 
 // ─── GROUP ENDPOINTS ─────────────────────────────────────────────────────────
@@ -1813,7 +3117,9 @@ async function syncGroupWithActiveSessions(
       for (const otherGroupName of session.assignedGroups) {
         if (otherGroupName === groupName) continue;
         const otherGroupKey = `${otherGroupName}:${(session.createdBy || "admin").toLowerCase()}`;
-        const otherGroup = studentGroups.get(otherGroupKey) || studentGroups.get(`${otherGroupName}:admin`);
+        const otherGroup =
+          studentGroups.get(otherGroupKey) ||
+          studentGroups.get(`${otherGroupName}:admin`);
         if (otherGroup && Array.isArray(otherGroup.userIds)) {
           if (otherGroup.userIds.some((id) => id.toUpperCase() === uid)) {
             stillBelongsToOtherGroup = true;
@@ -1839,9 +3145,11 @@ async function syncGroupWithActiveSessions(
 }
 
 adminRouter.get("/groups", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const callerUser = (caller.username || "admin").toLowerCase();
+  const callerRole = (caller.role || "admin").toLowerCase();
   const groupsList = Array.from(studentGroups.values()).filter((g) => {
+    if (callerRole === "admin") return true;
     return (g.createdBy || "admin").toLowerCase() === callerUser;
   });
 
@@ -1849,7 +3157,7 @@ adminRouter.get("/groups", async (c) => {
 });
 
 adminRouter.post("/groups", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const body = await c.req.json();
   const { name, userIds } = body as { name?: string; userIds?: string[] };
 
@@ -1889,12 +3197,16 @@ adminRouter.post("/groups", async (c) => {
 });
 
 adminRouter.post("/groups/:name/students", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -1939,7 +3251,12 @@ adminRouter.post("/groups/:name/students", async (c) => {
   studentGroups.set(targetKey, updatedGroup);
 
   if (addedUserIds.length > 0) {
-    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, addedUserIds, []);
+    await syncGroupWithActiveSessions(
+      group.name,
+      group.createdBy || caller.username,
+      addedUserIds,
+      [],
+    );
   }
 
   return c.json({
@@ -1950,7 +3267,7 @@ adminRouter.post("/groups/:name/students", async (c) => {
 });
 
 adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const studentId = decodeURIComponent(c.req.param("studentId"))
     .trim()
@@ -1959,7 +3276,11 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -1979,7 +3300,12 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
 
   const targetKey = `${group.name}:${(group.createdBy || caller.username).toLowerCase()}`;
   studentGroups.set(targetKey, updatedGroup);
-  await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], [studentId]);
+  await syncGroupWithActiveSessions(
+    group.name,
+    group.createdBy || caller.username,
+    [],
+    [studentId],
+  );
 
   return c.json({
     success: true,
@@ -1989,12 +3315,16 @@ adminRouter.delete("/groups/:name/students/:studentId", async (c) => {
 });
 
 adminRouter.delete("/groups/:name", async (c) => {
-  const caller = c.get("caller") || { role: "admin", username: "admin" };
+  const caller = requireCaller(c);
   const groupName = decodeURIComponent(c.req.param("name")).trim();
   const mapKey = `${groupName}:${caller.username.toLowerCase()}`;
   let group = studentGroups.get(mapKey);
   if (!group && caller.role === "admin") {
-    group = studentGroups.get(`${groupName}:admin`) || Array.from(studentGroups.values()).find(g => g.name.toLowerCase() === groupName.toLowerCase());
+    group =
+      studentGroups.get(`${groupName}:admin`) ||
+      Array.from(studentGroups.values()).find(
+        (g) => g.name.toLowerCase() === groupName.toLowerCase(),
+      );
   }
 
   if (!group) {
@@ -2009,7 +3339,12 @@ adminRouter.delete("/groups/:name", async (c) => {
   }
 
   if (group && Array.isArray(group.userIds)) {
-    await syncGroupWithActiveSessions(group.name, group.createdBy || caller.username, [], group.userIds);
+    await syncGroupWithActiveSessions(
+      group.name,
+      group.createdBy || caller.username,
+      [],
+      group.userIds,
+    );
   }
 
   return c.json({ success: true, message: `Group '${groupName}' deleted.` });

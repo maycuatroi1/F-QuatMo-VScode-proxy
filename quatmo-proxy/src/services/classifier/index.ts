@@ -8,11 +8,182 @@ import {
   calculateSignalScore,
   calculateSessionSignalScore,
   deriveIemLabel,
+  blendFeatures,
+  extractCodeSnapshot,
   INSTRUMENTAL_WEIGHTS,
   EXECUTIVE_WEIGHTS,
   IEM_WINDOW_SIZE,
 } from "./features";
 import { sessionStates } from "../sessionStore";
+import { eventBus } from "../eventBus";
+import {
+  classifyCurrentPrompt,
+  type IemLabel,
+} from "./currentPromptClassifier";
+import { classifierConcurrencyController } from "./concurrencyLimiter";
+
+export interface EvaluationResult {
+  label: IemLabel | "ambiguous" | string;
+  overallLabel?: IemLabel;
+  currentLabel?: IemLabel;
+  confidence: number;
+  iScoreS: number;
+  eScoreS: number;
+  iScoreTurn: number;
+  eScoreTurn: number;
+  windowSize: number;
+}
+
+export interface TopNClassificationResult {
+  label: IemLabel;
+  overallLabel?: IemLabel;
+  confidence: number;
+  source: string;
+  windowSize?: number;
+  iScoreS?: number;
+  eScoreS?: number;
+}
+
+/**
+ * Retrieves the student's active IEM label derived from their top-N sliding window history.
+ * Does not perform prompt-level regex classification; instead reads from the evaluated
+ * sliding window (turns), sessionStates, token cache, or historical log files.
+ */
+export async function getStudentTopNClassification(
+  sessionCode: string,
+  studentId: string,
+  token?: string,
+  conversationId?: string,
+): Promise<TopNClassificationResult> {
+  const sCode = (sessionCode || "DEFAULT").toUpperCase();
+  const sId = (studentId || "DEFAULT_USER").toUpperCase();
+  const stateKey = `${sCode}:${sId}`;
+
+  // 1. Derive directly from the top-N window turns in Redis / in-memory store
+  try {
+    const turns = await redisStore.getTurns(sCode, sId, conversationId);
+    if (turns && turns.length > 0) {
+      const windowTurns = turns.slice(-IEM_WINDOW_SIZE);
+      const I_score_S = calculateSessionSignalScore(
+        windowTurns.map((turn) => turn.I_score),
+      );
+      const E_score_S = calculateSessionSignalScore(
+        windowTurns.map((turn) => turn.E_score),
+      );
+      const rawLabel = deriveIemLabel(I_score_S, E_score_S);
+      const label: IemLabel =
+        rawLabel === "executive" || rawLabel === "instrumental"
+          ? rawLabel
+          : "mixed";
+      const confidence = calculateIemConfidence(label, I_score_S, E_score_S);
+      return {
+        label,
+        overallLabel: label,
+        confidence,
+        source: `window_turns(${windowTurns.length})`,
+        windowSize: windowTurns.length,
+        iScoreS: I_score_S,
+        eScoreS: E_score_S,
+      };
+    }
+  } catch (err) {
+    console.warn(
+      "[Classifier] Failed to get window turns for top-N label:",
+      err,
+    );
+  }
+
+  try {
+    let logFilePath = path.resolve(
+      process.cwd(),
+      "logs",
+      "sessions",
+      sCode,
+      `${sId}.json`,
+    );
+    if (!fs.existsSync(logFilePath)) {
+      logFilePath = path.resolve(
+        process.cwd(),
+        "logs",
+        "guests",
+        `${sId}.json`,
+      );
+    }
+    if (fs.existsSync(logFilePath)) {
+      const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+      const logs = JSON.parse(fileContent);
+      if (Array.isArray(logs) && logs.length > 0) {
+        const matchingLogs = conversationId
+          ? logs.filter((e: any) => e.conversationId === conversationId)
+          : logs;
+
+        for (let i = matchingLogs.length - 1; i >= 0; i--) {
+          const entry = matchingLogs[i];
+          const c = entry?.classification;
+          const candidate = c?.trendLabel || c?.label || c?.currentLabel;
+          if (candidate && candidate !== "none") {
+            const norm = candidate.toLowerCase().trim();
+            if (
+              norm === "instrumental" ||
+              norm === "executive" ||
+              norm === "mixed"
+            ) {
+              return {
+                label: norm as IemLabel,
+                overallLabel: norm as IemLabel,
+                confidence:
+                  typeof c?.confidence === "number" ? c.confidence : 0.8,
+                source: "log_history",
+                windowSize:
+                  typeof c?.windowSize === "number" ? c.windowSize : 1,
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Classifier] Failed to read log file for top-N label:", err);
+  }
+
+  if (conversationId) {
+    return {
+      label: "mixed",
+      overallLabel: "mixed",
+      confidence: 0.5,
+      source: "new_conversation",
+      windowSize: 0,
+    };
+  }
+
+  try {
+    const state = sessionStates.get(stateKey);
+    if (state?.latestClassification && state.latestClassification !== "none") {
+      const norm = state.latestClassification.toLowerCase().trim();
+      if (norm === "instrumental" || norm === "executive" || norm === "mixed") {
+        return {
+          label: norm as IemLabel,
+          overallLabel: norm as IemLabel,
+          confidence: 0.8,
+          source: "session_state",
+        };
+      }
+    }
+  } catch (err) {
+    console.warn(
+      "[Classifier] Failed to check sessionStates for top-N label:",
+      err,
+    );
+  }
+
+  return {
+    label: "mixed",
+    overallLabel: "mixed",
+    confidence: 0.5,
+    source: "default_fallback",
+    windowSize: 0,
+  };
+}
 
 export async function evaluateTurnAndSession(
   sessionCode: string,
@@ -21,14 +192,16 @@ export async function evaluateTurnAndSession(
   prompt: string,
   response: string,
   history: Array<{ role: string; content: string }>,
-): Promise<void> {
+  isFastTrack = false,
+  conversationId?: string,
+): Promise<EvaluationResult | null> {
   const sCode = sessionCode.toUpperCase();
   const sId = studentId.toUpperCase();
   const stateKey = `${sCode}:${sId}`;
 
   try {
     const clientContext = await redisStore.getClientContext(sCode, sId);
-    const turns = await redisStore.getTurns(sCode, sId);
+    const turns = await redisStore.getTurns(sCode, sId, conversationId);
     const priorTurns = turns.slice(-(IEM_WINDOW_SIZE - 1));
     const lastTurn =
       priorTurns.length > 0 ? priorTurns[priorTurns.length - 1] : null;
@@ -45,50 +218,120 @@ export async function evaluateTurnAndSession(
       priorTurns,
     );
 
-    const codeSnapshot = clientContext?.activeFile?.content || "";
-    const codeSnapshots = clientContext?.files || [];
-    const activeFile = clientContext?.activeFile;
-    const semantic = await evaluateTurnSemanticFeatures(
-      prompt,
-      response,
-      codeSnapshot,
-      history,
-      codeSnapshots,
-      activeFile,
-      priorTurns,
-    );
+    const extracted = extractCodeSnapshot(null, prompt);
+    const codeSnapshot =
+      clientContext?.activeFile?.content || extracted.content || "";
+    const activeFile =
+      clientContext?.activeFile ||
+      (extracted.content
+        ? { path: extracted.path, content: extracted.content }
+        : undefined);
+    const codeSnapshots =
+      clientContext?.files && clientContext.files.length > 0
+        ? clientContext.files
+        : activeFile
+          ? [
+              {
+                path: activeFile.path,
+                content: activeFile.content,
+                languageId: extracted.languageId,
+              },
+            ]
+          : [];
 
-    const combinedFeatures: Record<string, number> = {
-      ...semantic,
-      ...programmatic,
-    };
+    const enableHeuristicFastTrack =
+      process.env.ENABLE_HEURISTIC_PREFLIGHT === "true";
+
+    let semantic: Record<string, number>;
+    if (isFastTrack && enableHeuristicFastTrack) {
+      console.log(
+        `[Evaluator] Running Fast-Track Heuristic evaluation for ${sId} in ${sCode}`,
+      );
+      const decision = classifyCurrentPrompt(prompt);
+      semantic = { ...decision.activeFeatures };
+      for (const [k, v] of Object.entries(programmatic)) {
+        if (semantic[k] === undefined) {
+          semantic[k] = v;
+        }
+      }
+    } else {
+      if (isFastTrack) {
+        console.log(
+          `[Evaluator] High load detected for ${sId} in ${sCode}, but heuristic shortcut is DISABLED for research data collection integrity. Running full deep LLM evaluation.`,
+        );
+      }
+      semantic = await evaluateTurnSemanticFeatures(
+        prompt,
+        response,
+        codeSnapshot,
+        history,
+        codeSnapshots,
+        activeFile,
+        priorTurns,
+        clientContext?.recentTerminal,
+      );
+    }
+
+    // Blend programmatic and LLM semantic features using per-feature trust weights.
+    // - Features only in programmatic (c6, c7, t9): pass through
+    // - Features only in LLM (i1-i8, e1-e6, r1-r8, t1-t8, c4, c5): pass through
+    // - Features in BOTH (c1-c3, c8-c10, t10): blended = progTrust×prog + (1-progTrust)×llm
+    const disagreements: string[] = [];
+    const combinedFeatures = blendFeatures(
+      semantic,
+      programmatic,
+      (key, prog, llm, blended) => {
+        if (Math.abs(prog - llm) > 0.4) {
+          disagreements.push(
+            `${key}[prog=${prog.toFixed(2)},llm=${llm.toFixed(2)}→${blended.toFixed(2)}]`,
+          );
+        }
+      },
+    );
 
     const iTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(INSTRUMENTAL_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      iTurnValues.push(act * weight);
+      if (act > 0) {
+        iTurnValues.push(weight);
+      }
     }
     const I_score_Ti = calculateSignalScore(iTurnValues);
 
     const eTurnValues: number[] = [];
     for (const [key, weight] of Object.entries(EXECUTIVE_WEIGHTS)) {
       const act = combinedFeatures[key] ?? 0;
-      eTurnValues.push(act * weight);
+      if (act > 0) {
+        eTurnValues.push(weight);
+      }
     }
     const E_score_Ti = calculateSignalScore(eTurnValues);
+
+    const currentRawLabel = deriveIemLabel(I_score_Ti, E_score_Ti);
+    const currentLabel: IemLabel =
+      currentRawLabel === "executive" || currentRawLabel === "instrumental"
+        ? currentRawLabel
+        : "mixed";
 
     const currentTurn = {
       timestamp: now,
       prompt,
       response,
       codeSnapshot,
+      terminalOutput: clientContext?.recentTerminal?.output,
+      lastTerminalCommand: clientContext?.recentTerminal?.lastCommand,
       I_score: I_score_Ti,
       E_score: E_score_Ti,
       featureVector: combinedFeatures,
     };
 
-    const windowTurns = [...priorTurns, currentTurn].slice(-IEM_WINDOW_SIZE);
-    await redisStore.saveTurns(sCode, sId, windowTurns);
+    const windowTurns = await redisStore.pushTurnAtomic(
+      sCode,
+      sId,
+      currentTurn,
+      IEM_WINDOW_SIZE,
+      conversationId,
+    );
 
     const I_score_S = calculateSessionSignalScore(
       windowTurns.map((turn) => turn.I_score),
@@ -97,13 +340,18 @@ export async function evaluateTurnAndSession(
       windowTurns.map((turn) => turn.E_score),
     );
     const delta = I_score_S - E_score_S;
-    const label = deriveIemLabel(I_score_S, E_score_S);
+    const overallRawLabel = deriveIemLabel(I_score_S, E_score_S);
+    const overallLabel: IemLabel =
+      overallRawLabel === "executive" || overallRawLabel === "instrumental"
+        ? overallRawLabel
+        : "mixed";
+    const label = overallLabel;
     const confidence = calculateIemConfidence(label, I_score_S, E_score_S);
 
     console.log(
-      `[Evaluator] Sliding window updated for ${sId} in ${sCode} -> I(S): ${I_score_S.toFixed(
-        2,
-      )} | E(S): ${E_score_S.toFixed(2)} | Delta: ${delta.toFixed(2)} | Window: ${windowTurns.length} | Label: ${label}`,
+      `[Evaluator] IEM Result for ${sId} in ${sCode}${conversationId ? ` [Conv: ${conversationId}]` : ""} (Window: ${windowTurns.length}) -> ` +
+        `currentLabel: ${currentLabel.toUpperCase()} [I(Turn): ${I_score_Ti.toFixed(2)} | E(Turn): ${E_score_Ti.toFixed(2)}] | ` +
+        `overallLabel (top5): ${overallLabel.toUpperCase()} [I(Top5): ${I_score_S.toFixed(2)} | E(Top5): ${E_score_S.toFixed(2)} | Delta: ${delta.toFixed(2)}]`,
     );
 
     await redisStore.cacheClassification(token, label, confidence);
@@ -117,40 +365,109 @@ export async function evaluateTurnAndSession(
       sessionStates.set(stateKey, state);
     }
 
+    eventBus
+      .publishIemUpdate({
+        token,
+        sessionCode: sCode,
+        studentId: sId,
+        conversationId,
+        label: overallLabel,
+        overallLabel,
+        currentLabel,
+        confidence,
+        iScoreS: I_score_S,
+        eScoreS: E_score_S,
+        iScoreTurn: I_score_Ti,
+        eScoreTurn: E_score_Ti,
+        windowSize: windowTurns.length,
+        timestamp: now,
+      })
+      .catch((busErr) => {
+        console.warn(
+          "[Evaluator] Failed to publish IEM update to event bus:",
+          busErr,
+        );
+      });
+
     try {
-      const logDir = path.resolve(process.cwd(), "logs", "sessions", sCode);
-      const logFilePath = path.resolve(logDir, `${sId}.json`);
-      if (fs.existsSync(logFilePath)) {
-        const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
-        const logs = JSON.parse(fileContent);
-        if (logs.length > 0) {
-          const lastEntry = logs[logs.length - 1];
-          const currentLabel =
-            lastEntry.classification?.currentLabel ||
-            lastEntry.classification?.label ||
-            "mixed";
-          lastEntry.classification = {
-            label,
-            currentLabel,
-            trendLabel: label,
-            confidence,
-            iScoreS: I_score_S,
-            eScoreS: E_score_S,
-            iScoreTurn: I_score_Ti,
-            eScoreTurn: E_score_Ti,
-            windowSize: windowTurns.length,
-            method: "sliding_window_hierarchical_signal_score_v3",
-            summary: `I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)} | Label: ${label}`,
-          };
-          await fs.promises.writeFile(
-            logFilePath,
-            JSON.stringify(logs, null, 2),
-            "utf-8",
+      const safeSessionCode = (sCode || "DEFAULT").toUpperCase();
+      const safeStudentId = (sId || "DEFAULT_USER").toUpperCase();
+      const logDir = path.resolve(
+        process.cwd(),
+        "logs",
+        "sessions",
+        safeSessionCode,
+      );
+      let logFilePath = path.resolve(logDir, `${safeStudentId}.json`);
+      if (!fs.existsSync(logFilePath)) {
+        logFilePath = path.resolve(logDir, `${sId}.json`);
+      }
+      if (!fs.existsSync(logFilePath)) {
+        const guestPath = path.resolve(
+          process.cwd(),
+          "logs",
+          "guests",
+          `${safeStudentId}.json`,
+        );
+        if (fs.existsSync(guestPath)) {
+          logFilePath = guestPath;
+        } else {
+          const altGuest = path.resolve(
+            process.cwd(),
+            "logs",
+            "guests",
+            `${sId}.json`,
           );
-          console.log(
-            `[Evaluator] Updated local JSON log file for ${sId} with classification: ${label}`,
-          );
+          if (fs.existsSync(altGuest)) {
+            logFilePath = altGuest;
+          }
         }
+      }
+      if (fs.existsSync(logFilePath)) {
+        await withFileLock(logFilePath, async () => {
+          const fileContent = await fs.promises.readFile(logFilePath, "utf-8");
+          const logs = JSON.parse(fileContent);
+          if (logs.length > 0) {
+            const targetEntry =
+              logs
+                .slice()
+                .reverse()
+                .find(
+                  (e: any) =>
+                    e.prompt === prompt &&
+                    (!conversationId ||
+                      !e.conversationId ||
+                      e.conversationId === conversationId),
+                ) || logs[logs.length - 1];
+            targetEntry.classification = {
+              ...(targetEntry.classification || {}),
+              label: overallLabel,
+              overallLabel,
+              currentLabel,
+              trendLabel: overallLabel,
+              confidence,
+              iScoreS: I_score_S,
+              eScoreS: E_score_S,
+              iScoreTurn: I_score_Ti,
+              eScoreTurn: E_score_Ti,
+              windowSize: windowTurns.length,
+              summary: `currentLabel: ${currentLabel} | overallLabel: ${overallLabel} | I(S): ${I_score_S.toFixed(2)} | E(S): ${E_score_S.toFixed(2)}`,
+              features: combinedFeatures,
+            };
+            targetEntry.featureVector = combinedFeatures;
+            if (conversationId && !targetEntry.conversationId) {
+              targetEntry.conversationId = conversationId;
+            }
+            await fs.promises.writeFile(
+              logFilePath,
+              JSON.stringify(logs, null, 2),
+              "utf-8",
+            );
+            console.log(
+              `[Evaluator] Updated local JSON log file for ${safeStudentId} with currentLabel: ${currentLabel} | overallLabel (top5): ${overallLabel}${conversationId ? ` [Conv: ${conversationId}]` : ""}`,
+            );
+          }
+        });
       }
     } catch (logErr) {
       console.error(
@@ -158,9 +475,76 @@ export async function evaluateTurnAndSession(
         logErr,
       );
     }
+
+    return {
+      label: overallLabel,
+      overallLabel,
+      currentLabel,
+      confidence,
+      iScoreS: I_score_S,
+      eScoreS: E_score_S,
+      iScoreTurn: I_score_Ti,
+      eScoreTurn: E_score_Ti,
+      windowSize: windowTurns.length,
+    };
   } catch (err: any) {
     console.error("[Evaluator] Error in evaluateTurnAndSession:", err.message);
+    return null;
   } finally {
     await redisStore.setEvaluationPending(token, false).catch(() => {});
   }
+}
+
+const fileLocks = new Map<string, Promise<void>>();
+export async function withFileLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const current = fileLocks.get(filePath) || Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  fileLocks.set(
+    filePath,
+    current.then(() => next),
+  );
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release!();
+    if (fileLocks.get(filePath) === next) {
+      fileLocks.delete(filePath);
+    }
+  }
+}
+
+/**
+ * Enqueues turn evaluation into the Keyed FIFO Concurrency Controller.
+ * Ensures turns for the same student are processed in strict causal sequence,
+ * while independent students run concurrently in parallel.
+ */
+export function queueEvaluation(
+  sessionCode: string,
+  studentId: string,
+  token: string,
+  prompt: string,
+  response: string,
+  history: Array<{ role: string; content: string }>,
+  conversationId?: string,
+): Promise<EvaluationResult | null> {
+  const clientKey = `${(sessionCode || "DEFAULT").toUpperCase()}:${(studentId || "DEFAULT_USER").toUpperCase()}`;
+  return classifierConcurrencyController.enqueue(clientKey, (isFastTrack) =>
+    evaluateTurnAndSession(
+      sessionCode,
+      studentId,
+      token,
+      prompt,
+      response,
+      history,
+      isFastTrack,
+      conversationId,
+    ),
+  );
 }

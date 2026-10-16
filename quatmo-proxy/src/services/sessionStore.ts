@@ -20,7 +20,27 @@ export interface StudentAccount {
   createdBy?: string;
   updatedAt?: number;
   updatedBy?: string;
+  isDeleted?: boolean;
+  deletedAt?: number | null;
 }
+
+export interface ExamQuestion {
+  id: string;
+  title: string;
+  content: string;
+  questionPrompt: string;
+}
+
+export interface SessionRuntimeConfig {
+  enabled: boolean;
+  runtimeType: "python" | "nodejs" | "java" | "cpp" | "dotnet" | "custom";
+  runtimeVersion: string;
+  packages?: string[];
+  lanMirrorUrl?: string;
+  downloadUrl?: string;
+}
+
+export type SessionPromptMode = "standard" | "scaffolded_code" | "socratic_tutor";
 
 export interface Session {
   sessionCode: string;
@@ -31,7 +51,13 @@ export interface Session {
   defaultTokenBudget: number;
   allowedStudentIds: Set<string>;
   assignedGroups?: string[];
+  sessionType?: "basic" | "exam";
+  sessionPrompt?: string;
+  promptMode?: SessionPromptMode;
+  examQuestions?: ExamQuestion[];
+  runtimeConfig?: SessionRuntimeConfig;
   createdAt: number;
+  endedAt?: number;
   createdBy?: string;
   updatedAt?: number;
   updatedBy?: string;
@@ -131,6 +157,8 @@ try { db.run("ALTER TABLE student_accounts ADD COLUMN created_by TEXT NOT NULL D
 try { db.run("ALTER TABLE student_accounts ADD COLUMN created_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE student_accounts ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN is_deleted INTEGER DEFAULT 0"); } catch (e) {}
+try { db.run("ALTER TABLE student_accounts ADD COLUMN deleted_at INTEGER"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -142,6 +170,9 @@ db.run(`
     default_token_budget INTEGER NOT NULL,
     allowed_student_ids TEXT NOT NULL,
     assigned_groups TEXT,
+    session_type TEXT DEFAULT 'basic',
+    session_prompt TEXT DEFAULT '',
+    exam_questions TEXT DEFAULT '[]',
     created_at INTEGER NOT NULL,
     created_by TEXT DEFAULT 'admin',
     updated_at INTEGER,
@@ -150,9 +181,14 @@ db.run(`
 `);
 
 try { db.run("ALTER TABLE sessions ADD COLUMN assigned_groups TEXT"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN session_type TEXT DEFAULT 'basic'"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN session_prompt TEXT DEFAULT ''"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN exam_questions TEXT DEFAULT '[]'"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN created_by TEXT DEFAULT 'admin'"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_at INTEGER"); } catch (e) {}
 try { db.run("ALTER TABLE sessions ADD COLUMN updated_by TEXT DEFAULT 'admin'"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN runtime_config TEXT DEFAULT ''"); } catch (e) {}
+try { db.run("ALTER TABLE sessions ADD COLUMN prompt_mode TEXT DEFAULT 'scaffolded_code'"); } catch (e) {}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS session_states (
@@ -239,8 +275,8 @@ const stmtDeleteLecturer = db.prepare(`
 `);
 
 const stmtSaveStudent = db.prepare(`
-  INSERT OR REPLACE INTO student_accounts (student_id, created_by, password_hash, created_at, updated_at, updated_by)
-  VALUES ($id, $created_by, $hash, $created_at, $updated_at, $updated_by)
+  INSERT OR REPLACE INTO student_accounts (student_id, created_by, password_hash, created_at, updated_at, updated_by, is_deleted, deleted_at)
+  VALUES ($id, $created_by, $hash, $created_at, $updated_at, $updated_by, $is_deleted, $deleted_at)
 `);
 
 const stmtDeleteStudent = db.prepare(`
@@ -248,8 +284,8 @@ const stmtDeleteStudent = db.prepare(`
 `);
 
 const stmtSaveSession = db.prepare(`
-  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, created_at, created_by, updated_at, updated_by)
-  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $created, $created_by, $updated_at, $updated_by)
+  INSERT OR REPLACE INTO sessions (session_code, start_time, duration_minutes, ai_option, ai_validity_minutes, default_token_budget, allowed_student_ids, assigned_groups, session_type, session_prompt, prompt_mode, exam_questions, runtime_config, created_at, created_by, updated_at, updated_by)
+  VALUES ($code, $start, $dur, $ai_opt, $ai_val, $budget, $students, $groups, $session_type, $session_prompt, $prompt_mode, $exam_questions, $runtime_config, $created, $created_by, $updated_at, $updated_by)
 `);
 
 const stmtDeleteSession = db.prepare(`
@@ -313,11 +349,13 @@ export class PersistedStudentAccounts extends Map<string, StudentAccount> {
     super.set(mapKey, accToStore);
     stmtSaveStudent.run({
       $id: accToStore.studentId,
-      $created_by: accToStore.createdBy,
+      $created_by: accToStore.createdBy || creator,
       $hash: accToStore.passwordHash,
       $created_at: accToStore.createdAt || now,
       $updated_at: accToStore.updatedAt || now,
       $updated_by: accToStore.updatedBy || creator,
+      $is_deleted: accToStore.isDeleted ? 1 : 0,
+      $deleted_at: accToStore.deletedAt || null,
     });
     return this;
   }
@@ -347,6 +385,11 @@ export class PersistedSessions extends Map<string, Session> {
       $budget: value.defaultTokenBudget,
       $students: JSON.stringify(Array.from(value.allowedStudentIds)),
       $groups: JSON.stringify(value.assignedGroups || []),
+      $session_type: value.sessionType || "basic",
+      $session_prompt: value.sessionPrompt || "",
+      $prompt_mode: value.promptMode || "scaffolded_code",
+      $exam_questions: JSON.stringify(value.examQuestions || []),
+      $runtime_config: value.runtimeConfig ? JSON.stringify(value.runtimeConfig) : "",
       $created: value.createdAt || now,
       $created_by: value.createdBy || "admin",
       $updated_at: value.updatedAt || now,
@@ -402,7 +445,7 @@ export class PersistedGroups extends Map<string, Group> {
     super.set(mapKey, groupToStore);
     stmtSaveGroup.run({
       $name: groupToStore.name,
-      $created_by: groupToStore.createdBy,
+      $created_by: groupToStore.createdBy || creator,
       $users: JSON.stringify(groupToStore.userIds),
       $created_at: groupToStore.createdAt || now,
       $updated_at: groupToStore.updatedAt || now,
@@ -467,7 +510,7 @@ export function getStudentAccount(studentId: string, creator = "admin"): Student
 
 export async function verifyPasswordSafely(password: string, hash: string): Promise<boolean> {
   if (!password || !hash) return false;
-  if (password === hash) return true;
+  // Never accept the stored hash itself as a password (pass-the-hash).
   try {
     return await Bun.password.verify(password, hash);
   } catch {
@@ -599,8 +642,10 @@ try {
       passwordHash: r.password_hash,
       createdAt: r.created_at || Date.now(),
       createdBy: creator,
-      updatedAt: r.updated_at || Date.now(),
+      updatedAt: r.updated_at || r.created_at || 0,
       updatedBy: r.updated_by || "admin",
+      isDeleted: r.is_deleted === 1,
+      deletedAt: r.deleted_at || null,
     });
   }
 
@@ -612,6 +657,18 @@ try {
     } catch {
       parsedGroups = [];
     }
+    let parsedQuestions: ExamQuestion[] = [];
+    try {
+      if (r.exam_questions) parsedQuestions = JSON.parse(r.exam_questions);
+    } catch {
+      parsedQuestions = [];
+    }
+    let parsedRuntimeConfig: SessionRuntimeConfig | undefined;
+    try {
+      if (r.runtime_config) parsedRuntimeConfig = JSON.parse(r.runtime_config);
+    } catch {
+      parsedRuntimeConfig = undefined;
+    }
     Map.prototype.set.call(sessions, r.session_code, {
       sessionCode: r.session_code,
       startTime: r.start_time,
@@ -621,9 +678,14 @@ try {
       defaultTokenBudget: r.default_token_budget,
       allowedStudentIds: new Set(JSON.parse(r.allowed_student_ids)),
       assignedGroups: parsedGroups,
+      sessionType: r.session_type || "basic",
+      sessionPrompt: r.session_prompt || "",
+      promptMode: (r.prompt_mode as SessionPromptMode) || "scaffolded_code",
+      examQuestions: parsedQuestions,
+      runtimeConfig: parsedRuntimeConfig,
       createdAt: r.created_at || Date.now(),
       createdBy: r.created_by || "admin",
-      updatedAt: r.updated_at || r.created_at || Date.now(),
+      updatedAt: r.updated_at || r.created_at || 0,
       updatedBy: r.updated_by || "admin",
     });
   }
@@ -665,7 +727,7 @@ try {
       userIds: JSON.parse(r.user_ids),
       createdAt: r.created_at || Date.now(),
       createdBy: creator,
-      updatedAt: r.updated_at || Date.now(),
+      updatedAt: r.updated_at || r.created_at || 0,
       updatedBy: r.updated_by || "admin",
     });
   }

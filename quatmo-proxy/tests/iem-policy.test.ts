@@ -22,6 +22,38 @@ test("conceptual current request selects instrumental mode", () => {
   expect(decision.label).toBe("instrumental");
 });
 
+test("implementation inquiry without delegation selects instrumental mode", () => {
+  const decision1 = classifyCurrentPrompt(
+    "How can I implement a binary search algorithm in Python?",
+  );
+  expect(decision1.label).toBe("instrumental");
+
+  const decision2 = classifyCurrentPrompt(
+    "Hướng dẫn cách cài đặt thuật toán quicksort bằng Python",
+  );
+  expect(decision2.label).toBe("instrumental");
+});
+
+test("conceptual questions without terminal telemetry do not receive c10 penalty", () => {
+  const features = calculateProgrammaticFeatures(
+    "Explain what a deadlock is in operating systems",
+    "",
+    null,
+    null,
+    30,
+    [],
+  );
+  expect(features.c10).toBe(0);
+});
+
+test("vietnamese executive prompt is accurately classified as executive", () => {
+  const decision1 = classifyCurrentPrompt("Viết code cho tôi bài tập tạo web django này");
+  expect(decision1.label).toBe("executive");
+
+  const decision2 = classifyCurrentPrompt("giải bài này giúp tôi với");
+  expect(decision2.label).toBe("executive");
+});
+
 test("unclear current request fails safely to mixed mode", () => {
   const decision = classifyCurrentPrompt("Help me with Python");
   expect(decision.label).toBe("mixed");
@@ -97,6 +129,8 @@ test("IEM gates use HIGH 0.55, MID 0.45, and MARGIN 0.15", () => {
   expect(deriveIemLabel(0.2, 0.7)).toBe("executive");
   expect(deriveIemLabel(0.7, 0.5)).toBe("mixed");
   expect(deriveIemLabel(0.5, 0.2)).toBe("ambiguous");
+  expect(deriveIemLabel(0.5, 0.9)).toBe("executive");
+  expect(deriveIemLabel(0.9, 0.5)).toBe("instrumental");
 });
 
 test("t10 requires delegation to recur across turns", () => {
@@ -118,5 +152,91 @@ test("t10 requires delegation to recur across turns", () => {
     priorTurns,
   );
 
-  expect(features.t10).toBe(0.75);
+  expect(features.t10).toBe(1);
+});
+
+test("c10 drops to 0 when student runs test or script in terminal", () => {
+  const features = calculateProgrammaticFeatures(
+    "how do I fix the loop condition?",
+    "",
+    {
+      recentTerminal: {
+        lastCommand: "python test_solution.py",
+        output: "Ran 3 tests in 0.002s\nOK\n[Process exited with code 0]",
+        timestamp: Date.now(),
+      },
+    },
+    null,
+    30,
+    [],
+  );
+
+  expect(features.c10).toBe(0);
+});
+
+test("c10 activates when multiple turns pass with zero test or execution activity in terminal and prompt", () => {
+  const priorTurns: TurnLog[] = [
+    {
+      timestamp: 1,
+      prompt: "give me code for problem 1",
+      response: "```python\nprint(1)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+    {
+      timestamp: 2,
+      prompt: "now do problem 2",
+      response: "```python\nprint(2)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+    {
+      timestamp: 3,
+      prompt: "now do problem 3",
+      response: "```python\nprint(3)\n```",
+      I_score: 0,
+      E_score: 0.8,
+    },
+  ];
+
+  const featuresWithTelemetry = calculateProgrammaticFeatures(
+    "now solve problem 4",
+    "",
+    {
+      recentTerminal: {
+        output: "ls -la",
+        timestamp: Date.now(),
+      },
+    },
+    priorTurns[2],
+    30,
+    priorTurns,
+  );
+
+  expect(featuresWithTelemetry.c10).toBe(1.0);
+});
+
+test("c10 drops to 0 when prior turn in window had terminal test execution", () => {
+  const priorTurns: TurnLog[] = [
+    {
+      timestamp: 1,
+      prompt: "my test failed",
+      response: "check the base case",
+      terminalOutput: "Traceback (most recent call last):\n  File \"solution.py\", line 10\nAssertionError",
+      lastTerminalCommand: "python solution.py",
+      I_score: 0.5,
+      E_score: 0.2,
+    },
+  ];
+
+  const features = calculateProgrammaticFeatures(
+    "how should I rewrite the base case?",
+    "",
+    null,
+    priorTurns[0],
+    20,
+    priorTurns,
+  );
+
+  expect(features.c10).toBe(0);
 });

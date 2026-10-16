@@ -19,19 +19,22 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
   Variables: { user: UserSession; token: string };
 }> => {
   return async (c, next) => {
+    // The client type header is client-controlled, so it must not disable limits.
+    // Agent mode (many tool-call turns) just gets a higher, separate budget.
     const clientType = c.req.header("x-client-type");
-    if (clientType === "quatmo-code") {
-      return await next();
-    }
+    const isAgent = clientType === "quatmo-code";
 
     const user = c.get("user") as UserSession | undefined;
     if (!user) {
       return c.json({ error: "Context unauthorized" }, 401);
     }
 
-    let limitVal = 30;
-    if (process.env.RATE_LIMIT_PER_MINUTE !== undefined) {
-      const parsed = parseInt(process.env.RATE_LIMIT_PER_MINUTE, 10);
+    let limitVal = isAgent ? 120 : 30;
+    const envLimit = isAgent
+      ? process.env.RATE_LIMIT_AGENT_PER_MINUTE
+      : process.env.RATE_LIMIT_PER_MINUTE;
+    if (envLimit !== undefined) {
+      const parsed = parseInt(envLimit, 10);
       if (!isNaN(parsed)) {
         limitVal = parsed;
       }
@@ -42,7 +45,10 @@ export const rateLimitMiddleware = (): MiddlewareHandler<{
     }
 
     const currentMinute = Math.floor(Date.now() / 60000);
-    const redisKey = `rate:req:${user.keyId}:${currentMinute}`;
+    // Session tokens share keyId "session-<code>" across the whole class: bucket per
+    // student so one student can never throttle the others during an exam.
+    const subject = user.userId ? `${user.keyId}:${user.userId}` : user.keyId;
+    const redisKey = `rate:req:${isAgent ? "agent" : "chat"}:${subject}:${currentMinute}`;
 
     if (redis && redis.status === "ready") {
       try {

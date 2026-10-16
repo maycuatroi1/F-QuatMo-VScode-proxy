@@ -21,6 +21,7 @@ import fs from "fs";
 import path from "path";
 
 const BUILD_SIGNING_SECRET = process.env.BUILD_SIGNING_SECRET || "";
+const ENFORCE_SIGNING_KEY = (process.env.ENFORCE_SIGNING_KEY || "").toLowerCase() === "true";
 
 export interface ClientFingerprintPayload {
   clientId: string;
@@ -66,7 +67,7 @@ export const verifyFingerprintMiddleware = (): MiddlewareHandler => {
         try {
           const decoded = Buffer.from(raw, "base64").toString("utf-8");
           const fingerprint = JSON.parse(decoded);
-          if (fingerprint.signature === LATEST_FINGERPRINT) {
+          if (fingerprint.signature === LATEST_FINGERPRINT || fingerprint.clientId === LATEST_FINGERPRINT) {
             matches = true;
           }
         } catch (e) {
@@ -85,13 +86,15 @@ export const verifyFingerprintMiddleware = (): MiddlewareHandler => {
           userAgent,
           status: "invalid_signingkey",
         });
+        if (ENFORCE_SIGNING_KEY) {
+          return c.json({ error: "Forbidden: Outdated or unauthorized Fvscode application version." }, 403);
+        }
       }
     }
 
     if (!raw) {
       // No fingerprint header — unsigned/dev build
       c.set("clientId" as any, "unsigned");
-      // Run in background
       logForensicEvent({
         timestamp,
         clientId: "unsigned",
@@ -101,6 +104,9 @@ export const verifyFingerprintMiddleware = (): MiddlewareHandler => {
         userAgent,
         status: "unsigned",
       });
+      if (ENFORCE_SIGNING_KEY) {
+        return c.json({ error: "Forbidden: Missing application signing key (Unsigned build)." }, 403);
+      }
       return next();
     }
 
@@ -144,6 +150,9 @@ export const verifyFingerprintMiddleware = (): MiddlewareHandler => {
           userAgent,
           status: "tampered",
         });
+        if (ENFORCE_SIGNING_KEY) {
+          return c.json({ error: "Forbidden: Invalid or tampered application signing key." }, 403);
+        }
       } else {
         c.set("clientId" as any, fingerprint.clientId);
         c.set("staffId" as any, fingerprint.staffId);
@@ -170,6 +179,9 @@ export const verifyFingerprintMiddleware = (): MiddlewareHandler => {
         userAgent,
         status: "malformed",
       });
+      if (ENFORCE_SIGNING_KEY) {
+        return c.json({ error: "Forbidden: Malformed application signing key." }, 403);
+      }
     }
 
     return next();

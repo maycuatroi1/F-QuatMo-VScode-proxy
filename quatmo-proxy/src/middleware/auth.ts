@@ -1,5 +1,6 @@
 import type { MiddlewareHandler } from "hono";
 import { getProxyApiKey } from "../services/proxyKey";
+import { safeEqual } from "../services/security";
 
 export interface UserSession {
   keyId: string;
@@ -22,7 +23,7 @@ export const authMiddleware = (): MiddlewareHandler<{
 
     let session: UserSession | null = null;
 
-    if (token === proxyApiKey) {
+    if (safeEqual(token, proxyApiKey)) {
       session = {
         keyId: "master-key-id",
         userId: "master-user",

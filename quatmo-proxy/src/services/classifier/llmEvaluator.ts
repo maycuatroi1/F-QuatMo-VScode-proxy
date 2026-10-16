@@ -1,17 +1,12 @@
 import fs from "fs";
 import path from "path";
+import { INSTRUMENTAL_WEIGHTS, EXECUTIVE_WEIGHTS } from "./features";
 import type { TurnLog } from "./redisStore";
 
 let cachedEvalPrompt = "";
 let lastPromptLoadedTime = 0;
 
-const ACTIVATION_VALUES: Record<string, number> = {
-  none: 0.0,
-  weak: 0.25,
-  partial: 0.5,
-  clear: 0.75,
-  strong: 1.0,
-};
+
 
 async function getEvaluationSystemPrompt(): Promise<string> {
   const now = Date.now();
@@ -47,6 +42,7 @@ export async function evaluateTurnSemanticFeatures(
   codeSnapshots?: Array<{ path: string; content: string; languageId: string }>,
   activeFile?: { path: string; content: string },
   recentTurns: TurnLog[] = [],
+  recentTerminal?: { output: string; lastCommand?: string; exitCode?: number },
 ): Promise<Record<string, number>> {
   const defaultFeatures: Record<string, number> = {};
 
@@ -81,6 +77,7 @@ export async function evaluateTurnSemanticFeatures(
     "t6",
     "t7",
     "t8",
+    "t10",
     "c1",
     "c2",
     "c3",
@@ -90,40 +87,52 @@ export async function evaluateTurnSemanticFeatures(
     "c9",
     "c10",
   ];
-  for (const k of allKeys) defaultFeatures[k] = 0.0;
-
-  const apiUrl = process.env.CLASSIFIER_API_URL;
-  if (!apiUrl) {
-    console.warn(
-      "[Classifier LLM] CLASSIFIER_API_URL not set. Skipping LLM evaluation.",
-    );
-    return defaultFeatures;
+  for (const k of allKeys) {
+    defaultFeatures[k] = 0;
   }
-
-  const model = process.env.CLASSIFIER_MODEL || "qwen3-coder";
-  const apiKey = process.env.CLASSIFIER_API_KEY?.trim();
 
   try {
     const systemPrompt = await getEvaluationSystemPrompt();
+    const apiUrl =
+      process.env.CLASSIFIER_EVAL_API_URL ||
+      process.env.CLASSIFIER_API_URL ||
+      "https://api.openai.com/v1/chat/completions";
+    const apiKey =
+      process.env.CLASSIFIER_EVAL_API_KEY || process.env.CLASSIFIER_API_KEY || "";
+    const model =
+      process.env.CLASSIFIER_EVAL_MODEL || process.env.CLASSIFIER_MODEL || "gpt-4o-mini";
+
+    if (!apiUrl) {
+      console.warn(
+        "[Classifier LLM] CLASSIFIER_API_URL not set. Skipping LLM evaluation.",
+      );
+      return defaultFeatures;
+    }
 
     const formattedHistory =
       recentTurns.length > 0
         ? recentTurns
-            .map((turn, index) => {
-              const turnNumber = index + 1;
-              return [
+            .map((turn, idx) => {
+              const turnNumber = idx + 1;
+              const turnParts = [
                 `Turn ${turnNumber}:`,
                 `Student Prompt: ${turn.prompt}`,
                 `AI Response: ${turn.response}`,
                 turn.codeSnapshot
                   ? `Code Snapshot:\n\`\`\`\n${turn.codeSnapshot}\n\`\`\``
                   : "Code Snapshot: None",
-              ].join("\n");
+              ];
+              if (turn.terminalOutput) {
+                turnParts.push(
+                  `Terminal Activity: ${turn.lastTerminalCommand ? `(Command: ${turn.lastTerminalCommand}) ` : ""}\n\`\`\`\n${turn.terminalOutput}\n\`\`\``,
+                );
+              }
+              return turnParts.join("\n");
             })
             .join("\n\n")
         : history
             .map(
-              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content.slice(0, 1000)}`,
+              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content}`,
             )
             .join("\n\n");
 
@@ -151,6 +160,20 @@ export async function evaluateTurnSemanticFeatures(
       }
     }
 
+    let terminalSection = "Recent Terminal Activity: None";
+    if (recentTerminal?.output || recentTerminal?.lastCommand) {
+      terminalSection = [
+        "Recent Terminal Activity:",
+        recentTerminal.lastCommand ? `Last Command: ${recentTerminal.lastCommand}` : "",
+        recentTerminal.exitCode !== undefined ? `Exit Code: ${recentTerminal.exitCode}` : "",
+        recentTerminal.output
+          ? `Output:\n\`\`\`\n${recentTerminal.output}\n\`\`\``
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     const payload = [
       "## RECENT 5-TURN WINDOW HISTORY",
       formattedHistory || "None (First Turn)",
@@ -158,6 +181,7 @@ export async function evaluateTurnSemanticFeatures(
       `Student Prompt: ${prompt}`,
       `AI Response: ${response}`,
       codeSection,
+      terminalSection,
     ].join("\n\n");
 
     const headers: Record<string, string> = {
@@ -167,25 +191,47 @@ export async function evaluateTurnSemanticFeatures(
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: payload },
-        ],
-        temperature: 0,
-      }),
-      signal: AbortSignal.timeout(35000),
-    });
+    const timeoutMs = parseInt(
+      process.env.CLASSIFIER_TIMEOUT_MS || "90000",
+      10,
+    );
+    let lastError: any = null;
+    let responseText = "";
 
-    if (!res.ok) {
-      throw new Error(`LLM API returned status ${res.status}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(apiUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: payload },
+            ],
+            temperature: 0,
+          }),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (!res.ok) {
+          throw new Error(`LLM API returned status ${res.status}`);
+        }
+
+        responseText = await res.text();
+        break;
+      } catch (err: any) {
+        lastError = err;
+        if (attempt < 2) {
+          console.warn(`[Classifier LLM] Attempt ${attempt} failed (${err.message}). Retrying in 1.5s...`);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
     }
 
-    const responseText = await res.text();
+    if (!responseText && lastError) {
+      throw lastError;
+    }
     console.log("[Classifier LLM] Raw Response Text:", responseText);
     let parsed: any = null;
 
@@ -194,14 +240,26 @@ export async function evaluateTurnSemanticFeatures(
       const content = responseJson.choices?.[0]?.message?.content || "";
       console.log("[Classifier LLM] Assistant Message Content:", content);
 
-      const startIdx = content.indexOf("{");
-      const endIdx = content.lastIndexOf("}");
-      if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-        parsed = JSON.parse(content.substring(startIdx, endIdx + 1));
+      const arrayStart = content.indexOf("[");
+      const arrayEnd = content.lastIndexOf("]");
+      const objStart = content.indexOf("{");
+      const objEnd = content.lastIndexOf("}");
+
+      if (
+        arrayStart !== -1 &&
+        arrayEnd !== -1 &&
+        (objStart === -1 || arrayStart < objStart)
+      ) {
+        parsed = JSON.parse(content.substring(arrayStart, arrayEnd + 1));
+      } else if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+        parsed = JSON.parse(content.substring(objStart, objEnd + 1));
       } else {
         parsed = JSON.parse(content.replace(/```json|```/g, "").trim());
       }
-      console.log("[Classifier LLM] Parsed JSON Object:", JSON.stringify(parsed, null, 2));
+      console.log(
+        "[Classifier LLM] Parsed JSON Object:",
+        JSON.stringify(parsed, null, 2),
+      );
     } catch (e) {
       console.error(
         "[Classifier LLM] Failed to parse JSON response:",
@@ -212,15 +270,72 @@ export async function evaluateTurnSemanticFeatures(
 
     if (parsed) {
       const result: Record<string, number> = { ...defaultFeatures };
-      for (const [key, value] of Object.entries(parsed)) {
-        if (typeof value === "string") {
-          const valNormalized = value.toLowerCase().trim();
-          if (ACTIVATION_VALUES[valNormalized] !== undefined) {
-            result[key] = ACTIVATION_VALUES[valNormalized];
+      const activeKeys: string[] = [];
+
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (typeof item === "string") {
+            const k = item.toLowerCase().trim();
+            if (k in defaultFeatures) {
+              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+              result[k] = weight;
+              activeKeys.push(k);
+            }
+          }
+        }
+      } else if (typeof parsed === "object" && parsed !== null) {
+        const list = Array.isArray(parsed.active_features)
+          ? parsed.active_features
+          : Array.isArray(parsed.features)
+            ? parsed.features
+            : null;
+
+        if (list) {
+          for (const item of list) {
+            if (typeof item === "string") {
+              const k = item.toLowerCase().trim();
+              if (k in defaultFeatures) {
+                const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+                result[k] = weight;
+                activeKeys.push(k);
+              }
+            }
+          }
+        } else {
+          for (const [key, value] of Object.entries(parsed)) {
+            const k = key.toLowerCase().trim();
+            if (k in defaultFeatures) {
+              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+              if (typeof value === "number") {
+                if (value > 0) {
+                  result[k] = weight;
+                  activeKeys.push(k);
+                }
+              } else if (typeof value === "boolean") {
+                if (value) {
+                  result[k] = weight;
+                  activeKeys.push(k);
+                }
+              } else if (typeof value === "string") {
+                const s = value.toLowerCase().trim();
+                if (s !== "none" && s !== "false" && s !== "0" && s !== "") {
+                  result[k] = weight;
+                  activeKeys.push(k);
+                }
+              }
+            }
           }
         }
       }
-      console.log("[Classifier LLM] Mapped Features:", JSON.stringify(result, null, 2));
+
+      console.log(
+        `[Classifier LLM] Active Features (${activeKeys.length}):`,
+        JSON.stringify(activeKeys),
+      );
+      console.log(
+        "[Classifier LLM] Mapped Features (Pure Criteria Weights):",
+        JSON.stringify(result, null, 2),
+      );
       return result;
     }
   } catch (err: any) {
