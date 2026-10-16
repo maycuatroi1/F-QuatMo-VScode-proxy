@@ -1941,34 +1941,45 @@ adminRouter.get("/visualize/sessions", async (c) => {
   if (s3Storage.isAvailable()) {
     try {
       const s3SessionCodes = await s3Storage.listSessionsFromS3();
-      for (const code of s3SessionCodes) {
-        if (!scannedCodes.has(code)) {
-          scannedCodes.add(code);
-          const students = await s3Storage.listStudentsInSessionFromS3(code);
-          const sessionObj = sessions.get(code);
-          const promptLogCount = students.filter((s) => s.hasPromptLog).length;
-          const eventLogCount = students.filter((s) => s.hasEventLog).length;
-          const sStart = toMs(sessionObj?.startTime);
-          const sCreated = toMs(sessionObj?.createdAt);
-          const sEnd = toMs(sessionObj?.endedAt);
-          const lastActivity = Math.max(
-            ...students.map((s) => s.lastActivity || 0),
-            sCreated || Date.now(),
-          );
-          resultSessions.push({
-            sessionCode: code,
-            sessionName: code,
-            promptLogCount,
-            eventLogCount,
-            lastActivity,
-            studentCount:
-              students.length || sessionObj?.allowedStudentIds?.size || 0,
-            startTime: sStart || sCreated || undefined,
-            createdAt: sCreated || sStart || undefined,
-            durationMinutes: sessionObj?.durationMinutes || 90,
-            endedAt: sEnd || undefined,
-          });
-        }
+      const newCodes = s3SessionCodes.filter((code) => !scannedCodes.has(code));
+      newCodes.forEach((code) => scannedCodes.add(code));
+
+      const s3Results = await Promise.all(
+        newCodes.map(async (code) => {
+          try {
+            const students = await s3Storage.listStudentsInSessionFromS3(code);
+            const sessionObj = sessions.get(code);
+            const promptLogCount = students.filter((s) => s.hasPromptLog).length;
+            const eventLogCount = students.filter((s) => s.hasEventLog).length;
+            const sStart = toMs(sessionObj?.startTime);
+            const sCreated = toMs(sessionObj?.createdAt);
+            const sEnd = toMs(sessionObj?.endedAt);
+            const lastActivity = Math.max(
+              ...students.map((s) => s.lastActivity || 0),
+              sCreated || Date.now(),
+            );
+            return {
+              sessionCode: code,
+              sessionName: code,
+              promptLogCount,
+              eventLogCount,
+              lastActivity,
+              studentCount:
+                students.length || sessionObj?.allowedStudentIds?.size || 0,
+              startTime: sStart || sCreated || undefined,
+              createdAt: sCreated || sStart || undefined,
+              durationMinutes: sessionObj?.durationMinutes || 90,
+              endedAt: sEnd || undefined,
+            };
+          } catch (e) {
+            console.error(`[Visualize] Failed to list students for S3 session ${code}:`, e);
+            return null;
+          }
+        }),
+      );
+
+      for (const res of s3Results) {
+        if (res) resultSessions.push(res);
       }
     } catch (err) {
       console.error("[Visualize] S3 sessions listing error:", err);
