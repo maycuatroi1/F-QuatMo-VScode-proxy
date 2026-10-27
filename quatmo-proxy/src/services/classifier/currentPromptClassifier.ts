@@ -10,11 +10,14 @@ export type IemLabel = "instrumental" | "mixed" | "executive";
 
 export interface CurrentPromptDecision {
   label: IemLabel;
+  rawLabel?: string;
   confidence: number;
   instrumentalScore: number;
   executiveScore: number;
   activeFeatures: Record<string, number>;
   hardExecutive: boolean;
+  isAmbiguous?: boolean;
+  isShortContinuation?: boolean;
 }
 
 function normalizeText(value: string): string {
@@ -56,13 +59,13 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   const hasCodeContext =
     /attached (context )?file|```|traceback|\b(line|error) \d+\b/i.test(text);
 
-  // Explicit delegation phrasing (e.g. "for me", "cho tôi", "làm hộ tôi", etc.)
+  // Explicit delegation indicators
   const hasExplicitDelegation =
     /\b(for me|to me|give me|send me|show me|cho (?:tôi|tao|mình|em)|hộ (?:tôi|tao|mình|em)|giúp (?:tôi|tao|mình|em))\b/i.test(
       text,
     );
 
-  // --- Instrumental Signals ---
+  // Instrumental inquiry patterns
   const asksExplanation =
     /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|how can|how to|difference between|compare|meaning of|intuition behind)\b/i.test(
       text,
@@ -71,7 +74,7 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
       text,
     );
 
-  // --- Executive Signals ---
+  // Executive signal patterns
   const asksDirectCreation =
     (
       /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website)\b/i.test(
@@ -118,16 +121,16 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
       text,
     );
 
-  // Cluster 1 Disambiguation: "how to / show me" followed by full delegation
+  // Differentiate procedural guidance from full delegation
   const isHowToDelegation =
     /\b(how (?:can|to|do) i|show me)\b.{0,60}\b(complete|code|finish|write|implement)\b.{0,40}\b(all|full|everything|todos?|files?)\b/i.test(text) ||
     (/\b(show me|how can i)\b/i.test(text) && /\b(for me|giúp tôi|hộ em)\b/i.test(text) && /\b(code|file|function|task)\b/i.test(text));
 
-  // Cluster 7 Disambiguation: Traceback error log dumps
+  // Identify raw stack trace or runtime traceback dumps
   const isTraceback = /\b(traceback \(most recent call last\)|from database import|modulenotfounderror|operationalerror|sqlalchemy)\b/i.test(text);
   const asksTracebackExplanation = isTraceback && /\b(why|what causes|explain|what does this mean|tại sao|nguyên nhân|nghĩa là gì)\b/i.test(text);
 
-  // Cluster 9 Disambiguation: Code Review vs Review-and-Fix
+  // Distinguish code reviews from code-fixing delegations
   const isReviewAndFix =
     /\b(check|review|kiểm tra|soi lỗi)\b.{0,80}\b(if wrong|nếu sai|nếu lỗi|and fix|và sửa|sửa giúp|help me fix|fix (?:it|any bugs?|help me)|sửa hộ)\b/i.test(text);
   const isPureReview =
@@ -135,10 +138,10 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     (/(?:^\s*|\b)(check|review|kiểm tra|soi lỗi|is this correct|check my code|check my logic|check the function)\b/i.test(text) ||
      /\b(review|check)\b.{0,40}\b(code|function|logic|hàm)\b/i.test(text));
 
-  // Cluster 3 Disambiguation: Short continuation prompts
+  // Identify short continuation prompts
   const isShortContinuation = /^(same|do the same|the same|continue|next|như cũ|làm tiếp)$/i.test(text.trim());
 
-  // Instrumental Feature Activations (i1 - i8)
+  // Instrumental feature activations
   if (asksExplanation && !isHowToDelegation && !asksDirectCreation) {
     activate(features, "i1", 0.75);
   }
@@ -236,7 +239,7 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     activate(features, "i6", 0.85);
   }
 
-  // Executive Feature Activations (e1 - e6)
+  // Executive feature activations
   if (
     text.length >= 200 &&
     /\b(requirements?|assignment|task|acceptance criteria|problem statement|input format|output format|sample input|sample output|test case|bài tập|đề bài|yêu cầu bài)\b/i.test(

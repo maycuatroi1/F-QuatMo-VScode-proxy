@@ -30,6 +30,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { s3Storage } from "../services/s3Storage";
+import { summaryStorageService } from "../services/summaryStorage";
 import { reconcileStudentPromptTurns } from "../services/telemetryMigration";
 
 function sanitizeFilename(name: string): string {
@@ -2425,6 +2426,155 @@ adminRouter.get(
     }
 
     return c.json({ sessionCode, studentId, turns: [] });
+  },
+);
+
+// ─── Process Summary API ─────────────────────────────────────────────────────
+
+/** Retrieve generated summary for an individual student */
+adminRouter.get(
+  "/visualize/sessions/:sessionCode/accounts/:studentId/summary",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+    const autoGen = c.req.query("auto") === "true";
+
+    let result = await summaryStorageService.getStudentSummary(
+      sessionCode,
+      studentId,
+    );
+
+    if (!result && autoGen) {
+      try {
+        result = await summaryStorageService.generateStudentSummary(
+          sessionCode,
+          studentId,
+        );
+      } catch (err: any) {
+        console.warn(
+          `[Summary API] Auto-generation failed for ${sessionCode}/${studentId}:`,
+          err?.message || err,
+        );
+      }
+    }
+
+    if (!result) {
+      return c.json(
+        {
+          ok: false,
+          error: "Summary not found for this student.",
+          sessionCode,
+          studentId,
+        },
+        404,
+      );
+    }
+
+    return c.json(result);
+  },
+);
+
+/** Trigger summary generation for an individual student */
+adminRouter.post(
+  "/visualize/sessions/:sessionCode/accounts/:studentId/summary/generate",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
+
+    try {
+      const generated = await summaryStorageService.generateStudentSummary(
+        sessionCode,
+        studentId,
+      );
+      return c.json(generated);
+    } catch (err: any) {
+      console.error(
+        `[Summary API] Generation failed for ${sessionCode}/${studentId}:`,
+        err,
+      );
+      return c.json(
+        {
+          ok: false,
+          error: err?.message || "Failed to generate student summary.",
+        },
+        500,
+      );
+    }
+  },
+);
+
+/** Retrieve master summary manifest for a session */
+adminRouter.get(
+  "/visualize/sessions/:sessionCode/summary-manifest",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const manifest =
+      await summaryStorageService.getSessionManifest(sessionCode);
+
+    if (!manifest) {
+      return c.json(
+        {
+          ok: false,
+          error: "Summary manifest not found for this session.",
+          sessionCode,
+        },
+        404,
+      );
+    }
+
+    return c.json({
+      ok: true,
+      sessionCode,
+      manifestMarkdown: manifest.manifestMarkdown,
+      source: manifest.source,
+    });
+  },
+);
+
+/** Trigger batch summary generation for all students in a session */
+adminRouter.post(
+  "/visualize/sessions/:sessionCode/summary/generate-all",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+
+    try {
+      const res =
+        await summaryStorageService.generateSessionSummaries(sessionCode);
+      return c.json(res);
+    } catch (err: any) {
+      console.error(
+        `[Summary API] Batch generation failed for ${sessionCode}:`,
+        err,
+      );
+      return c.json(
+        {
+          ok: false,
+          error: err?.message || "Failed to batch generate summaries.",
+        },
+        500,
+      );
+    }
+  },
+);
+
+/** List student summary availability across a session */
+adminRouter.get(
+  "/visualize/sessions/:sessionCode/summaries",
+  async (c) => {
+    const sessionCode = sanitizeFilename(
+      c.req.param("sessionCode"),
+    ).toUpperCase();
+    const list =
+      await summaryStorageService.listSessionSummaries(sessionCode);
+    return c.json({ ok: true, sessionCode, summaries: list });
   },
 );
 

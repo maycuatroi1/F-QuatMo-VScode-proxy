@@ -25,6 +25,7 @@ import {
   recordSuccessfulLogin,
 } from "../services/rateLimiter";
 import { s3Storage } from "../services/s3Storage";
+import { summaryStorageService } from "../services/summaryStorage";
 import { getClientIP } from "./admin";
 import { clientVersionGate } from "../middleware/clientVersionGate";
 import { evaluateClient, readClientIdentity } from "../services/clientGate";
@@ -1303,6 +1304,16 @@ sessionAuthRouter.post("/upload-logs", async (c) => {
       );
     }
   }
+
+  // Asynchronously trigger process summary generation
+  void summaryStorageService
+    .generateStudentSummary(sessionCode, studentId)
+    .catch((err) => {
+      console.warn(
+        `[Summary Trigger] Background summary generation error for ${sessionCode}/${studentId}:`,
+        err?.message || err,
+      );
+    });
 
   return c.json({
     success: true,

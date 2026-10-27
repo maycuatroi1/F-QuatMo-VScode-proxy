@@ -137,10 +137,8 @@ export function deriveIemLabel(
     return "executive";
   }
 
-  // 3. Mixed Signal Determination (Parity + Co-activation Floor):
-  // Xóa bỏ quy tắc cứng nhắc bắt buộc cả Is và Es phải cùng >= 0.45!
-  // a) Khoảng cách cân bằng: |Is - Es| <= 0.20
-  // b) Năng lượng đồng kích hoạt: sqrt(Is * Es) >= 0.18 HOẶC (Is >= 0.30 && Es >= 0.30)
+  // 3. Mixed signal determination (parity and co-activation threshold):
+  // Evaluates score balance (|Is - Es| <= 0.20) and substantive dual engagement.
   const coactivationEnergy = Math.sqrt(Math.max(0, instrumentalScore * executiveScore));
   const isParityBalanced = absDelta <= 0.20;
   const hasSubstantiveCoactivation =
