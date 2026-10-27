@@ -60,6 +60,20 @@ export class SummaryStorageService {
     return path.resolve(process.cwd(), "logs", "sessions", safeSession);
   }
 
+  public getResolvedEngineBin(): string | null {
+    const rawBin =
+      this.engineBinPath ||
+      process.env.SUMMARY_ENGINE_BIN ||
+      (process.platform === "win32" ? "bin/summary_engine.exe" : "bin/summary_engine");
+    const candidate = path.isAbsolute(rawBin)
+      ? rawBin
+      : path.resolve(process.cwd(), rawBin);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    return null;
+  }
+
   /**
    * Saves student summary markdown and json metadata.
    * Dual-mode: Always saves locally (dev/test & cache) and syncs to S3 when S3 is configured.
@@ -411,63 +425,48 @@ export class SummaryStorageService {
       );
     }
 
-    const pythonBin = process.platform === "win32" ? "py" : "python3";
-    const args: string[] = [];
+    const resolvedBin = this.getResolvedEngineBin();
+    let stdoutContent: string;
 
-    if (this.engineBinPath && fs.existsSync(this.engineBinPath)) {
+    if (resolvedBin) {
       // Execute compiled standalone engine binary
-      args.push(
-        "--zip",
-        zipPath,
-        "--student",
-        studentId,
-        "--json",
-      );
-      const { stdout } = await execFileAsync(this.engineBinPath, args, {
-        timeout: 30000,
+      const args = ["--zip", zipPath, "--student", studentId, "--json"];
+      const { stdout } = await execFileAsync(resolvedBin, args, {
+        timeout: 45000,
         maxBuffer: 10 * 1024 * 1024,
       });
-      const parsed = JSON.parse(stdout);
-      if (parsed.ok && parsed.markdown) {
-        await this.saveStudentSummary(
-          sessionCode,
-          studentId,
-          parsed.markdown,
-          {
-            check_report: parsed.check_report,
-            metrics: parsed.metrics,
-          },
-        );
-      }
-      return parsed;
+      stdoutContent = stdout;
     } else {
       // Execute Python engine CLI script
-      args.push(
+      const pythonBin = process.platform === "win32" ? "py" : "python3";
+      const args = [
         this.cliScriptPath,
         "--zip",
         zipPath,
         "--student",
         studentId,
         "--json",
-      );
+      ];
       const { stdout } = await execFileAsync(pythonBin, args, {
-        timeout: 30000,
+        timeout: 45000,
         maxBuffer: 10 * 1024 * 1024,
       });
-      const parsed = JSON.parse(stdout);
-      if (parsed.ok && parsed.markdown) {
-        await this.saveStudentSummary(
-          sessionCode,
-          studentId,
-          parsed.markdown,
-          {
-            check_report: parsed.check_report,
-            metrics: parsed.metrics,
-          },
-        );
-      }
-      return parsed;
+      stdoutContent = stdout;
     }
+
+    const parsed = JSON.parse(stdoutContent);
+    if (parsed.ok && parsed.markdown) {
+      await this.saveStudentSummary(
+        sessionCode,
+        studentId,
+        parsed.markdown,
+        {
+          check_report: parsed.check_report,
+          metrics: parsed.metrics,
+        },
+      );
+    }
+    return parsed;
   }
 
   /**
@@ -484,15 +483,27 @@ export class SummaryStorageService {
       );
     }
 
-    const pythonBin = process.platform === "win32" ? "py" : "python3";
-    const args = [this.cliScriptPath, "--zip", zipPath, "--json"];
+    const resolvedBin = this.getResolvedEngineBin();
+    let stdoutContent: string;
 
-    const { stdout } = await execFileAsync(pythonBin, args, {
-      timeout: 120000,
-      maxBuffer: 20 * 1024 * 1024,
-    });
-    const parsed = JSON.parse(stdout);
+    if (resolvedBin) {
+      const args = ["--zip", zipPath, "--json"];
+      const { stdout } = await execFileAsync(resolvedBin, args, {
+        timeout: 180000,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      stdoutContent = stdout;
+    } else {
+      const pythonBin = process.platform === "win32" ? "py" : "python3";
+      const args = [this.cliScriptPath, "--zip", zipPath, "--json"];
+      const { stdout } = await execFileAsync(pythonBin, args, {
+        timeout: 180000,
+        maxBuffer: 20 * 1024 * 1024,
+      });
+      stdoutContent = stdout;
+    }
 
+    const parsed = JSON.parse(stdoutContent);
     if (parsed.ok && parsed.manifest_content) {
       await this.saveSessionManifest(sessionCode, parsed.manifest_content);
     }
