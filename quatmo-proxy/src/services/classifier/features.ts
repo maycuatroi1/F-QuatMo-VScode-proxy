@@ -1,67 +1,67 @@
 import { fastLineLCS } from "./algorithms";
 import type { ClientContext, TurnLog } from "./redisStore";
 
-// Define feature lists and their weights (Sec 12.1 - 12.4)
+// Define feature lists and their calibrated weights (Sec 12.1 - 12.4 & Psychometric Rebalancing)
 export const INSTRUMENTAL_WEIGHTS: Record<string, number> = {
   // 12.1. Instrumental Prompt Features (i1 - i8)
-  i1: 0.50, // inquire_no_context
-  i2: 0.85, // integrate_with_context
-  i3: 0.65, // conceptual_question
-  i4: 0.70, // problem_understanding
-  i5: 0.60, // example_request
-  i6: 0.80, // error_interpretation
-  i7: 0.75, // verification_request
-  i8: 0.45, // code_implementation_question_soft
+  i1: 0.20, // inquire_no_context
+  i2: 0.35, // integrate_with_context
+  i3: 0.30, // conceptual_question
+  i4: 0.25, // problem_understanding
+  i5: 0.20, // example_request
+  i6: 0.35, // error_interpretation
+  i7: 0.35, // verification_request
+  i8: 0.15, // code_implementation_question_soft
 
   // 12.3. Instrumental Output Features (r1 - r6)
-  r1: 0.55, // tutor_role
-  r2: 0.75, // conceptual_explanation
-  r3: 0.75, // code_explanation
-  r4: 0.60, // example_only
-  r5: 0.70, // evaluator_feedback_only
-  r6: 0.85, // stepwise_hint
+  r1: 0.20, // tutor_role
+  r2: 0.30, // conceptual_explanation
+  r3: 0.30, // code_explanation
+  r4: 0.20, // example_only
+  r5: 0.30, // evaluator_feedback_only
+  r6: 0.35, // stepwise_hint
 
   // Trajectory features (t1 - t5)
-  t1: 0.70, // sustained_inquiry_pattern
-  t2: 0.80, // self_correction_after_hint
-  t3: 0.65, // increasing_specificity_own_reasoning
-  t4: 0.70, // verification_loop
-  t5: 0.85, // rejection_of_full_solution_offer
+  t1: 0.30, // sustained_inquiry_pattern
+  t2: 0.40, // self_correction_after_hint
+  t3: 0.25, // increasing_specificity_own_reasoning
+  t4: 0.30, // verification_loop
+  t5: 0.40, // rejection_of_full_solution_offer
 
   // Code-diff features (c1 - c5)
-  c1: 0.85, // high_student_modification_ratio
-  c2: 0.75, // incremental_small_step_changes
-  c3: 0.70, // structural_divergence_from_ai_suggestion
-  c4: 0.80, // test_driven_iteration
-  c5: 0.75, // own_algorithm_signature
+  c1: 0.35, // high_student_modification_ratio
+  c2: 0.25, // incremental_small_step_changes
+  c3: 0.30, // structural_divergence_from_ai_suggestion
+  c4: 0.35, // test_driven_iteration
+  c5: 0.35, // own_algorithm_signature
 };
 
 export const EXECUTIVE_WEIGHTS: Record<string, number> = {
   // 12.2. Executive Prompt Features (e1 - e6)
-  e1: 0.90, // code_generation_request
-  e2: 0.85, // delegate_request
-  e3: 0.80, // assignment_pasted
-  e4: 0.65, // code_pasted_no_question
-  e5: 0.75, // direct_correction_request
-  e6: 0.40, // results_pasted
+  e1: 0.35, // code_generation_request
+  e2: 0.40, // delegate_request
+  e3: 0.20, // assignment_pasted (recalibrated from 0.80)
+  e4: 0.25, // code_pasted_no_question
+  e5: 0.35, // direct_correction_request
+  e6: 0.15, // results_pasted
 
   // 12.4. Executive Output Features (r7 - r8)
-  r7: 0.85, // executor_role
-  r8: 0.95, // exact_solution_code
+  r7: 0.35, // executor_role
+  r8: 0.40, // exact_solution_code
 
   // Trajectory features (t6 - t10)
-  t6: 0.85, // repeated_copy_paste_pattern
-  t7: 0.80, // escalation_to_full_solution
-  t8: 0.60, // abandon_after_code_received
-  t9: 0.55, // minimal_effort_between_turns
-  t10: 0.75, // recurring_delegate_across_session
+  t6: 0.40, // repeated_copy_paste_pattern
+  t7: 0.30, // escalation_to_full_solution
+  t8: 0.20, // abandon_after_code_received
+  t9: 0.25, // minimal_effort_between_turns
+  t10: 0.35, // recurring_delegate_across_session
 
   // Code-diff features (c6 - c10)
-  c6: 0.90, // exact_copy_ratio
-  c7: 0.90, // single_large_jump
-  c8: 0.85, // structural_identity_with_ai_output
-  c9: 0.80, // no_intermediate_edits
-  c10: 0.65, // zero_own_test_activity
+  c6: 0.40, // exact_copy_ratio
+  c7: 0.35, // single_large_jump
+  c8: 0.30, // structural_identity_with_ai_output
+  c9: 0.30, // no_intermediate_edits
+  c10: 0.20, // zero_own_test_activity
 };
 
 export const IEM_WINDOW_SIZE = 5;
@@ -103,6 +103,7 @@ export function deriveIemLabel(
   executiveScore: number,
 ): "instrumental" | "executive" | "mixed" | "ambiguous" {
   const delta = instrumentalScore - executiveScore;
+  const absDelta = Math.abs(delta);
 
   // 1. Dominant signal: Leader is >= HIGH (0.55) and separation is decisive (> 0.20)
   if (instrumentalScore >= IEM_HIGH_THRESHOLD && delta > 0.20) {
@@ -112,15 +113,7 @@ export function deriveIemLabel(
     return "executive";
   }
 
-  // 2. Both signals are strong/active (>= MID 0.45) and competing -> Mixed
-  if (
-    instrumentalScore >= IEM_MID_THRESHOLD &&
-    executiveScore >= IEM_MID_THRESHOLD
-  ) {
-    return "mixed";
-  }
-
-  // 3. Clear single-sided signals where other signal is weak (< MID 0.45)
+  // 2. Clear single-sided signals where other signal is weak (< MID 0.45)
   if (
     instrumentalScore >= IEM_HIGH_THRESHOLD &&
     executiveScore < IEM_MID_THRESHOLD &&
@@ -134,6 +127,28 @@ export function deriveIemLabel(
     -delta >= IEM_MARGIN_THRESHOLD
   ) {
     return "executive";
+  }
+
+  // 2b. Decisive pure single-sided signal (leader >= 0.28, opposite <= 0.05, margin >= 0.15)
+  if (instrumentalScore >= 0.28 && executiveScore <= 0.05 && delta >= IEM_MARGIN_THRESHOLD) {
+    return "instrumental";
+  }
+  if (executiveScore >= 0.28 && instrumentalScore <= 0.05 && -delta >= IEM_MARGIN_THRESHOLD) {
+    return "executive";
+  }
+
+  // 3. Mixed Signal Determination (Parity + Co-activation Floor):
+  // Xóa bỏ quy tắc cứng nhắc bắt buộc cả Is và Es phải cùng >= 0.45!
+  // a) Khoảng cách cân bằng: |Is - Es| <= 0.20
+  // b) Năng lượng đồng kích hoạt: sqrt(Is * Es) >= 0.18 HOẶC (Is >= 0.30 && Es >= 0.30)
+  const coactivationEnergy = Math.sqrt(Math.max(0, instrumentalScore * executiveScore));
+  const isParityBalanced = absDelta <= 0.20;
+  const hasSubstantiveCoactivation =
+    coactivationEnergy >= 0.18 ||
+    (instrumentalScore >= 0.30 && executiveScore >= 0.30);
+
+  if (isParityBalanced && hasSubstantiveCoactivation) {
+    return "mixed";
   }
 
   // 4. Ambiguous fallback
@@ -157,7 +172,8 @@ export function calculateIemConfidence(
   }
 
   if (label === "mixed") {
-    return Math.min(1, weakestSignal / IEM_MID_THRESHOLD);
+    const coactivationEnergy = Math.sqrt(Math.max(0, instrumentalScore * executiveScore));
+    return Math.min(1, Math.max(0.60, coactivationEnergy / 0.40));
   }
 
   const evidence = Math.min(1, strongestSignal / IEM_HIGH_THRESHOLD);

@@ -118,14 +118,38 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
       text,
     );
 
+  // Cluster 1 Disambiguation: "how to / show me" followed by full delegation
+  const isHowToDelegation =
+    /\b(how (?:can|to|do) i|show me)\b.{0,60}\b(complete|code|finish|write|implement)\b.{0,40}\b(all|full|everything|todos?|files?)\b/i.test(text) ||
+    (/\b(show me|how can i)\b/i.test(text) && /\b(for me|giúp tôi|hộ em)\b/i.test(text) && /\b(code|file|function|task)\b/i.test(text));
+
+  // Cluster 7 Disambiguation: Traceback error log dumps
+  const isTraceback = /\b(traceback \(most recent call last\)|from database import|modulenotfounderror|operationalerror|sqlalchemy)\b/i.test(text);
+  const asksTracebackExplanation = isTraceback && /\b(why|what causes|explain|what does this mean|tại sao|nguyên nhân|nghĩa là gì)\b/i.test(text);
+
+  // Cluster 9 Disambiguation: Code Review vs Review-and-Fix
+  const isReviewAndFix =
+    /\b(check|review|kiểm tra|soi lỗi)\b.{0,80}\b(if wrong|nếu sai|nếu lỗi|and fix|và sửa|sửa giúp|help me fix|fix (?:it|any bugs?|help me)|sửa hộ)\b/i.test(text);
+  const isPureReview =
+    !isReviewAndFix &&
+    (/(?:^\s*|\b)(check|review|kiểm tra|soi lỗi|is this correct|check my code|check my logic|check the function)\b/i.test(text) ||
+     /\b(review|check)\b.{0,40}\b(code|function|logic|hàm)\b/i.test(text));
+
+  // Cluster 3 Disambiguation: Short continuation prompts
+  const isShortContinuation = /^(same|do the same|the same|continue|next|như cũ|làm tiếp)$/i.test(text.trim());
+
   // Instrumental Feature Activations (i1 - i8)
-  if (asksExplanation) activate(features, "i1", 0.75);
+  if (asksExplanation && !isHowToDelegation && !asksDirectCreation) {
+    activate(features, "i1", 0.75);
+  }
 
   if (
-    /\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide|in python|in c\+\+|in java|in javascript|in js|in ts|in c|bằng python|trong python|bằng c|bằng java)\b/i.test(
+    !asksDirectCreation &&
+    !isHowToDelegation &&
+    (/\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide|in python|in c\+\+|in java|in javascript|in js|in ts|in c|bằng python|trong python|bằng c|bằng java)\b/i.test(
       text,
     ) ||
-    /(?:cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text)
+    /(?:cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text))
   ) {
     activate(features, "i2", 0.75);
   }
@@ -144,7 +168,8 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
       text,
     ) ||
       /(?:tại sao|nguyên lý|ý nghĩa|bản chất|khái niệm|nguyên nhân lỗi|lỗi này nghĩa là gì)/i.test(text)) &&
-    !delegatesFix
+    !delegatesFix &&
+    !isHowToDelegation
   ) {
     activate(features, "i3", 0.85);
   }
@@ -177,14 +202,17 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   }
 
   if (
-    /\b(is this (?:approach|way|idea|logic)|is my (?:approach|thought|solution|understanding)|am i on the right track|am i right|validate (?:my|this)|check my logic)\b/i.test(
+    (/\b(is this (?:approach|way|idea|logic)|is my (?:approach|thought|solution|understanding)|am i on the right track|am i right|validate (?:my|this)|check my logic)\b/i.test(
+      text,
+    ) ||
+    /\b(how (?:can|do) i test|test my|verify (?:if|that|my)|know if (?:the )?codes? works?|check if (?:it|the code) works?|cách test|làm sao để test|kiểm thử)\b/i.test(
       text,
     ) ||
     /(?:logic này đúng không|cách này ổn không|tôi làm thế này có đúng không)/i.test(
       text,
-    )
+    ) || isPureReview || isReviewAndFix)
   ) {
-    activate(features, "i7", 0.75);
+    activate(features, "i7", 0.85);
   }
 
   if (
@@ -198,9 +226,14 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   if (
     asksExplanation &&
     /\b(implement|code|write|algorithm|function|class|cài đặt|viết code|thuật toán)\b/i.test(text) &&
-    !hasExplicitDelegation
+    !hasExplicitDelegation &&
+    !isHowToDelegation
   ) {
     activate(features, "i8", 0.75);
+  }
+
+  if (asksTracebackExplanation) {
+    activate(features, "i6", 0.85);
   }
 
   // Executive Feature Activations (e1 - e6)
@@ -211,12 +244,28 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     ) &&
     !asksExplanation
   ) {
-    activate(features, "e1", 0.85);
+    activate(features, "e1", 0.75);
   }
 
-  if (asksDirectCreation) activate(features, "e2", 1.0);
-  if (asksDirectAnswer) activate(features, "e3", 1.0);
-  if (delegatesFix) activate(features, "e4", 1.0);
+  if (asksDirectCreation || isHowToDelegation) {
+    activate(features, "e1", 0.85);
+    activate(features, "e2", 1.0);
+  }
+
+  if (asksDirectAnswer) {
+    activate(features, "e1", 0.75);
+    activate(features, "e3", 1.0);
+  }
+
+  if (delegatesFix || isReviewAndFix) {
+    activate(features, "e5", 1.0);
+  }
+
+  if (isTraceback && !asksTracebackExplanation) {
+    activate(features, "e4", 0.85);
+    activate(features, "e5", 0.75);
+    activate(features, "e6", 0.75);
+  }
 
   if (
     /\b(give me |provide |generate )(?:a |the )?(?:boilerplate|scaffold|starter template|ready-made|skeleton project|config file)\b/i.test(
@@ -238,11 +287,6 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   const instrumentalScore = scoreFeatures(features, INSTRUMENTAL_WEIGHTS);
   const executiveScore = scoreFeatures(features, EXECUTIVE_WEIGHTS);
 
-  // Apply the exact 3-Gate threshold rules from Research Paper Section III-D:
-  // G_instrumental: I >= HIGH (0.55) && E < MID (0.45) && (I - E) >= MARGIN (0.15)
-  // G_executive:    E >= HIGH (0.55) && I < MID (0.45) && (E - I) >= MARGIN (0.15)
-  // G_conflict:     I >= MID (0.45) && E >= MID (0.45) -> mixed
-  // G_ambiguous:    fallback -> mixed
   const rawLabel = deriveIemLabel(instrumentalScore, executiveScore);
   const label: IemLabel =
     rawLabel === "instrumental" || rawLabel === "executive"
@@ -253,10 +297,13 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
 
   return {
     label,
+    rawLabel,
     confidence,
     instrumentalScore,
     executiveScore,
     activeFeatures: features,
-    hardExecutive: label === "executive" && executiveScore >= 0.75,
+    hardExecutive: (rawLabel === "executive" || label === "executive") && executiveScore >= 0.50,
+    isAmbiguous: rawLabel === "ambiguous",
+    isShortContinuation,
   };
 }
