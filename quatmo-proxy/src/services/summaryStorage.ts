@@ -340,9 +340,11 @@ export class SummaryStorageService {
    */
   public findSessionZip(sessionCode: string): string | null {
     const safeSession = sanitizeSegment(sessionCode).toUpperCase();
-    const candidates = [
+    const exactCandidates = [
       path.resolve(process.cwd(), "logs", "sessions", `${safeSession}-logs.zip`),
       path.resolve(process.cwd(), "logs", "sessions", `${safeSession}.zip`),
+      path.resolve(process.cwd(), "logs", "sessions", `logs_${safeSession}.zip`),
+      path.resolve(process.cwd(), "logs", `${safeSession}.zip`),
       path.resolve(
         process.cwd(),
         "..",
@@ -364,13 +366,59 @@ export class SummaryStorageService {
         "data_analyz_survey",
         `${safeSession}.zip`,
       ),
+      path.resolve(
+        process.cwd(),
+        "..",
+        "..",
+        "dataTest",
+        "lopthayDat",
+        `logs_${safeSession}.zip`,
+      ),
+      path.resolve(
+        process.cwd(),
+        "..",
+        "..",
+        "dataTest",
+        "lopthayDat",
+        `migrated_logs_new_${safeSession}.zip`,
+      ),
+      path.resolve(
+        process.cwd(),
+        "..",
+        "..",
+        "md",
+        `logs_${safeSession}.zip`,
+      ),
     ];
 
-    for (const c of candidates) {
+    for (const c of exactCandidates) {
       if (fs.existsSync(c)) {
         return c;
       }
     }
+
+    // Directory scanning: search across historical survey and test folders
+    const scanDirs = [
+      path.resolve(process.cwd(), "logs", "sessions"),
+      path.resolve(process.cwd(), "..", "..", "data_analyz_survey"),
+      path.resolve(process.cwd(), "..", "..", "dataTest", "lopthayDat"),
+      path.resolve(process.cwd(), "..", "..", "dataTest"),
+      path.resolve(process.cwd(), "..", "..", "md"),
+    ];
+
+    for (const sDir of scanDirs) {
+      if (fs.existsSync(sDir)) {
+        try {
+          const files = fs.readdirSync(sDir);
+          for (const f of files) {
+            if (f.endsWith(".zip") && f.toUpperCase().includes(safeSession)) {
+              return path.join(sDir, f);
+            }
+          }
+        } catch {}
+      }
+    }
+
     return null;
   }
 
@@ -384,39 +432,41 @@ export class SummaryStorageService {
   ): Promise<any> {
     const zipPath = customZipPath || this.findSessionZip(sessionCode);
 
-    // Query summary microservice daemon if available
-    try {
-      const resp = await fetch(
-        `${this.serviceUrl}/api/summary/${encodeURIComponent(studentId)}`,
-        {
-          headers: { Accept: "application/json" },
-          signal: AbortSignal.timeout(10000),
-        },
-      );
-      if (resp.ok) {
-        const data = (await resp.json()) as any;
-        if (data.markdown) {
-          await this.saveStudentSummary(
-            sessionCode,
-            studentId,
-            data.markdown,
-            {
+    // Query summary microservice daemon if available (only for live sessions without custom zip)
+    if (!customZipPath) {
+      try {
+        const resp = await fetch(
+          `${this.serviceUrl}/api/summary/${encodeURIComponent(studentId)}`,
+          {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(180000), // 3 minutes to allow primary gemma-4-26b generation
+          },
+        );
+        if (resp.ok) {
+          const data = (await resp.json()) as any;
+          if (data.markdown) {
+            await this.saveStudentSummary(
+              sessionCode,
+              studentId,
+              data.markdown,
+              {
+                check_report: data.check_report,
+                metrics: data.metrics,
+              },
+            );
+            return {
+              ok: true,
+              student_id: studentId,
+              session_code: sessionCode,
+              markdown: data.markdown,
               check_report: data.check_report,
               metrics: data.metrics,
-            },
-          );
-          return {
-            ok: true,
-            student_id: studentId,
-            session_code: sessionCode,
-            markdown: data.markdown,
-            check_report: data.check_report,
-            metrics: data.metrics,
-            trigger: "daemon",
-          };
+              trigger: "daemon",
+            };
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
 
     // Fallback to local CLI generator execution
     if (!zipPath) {
@@ -432,7 +482,7 @@ export class SummaryStorageService {
       // Execute compiled standalone engine binary
       const args = ["--zip", zipPath, "--student", studentId, "--json"];
       const { stdout } = await execFileAsync(resolvedBin, args, {
-        timeout: 45000,
+        timeout: 300000,
         maxBuffer: 10 * 1024 * 1024,
       });
       stdoutContent = stdout;
@@ -448,7 +498,7 @@ export class SummaryStorageService {
         "--json",
       ];
       const { stdout } = await execFileAsync(pythonBin, args, {
-        timeout: 45000,
+        timeout: 300000,
         maxBuffer: 10 * 1024 * 1024,
       });
       stdoutContent = stdout;
@@ -489,16 +539,16 @@ export class SummaryStorageService {
     if (resolvedBin) {
       const args = ["--zip", zipPath, "--json"];
       const { stdout } = await execFileAsync(resolvedBin, args, {
-        timeout: 180000,
-        maxBuffer: 20 * 1024 * 1024,
+        timeout: 1800000,
+        maxBuffer: 50 * 1024 * 1024,
       });
       stdoutContent = stdout;
     } else {
       const pythonBin = process.platform === "win32" ? "py" : "python3";
       const args = [this.cliScriptPath, "--zip", zipPath, "--json"];
       const { stdout } = await execFileAsync(pythonBin, args, {
-        timeout: 180000,
-        maxBuffer: 20 * 1024 * 1024,
+        timeout: 1800000,
+        maxBuffer: 50 * 1024 * 1024,
       });
       stdoutContent = stdout;
     }

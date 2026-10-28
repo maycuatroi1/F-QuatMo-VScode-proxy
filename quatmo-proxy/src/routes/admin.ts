@@ -2565,6 +2565,69 @@ adminRouter.post(
   },
 );
 
+/** Generate summary directly from an uploaded zip file (supports historical exam archives) */
+adminRouter.post(
+  "/visualize/summary/generate-from-zip",
+  async (c) => {
+    try {
+      const body = await c.req.parseBody();
+      const file = body["file"] as any;
+      const studentId = typeof body["studentId"] === "string" ? sanitizeFilename(body["studentId"]).toUpperCase() : undefined;
+      const rawSession = typeof body["sessionCode"] === "string" ? sanitizeFilename(body["sessionCode"]).toUpperCase() : "";
+      const mode = typeof body["mode"] === "string" ? body["mode"] : (studentId ? "single" : "all");
+
+      if (!file || typeof file.arrayBuffer !== "function") {
+        return c.json(
+          { ok: false, error: "A valid telemetry zip file must be provided." },
+          400,
+        );
+      }
+
+      // Save uploaded buffer to a temporary file
+      const tempDir = path.resolve(process.cwd(), "logs", "temp_zips");
+      await fs.promises.mkdir(tempDir, { recursive: true });
+      const safeFilename = sanitizeFilename(file.name || "archive.zip");
+      const tempZipPath = path.join(tempDir, `upload_${Date.now()}_${safeFilename}`);
+      const arrayBuffer = await file.arrayBuffer();
+      await fs.promises.writeFile(tempZipPath, Buffer.from(arrayBuffer));
+
+      // Attempt to extract session code from zip if not provided
+      let sessionCode = rawSession;
+      if (!sessionCode || sessionCode === "OFFLINE" || sessionCode === "SESSION") {
+        const m = safeFilename.match(/(?:logs_|migrated_logs_)?([A-Za-z0-9]+-[A-Za-z0-9]+)/i);
+        sessionCode = m ? m[1].toUpperCase() : "HISTORICAL_SESSION";
+      }
+
+      try {
+        if (mode === "all" || !studentId) {
+          const result = await summaryStorageService.generateSessionSummaries(
+            sessionCode,
+            tempZipPath,
+          );
+          return c.json(result);
+        } else {
+          const result = await summaryStorageService.generateStudentSummary(
+            sessionCode,
+            studentId,
+            tempZipPath,
+          );
+          return c.json(result);
+        }
+      } finally {
+        try {
+          await fs.promises.unlink(tempZipPath);
+        } catch {}
+      }
+    } catch (err: any) {
+      console.error("[Summary API] Failed to generate from uploaded zip:", err);
+      return c.json(
+        { ok: false, error: err?.message || "Failed to process uploaded zip." },
+        500,
+      );
+    }
+  },
+);
+
 /** List student summary availability across a session */
 adminRouter.get(
   "/visualize/sessions/:sessionCode/summaries",
