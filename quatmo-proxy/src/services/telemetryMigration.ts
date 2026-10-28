@@ -40,6 +40,16 @@ export async function atomicWriteJson(
   await fs.promises.rename(tmpPath, filePath);
 }
 
+export function safeParseJson<T = any>(raw: string): T | null {
+  if (!raw) return null;
+  const clean = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  try {
+    return JSON.parse(clean);
+  } catch {
+    return null;
+  }
+}
+
 export function isGhostPromptTurn(turn: PromptTurnRecord): boolean {
   if (!turn) return false;
   const p = (turn.prompt || "").toString();
@@ -96,7 +106,7 @@ export async function reconcileStudentPromptTurns(
   if (fs.existsSync(jsonPath)) {
     try {
       const raw = await fs.promises.readFile(jsonPath, "utf-8");
-      const parsed = JSON.parse(raw);
+      const parsed = safeParseJson(raw);
       if (Array.isArray(parsed)) {
         const initialCount = parsed.length;
         existingTurns = parsed.filter((t) => !isGhostPromptTurn(t));
@@ -267,6 +277,11 @@ export async function reconcileStudentPromptTurns(
       }
     }
 
+    const totalTokens = existingTurns.reduce(
+      (acc, t) => acc + (t.tokensConsumedTotal || 0),
+      0,
+    );
+
     if (modified) {
       try {
         if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
@@ -278,16 +293,12 @@ export async function reconcileStudentPromptTurns(
         await atomicWriteJson(jsonPath, existingTurns);
 
         // Synchronize tokens consumed in session_manifest.json
-        const totalTokens = existingTurns.reduce(
-          (acc, t) => acc + (t.tokensConsumedTotal || 0),
-          0,
-        );
         const manifestPath = path.join(sessionDir, "session_manifest.json");
         if (fs.existsSync(manifestPath)) {
           try {
             const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
-            const mJson = JSON.parse(mRaw);
-            if (Array.isArray(mJson.students)) {
+            const mJson = safeParseJson(mRaw);
+            if (mJson && Array.isArray(mJson.students)) {
               const sItem = mJson.students.find(
                 (s: any) =>
                   s.studentId &&
@@ -301,19 +312,28 @@ export async function reconcileStudentPromptTurns(
             }
           } catch {}
         }
-
-        // Synchronize in SQLite memory & table if available
-        try {
-          const { sessionStates } = await import("./sessionStore");
-          const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
-          const st = sessionStates.get(stateKey);
-          if (st) {
-            st.tokensConsumed = totalTokens;
-            st.promptCount = existingTurns.length;
-          }
-        } catch {}
       } catch {}
     }
+
+    // Always synchronize SQLite table session_states and Redis if tokens differ
+    try {
+      const { sessionStates } = await import("./sessionStore");
+      const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
+      const st = sessionStates.get(stateKey);
+      if (st && (st.tokensConsumed !== totalTokens || modified)) {
+        st.tokensConsumed = totalTokens;
+        st.promptCount = existingTurns.length;
+        sessionStates.set(stateKey, st); // Persist to SQLite
+        const { redis } = await import("./redis");
+        if (redis && redis.status === "ready") {
+          await redis.hset(
+            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
+            "consumed",
+            String(totalTokens),
+          );
+        }
+      }
+    } catch {}
 
     return {
       turns: existingTurns,
@@ -458,8 +478,8 @@ export async function reconcileStudentPromptTurns(
       if (fs.existsSync(manifestPath)) {
         try {
           const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
-          const mJson = JSON.parse(mRaw);
-          if (Array.isArray(mJson.students)) {
+          const mJson = safeParseJson(mRaw);
+          if (mJson && Array.isArray(mJson.students)) {
             const sItem = mJson.students.find(
               (s: any) =>
                 s.studentId &&
@@ -473,6 +493,26 @@ export async function reconcileStudentPromptTurns(
           }
         } catch {}
       }
+
+      // Synchronize in SQLite memory & table and Redis
+      try {
+        const { sessionStates } = await import("./sessionStore");
+        const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
+        const st = sessionStates.get(stateKey);
+        if (st) {
+          st.tokensConsumed = totalTokens;
+          st.promptCount = synthesizedTurns.length;
+          sessionStates.set(stateKey, st); // Persist to SQLite
+        }
+        const { redis } = await import("./redis");
+        if (redis && redis.status === "ready") {
+          await redis.hset(
+            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
+            "consumed",
+            String(totalTokens),
+          );
+        }
+      } catch {}
       return {
         turns: synthesizedTurns,
         wasRepaired: true,
@@ -550,8 +590,126 @@ export async function runTelemetryMigration(): Promise<void> {
             err?.message || err,
           );
         }
+        // Check and sync session_manifest.json if present
+        const manifestPath = path.join(sessionDir, "session_manifest.json");
+        if (fs.existsSync(manifestPath)) {
+          try {
+            const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
+            const mJson = safeParseJson(mRaw);
+            if (mJson && Array.isArray(mJson.students)) {
+              const { sessionStates } = await import("./sessionStore");
+              const { redis } = await import("./redis");
+              for (const sItem of mJson.students) {
+                if (!sItem.studentId || typeof sItem.tokensConsumed !== "number") continue;
+                const safeSid = sItem.studentId.toUpperCase();
+                const stateKey = `${sessionCode}:${safeSid}`;
+                const st = sessionStates.get(stateKey);
+                if (st && st.tokensConsumed !== sItem.tokensConsumed) {
+                  console.log(
+                    `[TelemetryMigration] [Manifest Sync] ${stateKey}: tokens ${st.tokensConsumed} -> ${sItem.tokensConsumed}`,
+                  );
+                  st.tokensConsumed = sItem.tokensConsumed;
+                  if (typeof sItem.promptTurns === "number") st.promptCount = sItem.promptTurns;
+                  sessionStates.set(stateKey, st);
+                  if (redis && redis.status === "ready") {
+                    await redis.hset(`session:user:${sessionCode}:${safeSid}`, "consumed", String(sItem.tokensConsumed));
+                  }
+                }
+              }
+            }
+          } catch {}
+        }
       }
     }
+
+    // Also check for any session zip files in process.cwd(), logs/, or parent dir
+    try {
+      const searchDirs = [
+        process.cwd(),
+        path.resolve(process.cwd(), "logs"),
+        path.resolve(process.cwd(), ".."),
+      ];
+      const { sessionStates } = await import("./sessionStore");
+      const { redis } = await import("./redis");
+      const AdmZip = (await import("adm-zip")).default;
+
+      for (const d of searchDirs) {
+        if (!fs.existsSync(d)) continue;
+        const dFiles = await fs.promises.readdir(d);
+        for (const df of dFiles) {
+          if (!df.endsWith(".zip") || (!df.includes("SS-") && !df.includes("logs"))) continue;
+          try {
+            const zipPath = path.join(d, df);
+            const zip = new AdmZip(zipPath);
+            let zipModified = false;
+
+            // Audit each JSON file inside the zip for ghost turns
+            const zipEntries = zip.getEntries();
+            const studentTokenMap = new Map<string, number>();
+            const studentTurnsMap = new Map<string, number>();
+
+            for (const entry of zipEntries) {
+              if (entry.isDirectory || !entry.name.endsWith(".json") || entry.name.includes("manifest")) continue;
+              const sId = entry.name.replace(/\.json$/, "").toUpperCase();
+              try {
+                const parsed = safeParseJson(entry.getData().toString("utf-8"));
+                if (Array.isArray(parsed)) {
+                  const cleaned = parsed.filter((t: any) => !isGhostPromptTurn(t));
+                  const tokens = cleaned.reduce((acc: number, t: any) => acc + (t.tokensConsumedTotal || 0), 0);
+                  studentTokenMap.set(sId, tokens);
+                  studentTurnsMap.set(sId, cleaned.length);
+                  if (cleaned.length < parsed.length) {
+                    zip.updateFile(entry.entryName, Buffer.from(JSON.stringify(cleaned, null, 2), "utf-8"));
+                    zipModified = true;
+                  }
+                }
+              } catch {}
+            }
+
+            const mEntry = zip.getEntry("session_manifest.json");
+            if (mEntry) {
+              const mJson = safeParseJson(mEntry.getData().toString("utf-8"));
+              if (mJson && mJson.sessionCode && Array.isArray(mJson.students)) {
+                const sCode = mJson.sessionCode.toUpperCase();
+                for (const sItem of mJson.students) {
+                  if (!sItem.studentId) continue;
+                  const safeSid = sItem.studentId.toUpperCase();
+                  if (studentTokenMap.has(safeSid)) {
+                    const cleanTokens = studentTokenMap.get(safeSid)!;
+                    if (sItem.tokensConsumed !== cleanTokens) {
+                      sItem.tokensConsumed = cleanTokens;
+                      sItem.promptTurns = studentTurnsMap.get(safeSid) || sItem.promptTurns;
+                      zipModified = true;
+                    }
+                  }
+                  if (typeof sItem.tokensConsumed !== "number") continue;
+                  const stateKey = `${sCode}:${safeSid}`;
+                  const st = sessionStates.get(stateKey);
+                  if (st && st.tokensConsumed !== sItem.tokensConsumed) {
+                    console.log(
+                      `[TelemetryMigration] [Zip Sync] Synchronizing ${stateKey}: ${st.tokensConsumed} -> ${sItem.tokensConsumed}`,
+                    );
+                    st.tokensConsumed = sItem.tokensConsumed;
+                    if (typeof sItem.promptTurns === "number") st.promptCount = sItem.promptTurns;
+                    sessionStates.set(stateKey, st);
+                    if (redis && redis.status === "ready") {
+                      await redis.hset(`session:user:${sCode}:${safeSid}`, "consumed", String(sItem.tokensConsumed));
+                    }
+                  }
+                }
+                if (zipModified) {
+                  zip.updateFile("session_manifest.json", Buffer.from(JSON.stringify(mJson, null, 2), "utf-8"));
+                }
+              }
+            }
+
+            if (zipModified) {
+              zip.writeZip(zipPath);
+            }
+          } catch {}
+        }
+      }
+    } catch {}
 
     if (totalRepaired > 0) {
       console.log(
