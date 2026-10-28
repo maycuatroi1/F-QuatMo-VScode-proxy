@@ -40,6 +40,17 @@ export async function atomicWriteJson(
   await fs.promises.rename(tmpPath, filePath);
 }
 
+export function isGhostPromptTurn(turn: PromptTurnRecord): boolean {
+  if (!turn) return false;
+  const p = (turn.prompt || "").toString();
+  return (
+    p.includes("Text before cursor:") ||
+    p.includes("Text after cursor:") ||
+    p.includes("You complete code. Return ONLY the completion") ||
+    p.startsWith("Complete:\n")
+  );
+}
+
 export async function reconcileStudentPromptTurns(
   sessionCode: string,
   studentId: string,
@@ -79,13 +90,17 @@ export async function reconcileStudentPromptTurns(
     } catch {}
   }
 
+
   let existingTurns: PromptTurnRecord[] = [];
+  let hadExistingGhostTurns = false;
   if (fs.existsSync(jsonPath)) {
     try {
       const raw = await fs.promises.readFile(jsonPath, "utf-8");
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        existingTurns = parsed;
+        const initialCount = parsed.length;
+        existingTurns = parsed.filter((t) => !isGhostPromptTurn(t));
+        hadExistingGhostTurns = existingTurns.length < initialCount;
       }
     } catch {}
   }
@@ -104,7 +119,11 @@ export async function reconcileStudentPromptTurns(
         try {
           const decrypted = decryptLogFile(logPath, key) as any[];
           const valid = decrypted.filter(
-            (t) => t && !t._error && (t.prompt || t.tokensConsumedTotal),
+            (t) =>
+              t &&
+              !t._error &&
+              (t.prompt || t.tokensConsumedTotal) &&
+              !isGhostPromptTurn(t),
           );
           if (valid.length > 0) {
             logTurns = valid;
@@ -194,7 +213,7 @@ export async function reconcileStudentPromptTurns(
   );
 
   if (existingTurns.length >= maxAvailableTurns && existingTurns.length > 0) {
-    let modified = false;
+    let modified = hadExistingGhostTurns;
     for (let i = 0; i < existingTurns.length; i++) {
       const turn = existingTurns[i];
       if (
@@ -250,11 +269,57 @@ export async function reconcileStudentPromptTurns(
 
     if (modified) {
       try {
+        if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
+          const bakPath = `${jsonPath}.bak.${Date.now()}`;
+          try {
+            await fs.promises.copyFile(jsonPath, bakPath);
+          } catch {}
+        }
         await atomicWriteJson(jsonPath, existingTurns);
+
+        // Synchronize tokens consumed in session_manifest.json
+        const totalTokens = existingTurns.reduce(
+          (acc, t) => acc + (t.tokensConsumedTotal || 0),
+          0,
+        );
+        const manifestPath = path.join(sessionDir, "session_manifest.json");
+        if (fs.existsSync(manifestPath)) {
+          try {
+            const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
+            const mJson = JSON.parse(mRaw);
+            if (Array.isArray(mJson.students)) {
+              const sItem = mJson.students.find(
+                (s: any) =>
+                  s.studentId &&
+                  s.studentId.toUpperCase() === safeStudentId,
+              );
+              if (sItem) {
+                sItem.tokensConsumed = totalTokens;
+                sItem.promptTurns = existingTurns.length;
+                await atomicWriteJson(manifestPath, mJson);
+              }
+            }
+          } catch {}
+        }
+
+        // Synchronize in SQLite memory & table if available
+        try {
+          const { sessionStates } = await import("./sessionStore");
+          const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
+          const st = sessionStates.get(stateKey);
+          if (st) {
+            st.tokensConsumed = totalTokens;
+            st.promptCount = existingTurns.length;
+          }
+        } catch {}
       } catch {}
     }
 
-    return { turns: existingTurns, wasRepaired: modified, source: "json" };
+    return {
+      turns: existingTurns,
+      wasRepaired: modified,
+      source: hadExistingGhostTurns ? "sanitized_ghost_turns" : "json",
+    };
   }
 
   let synthesizedTurns: PromptTurnRecord[] = [];
@@ -385,6 +450,29 @@ export async function reconcileStudentPromptTurns(
   if (synthesizedTurns.length > existingTurns.length) {
     try {
       await atomicWriteJson(jsonPath, synthesizedTurns);
+      const totalTokens = synthesizedTurns.reduce(
+        (acc, t) => acc + (t.tokensConsumedTotal || 0),
+        0,
+      );
+      const manifestPath = path.join(sessionDir, "session_manifest.json");
+      if (fs.existsSync(manifestPath)) {
+        try {
+          const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
+          const mJson = JSON.parse(mRaw);
+          if (Array.isArray(mJson.students)) {
+            const sItem = mJson.students.find(
+              (s: any) =>
+                s.studentId &&
+                s.studentId.toUpperCase() === safeStudentId,
+            );
+            if (sItem) {
+              sItem.tokensConsumed = totalTokens;
+              sItem.promptTurns = synthesizedTurns.length;
+              await atomicWriteJson(manifestPath, mJson);
+            }
+          }
+        } catch {}
+      }
       return {
         turns: synthesizedTurns,
         wasRepaired: true,
