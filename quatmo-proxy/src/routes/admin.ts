@@ -1873,6 +1873,20 @@ adminRouter.get("/visualize/sessions", async (c) => {
             withFileTypes: true,
           });
           for (const sub of subEntries) {
+            const subNameLower = sub.name.toLowerCase();
+            if (
+              subNameLower.includes("manifest") ||
+              subNameLower.includes("metadata") ||
+              subNameLower.includes("upload_info") ||
+              subNameLower.includes("package") ||
+              subNameLower.startsWith(".") ||
+              subNameLower.endsWith(".tmp") ||
+              subNameLower.endsWith(".bak") ||
+              subNameLower === "__macosx"
+            ) {
+              continue;
+            }
+
             const subPath = path.join(sessionPath, sub.name);
             const stat = await fs.promises.stat(subPath);
             if (stat.mtimeMs > lastActivity) lastActivity = stat.mtimeMs;
@@ -2068,6 +2082,20 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
         withFileTypes: true,
       });
       for (const entry of entries) {
+        const entryNameLower = entry.name.toLowerCase();
+        if (
+          entryNameLower.includes("manifest") ||
+          entryNameLower.includes("metadata") ||
+          entryNameLower.includes("upload_info") ||
+          entryNameLower.includes("package") ||
+          entryNameLower.startsWith(".") ||
+          entryNameLower.endsWith(".tmp") ||
+          entryNameLower.endsWith(".bak") ||
+          entryNameLower === "__macosx"
+        ) {
+          continue;
+        }
+
         const entryPath = path.join(sessionLogDir, entry.name);
         const stat = await fs.promises.stat(entryPath);
 
@@ -2329,7 +2357,16 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     }
   }
 
-  const accounts = Array.from(accountMap.values());
+  const accounts = Array.from(accountMap.values()).filter((a) => {
+    const sid = (a.studentId || "").toLowerCase();
+    return (
+      !sid.includes("manifest") &&
+      !sid.includes("metadata") &&
+      !sid.includes("package") &&
+      !sid.startsWith(".") &&
+      sid !== "__macosx"
+    );
+  });
   accounts.sort((a, b) => {
     const aHas = a.hasPromptLog || a.hasEventLog ? 1 : 0;
     const bHas = b.hasPromptLog || b.hasEventLog ? 1 : 0;
