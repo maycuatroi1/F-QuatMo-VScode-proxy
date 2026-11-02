@@ -8,7 +8,6 @@ import { SESSIONS_META } from "./session_metadata";
 
 const CHECKPOINT_FILE = path.resolve(process.cwd(), "logs", ".migrated_legacy_sessions_v2");
 
-// Helper for safe timeout on async operations
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | null> {
   let timer: any;
   try {
@@ -52,17 +51,29 @@ export async function runLegacySessionMigration(): Promise<void> {
     const sessionTargetDir = path.join(logsSessionsDir, sessionCode);
     await fs.promises.mkdir(sessionTargetDir, { recursive: true });
 
-    // 2. Unpack bundle
+    // 2. Unpack bundle completely into local session directory
     const bundlePath = path.resolve(__dirname, "bundles", `bundle_${sessionCode}.zip`);
-    let zip: AdmZip | null = null;
     if (fs.existsSync(bundlePath)) {
       try {
-        zip = new AdmZip(bundlePath);
+        const zip = new AdmZip(bundlePath);
+        zip.extractAllTo(sessionTargetDir, true);
+        console.log(`[LegacyMigration] Unpacked archive into ${sessionTargetDir}`);
       } catch (err) {
-        console.error(`[LegacyMigration] Failed to open bundle ${bundlePath}:`, err);
+        console.error(`[LegacyMigration] Failed to unpack bundle ${bundlePath}:`, err);
       }
     } else {
       console.warn(`[LegacyMigration] Bundle not found at ${bundlePath}`);
+    }
+
+    // 2b. Clean up post-session ghost record for SS-6X47 / HE172034 (anonymous_1792028643935 from Oct 15)
+    if (sessionCode === "SS-6X47") {
+      const ghostRecordDir = path.join(sessionTargetDir, "HE172034", "exam_records", "anonymous_1792028643935");
+      if (fs.existsSync(ghostRecordDir)) {
+        try {
+          await fs.promises.rm(ghostRecordDir, { recursive: true, force: true });
+          console.log("[LegacyMigration] Cleaned up post-session ghost record anonymous_1792028643935 for HE172034");
+        } catch {}
+      }
     }
 
     // 3. Update SQLite Sessions Table & In-Memory Map
@@ -103,7 +114,6 @@ export async function runLegacySessionMigration(): Promise<void> {
     // 4. Process each student: Disk, SQLite, Redis, S3
     const manifestStudents: any[] = [];
 
-    // Parallelize processing in batches of 5 to maximize throughput
     const batchSize = 5;
     for (let i = 0; i < meta.students.length; i += batchSize) {
       const batch = meta.students.slice(i, i + batchSize);
@@ -126,28 +136,21 @@ export async function runLegacySessionMigration(): Promise<void> {
           await fs.promises.mkdir(studentTargetDir, { recursive: true });
 
           // 4a. Prompt turns file
+          const localPromptPath = path.join(sessionTargetDir, `${studentId}.json`);
           let promptTurns: any[] = [];
-          const promptTurnFileInZip = zip?.getEntry(`${studentId}.json`);
-          if (promptTurnFileInZip) {
+          if (fs.existsSync(localPromptPath)) {
             try {
-              const raw = promptTurnFileInZip.getData().toString("utf-8");
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) promptTurns = parsed;
+              const raw = await fs.promises.readFile(localPromptPath, "utf-8");
+              promptTurns = JSON.parse(raw);
             } catch {}
           }
 
-          // Write prompt turns to local disk
-          const localPromptPath = path.join(sessionTargetDir, `${studentId}.json`);
-          if (promptTurns.length > 0) {
-            await fs.promises.writeFile(localPromptPath, JSON.stringify(promptTurns, null, 2), "utf-8");
-          }
-
-          // 4b. Base upload_info
+          // 4b. Authoritative upload_info.json (uploadTimestamp MUST BE trueExpire to prevent premature clamping)
           let existingUploadInfo: any = {};
-          const uploadInfoEntry = zip?.getEntry(`${studentId}/upload_info.json`);
-          if (uploadInfoEntry) {
+          const localUploadInfoPath = path.join(studentTargetDir, "upload_info.json");
+          if (fs.existsSync(localUploadInfoPath)) {
             try {
-              existingUploadInfo = JSON.parse(uploadInfoEntry.getData().toString("utf-8"));
+              existingUploadInfo = JSON.parse(await fs.promises.readFile(localUploadInfoPath, "utf-8"));
             } catch {}
           }
 
@@ -155,8 +158,8 @@ export async function runLegacySessionMigration(): Promise<void> {
             ...existingUploadInfo,
             studentId,
             sessionCode,
-            uploadTimestamp: trueSignin,
-            uploadTimeISO: new Date(trueSignin).toISOString(),
+            uploadTimestamp: trueExpire,
+            uploadTimeISO: new Date(trueExpire).toISOString(),
             uploadIp: uploadIp || existingUploadInfo.uploadIp || existingUploadInfo.ip || "127.0.0.1",
             validityWindow: {
               signinTimestamp: trueSignin,
@@ -173,8 +176,6 @@ export async function runLegacySessionMigration(): Promise<void> {
             },
           };
 
-          // Write upload_info.json to local disk
-          const localUploadInfoPath = path.join(studentTargetDir, "upload_info.json");
           await fs.promises.writeFile(
             localUploadInfoPath,
             JSON.stringify(authoritativeUploadInfo, null, 2),
@@ -240,14 +241,16 @@ export async function runLegacySessionMigration(): Promise<void> {
                 `S3 upload_info ${sessionCode}/${studentId}`,
               );
 
-              // If exam records exist on S3, update upload_info.json in each record directory
-              const s3Records = await withTimeout(
-                s3Storage.listStudentExamRecords(sessionCode, studentId),
-                4000,
-                `S3 listStudentExamRecords ${sessionCode}/${studentId}`,
-              );
-              if (Array.isArray(s3Records) && s3Records.length > 0) {
-                for (const recId of s3Records) {
+              // Upload student exam records from local disk to S3 if not already in S3
+              const examRecordsLocalDir = path.join(studentTargetDir, "exam_records");
+              if (fs.existsSync(examRecordsLocalDir)) {
+                const recDirs = await fs.promises.readdir(examRecordsLocalDir);
+                for (const recId of recDirs) {
+                  const recPath = path.join(examRecordsLocalDir, recId);
+                  const stat = await fs.promises.stat(recPath);
+                  if (!stat.isDirectory()) continue;
+
+                  // Upload upload_info.json inside exam record
                   await withTimeout(
                     s3Storage.uploadExamRecordFile(
                       sessionCode,
@@ -258,8 +261,51 @@ export async function runLegacySessionMigration(): Promise<void> {
                       "application/json",
                     ),
                     4000,
-                    `S3 uploadExamRecordFile ${sessionCode}/${studentId}/${recId}`,
+                    `S3 uploadExamRecord upload_info ${sessionCode}/${studentId}/${recId}`,
                   );
+
+                  // Upload events.jsonl if missing from S3
+                  const eventsLocalFile = path.join(recPath, "events.jsonl");
+                  if (fs.existsSync(eventsLocalFile)) {
+                    const s3Events = await s3Storage.getExamRecordArtifact(sessionCode, studentId, recId, "events.jsonl");
+                    if (!s3Events || (typeof s3Events === "string" && s3Events.length < 10)) {
+                      const eventsContent = await fs.promises.readFile(eventsLocalFile);
+                      await withTimeout(
+                        s3Storage.uploadExamRecordFile(sessionCode, studentId, recId, "events.jsonl", eventsContent, "application/x-ndjson"),
+                        5000,
+                        `S3 upload events.jsonl for ${sessionCode}/${studentId}/${recId}`
+                      );
+                      console.log(`[LegacyMigration] Uploaded missing events.jsonl to S3 for ${sessionCode}/${studentId}/${recId}`);
+                    }
+                  }
+
+                  // Upload metadata.json if missing from S3
+                  const metaLocalFile = path.join(recPath, "metadata.json");
+                  if (fs.existsSync(metaLocalFile)) {
+                    const s3Meta = await s3Storage.getExamRecordArtifact(sessionCode, studentId, recId, "metadata.json");
+                    if (!s3Meta) {
+                      const metaContent = await fs.promises.readFile(metaLocalFile, "utf-8");
+                      await withTimeout(
+                        s3Storage.uploadExamRecordFile(sessionCode, studentId, recId, "metadata.json", metaContent, "application/json"),
+                        4000,
+                        `S3 upload metadata.json for ${sessionCode}/${studentId}/${recId}`
+                      );
+                    }
+                  }
+
+                  // Upload snapshot_start.zip if missing from S3
+                  const snapLocalFile = path.join(recPath, "snapshot_start.zip");
+                  if (fs.existsSync(snapLocalFile)) {
+                    const s3Snap = await s3Storage.getExamRecordArtifact(sessionCode, studentId, recId, "snapshot_start.zip");
+                    if (!s3Snap) {
+                      const snapContent = await fs.promises.readFile(snapLocalFile);
+                      await withTimeout(
+                        s3Storage.uploadExamRecordFile(sessionCode, studentId, recId, "snapshot_start.zip", snapContent, "application/zip"),
+                        5000,
+                        `S3 upload snapshot_start.zip for ${sessionCode}/${studentId}/${recId}`
+                      );
+                    }
+                  }
                 }
               }
             } catch (s3Err) {

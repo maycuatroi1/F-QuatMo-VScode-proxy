@@ -3101,6 +3101,7 @@ adminRouter.get(
         toMs(validityWindow?.expireTimestamp) || null;
 
       if (
+        !sessionEndTime &&
         uploadTimestamp &&
         sessionBeginTime &&
         uploadTimestamp >= sessionBeginTime
@@ -3114,7 +3115,7 @@ adminRouter.get(
         }
       }
 
-      if (metadata?.examEndAt) {
+      if (!sessionEndTime && metadata?.examEndAt) {
         const metaEnd = toMs(metadata.examEndAt);
         if (metaEnd && sessionBeginTime && metaEnd >= sessionBeginTime) {
           if (
