@@ -30,7 +30,7 @@ export const SESSIONS_META: Record<string, SessionMetaRecord> = {
     "sessionCode": "SS-6X47",
     "examDateStr": "2026-10-06",
     "createdAt": 1791250551391,
-    "durationMinutes": 120,
+    "durationMinutes": 180,
     "students": [
       {
         "studentId": "DATTT67",
@@ -284,8 +284,8 @@ export const SESSIONS_META: Record<string, SessionMetaRecord> = {
   "SS-QLHK": {
     "sessionCode": "SS-QLHK",
     "examDateStr": "2026-09-24",
-    "createdAt": 1790180968564,
-    "durationMinutes": 120,
+    "createdAt": 1790209800000,
+    "durationMinutes": 180,
     "students": [
       {
         "studentId": "DATTT67",

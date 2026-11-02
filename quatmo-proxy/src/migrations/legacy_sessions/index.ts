@@ -6,7 +6,7 @@ import { redis } from "../../services/redis";
 import { s3Storage } from "../../services/s3Storage";
 import { SESSIONS_META } from "./session_metadata";
 
-const CHECKPOINT_FILE = path.resolve(process.cwd(), "logs", ".migrated_legacy_sessions_v3");
+const CHECKPOINT_FILE = path.resolve(process.cwd(), "logs", ".migrated_legacy_sessions_v4");
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | null> {
   let timer: any;
@@ -83,7 +83,7 @@ export async function runLegacySessionMigration(): Promise<void> {
       const newSession: Session = {
         sessionCode,
         startTime: meta.createdAt,
-        durationMinutes: meta.durationMinutes || 120,
+        durationMinutes: meta.durationMinutes || 180,
         aiOption: "agent",
         aiValidityMinutes: 120,
         defaultTokenBudget: 150000,
@@ -101,7 +101,9 @@ export async function runLegacySessionMigration(): Promise<void> {
       sessionObj = newSession;
       sessions.set(sessionCode, newSession);
     } else {
-      sessionObj.durationMinutes = meta.durationMinutes || 120;
+      sessionObj.startTime = meta.createdAt;
+      sessionObj.createdAt = meta.createdAt;
+      sessionObj.durationMinutes = meta.durationMinutes || 180;
       sessionObj.promptMode = sessionObj.promptMode || "scaffolded_code";
       const currentAllowed = new Set(sessionObj.allowedStudentIds);
       studentIds.forEach((id) => currentAllowed.add(id));
@@ -338,6 +340,7 @@ export async function runLegacySessionMigration(): Promise<void> {
     // 5. Update session_manifest.json on Local Disk and S3
     const manifestObj = {
       sessionCode,
+      startTime: meta.createdAt,
       createdAt: meta.createdAt,
       examDateStr: meta.examDateStr,
       durationMinutes: meta.durationMinutes,

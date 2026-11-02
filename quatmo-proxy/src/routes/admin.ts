@@ -2643,6 +2643,22 @@ async function loadEventLogFromS3(
       } catch {}
     }
 
+    // If default record produced 0 core events, search other S3 records
+    if (!reqRecordId && s3Records.length > 1 && coreRecords.length === 0) {
+      for (const altRecId of s3Records) {
+        if (altRecId === targetRecordId) continue;
+        const altEventsRaw = await s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          altRecId,
+          "events.jsonl",
+        );
+        if (typeof altEventsRaw === "string" && altEventsRaw.trim().length > 0) {
+          return loadEventLogFromS3(sessionCode, studentId, altRecId);
+        }
+      }
+    }
+
     let uploadTimestamp: number | null = null;
     let uploadTimeISO: string | null = null;
     let validityWindow: any = null;
@@ -2880,10 +2896,23 @@ adminRouter.get(
           if (availableRecords.length > 0) {
             availableRecords.sort().reverse();
             const reqRecordId = c.req.query("recordId");
-            const targetRecordId =
+            let targetRecordId =
               reqRecordId && availableRecords.includes(reqRecordId)
                 ? reqRecordId
                 : availableRecords[0];
+
+            // If no explicit record requested and multiple exist, prioritize the one with actual events
+            if (!reqRecordId && availableRecords.length > 1) {
+              for (const rId of availableRecords) {
+                const evFile = path.join(examRecordsDir, rId, "events.jsonl");
+                try {
+                  if (fs.existsSync(evFile) && fs.statSync(evFile).size > 0) {
+                    targetRecordId = rId;
+                    break;
+                  }
+                } catch {}
+              }
+            }
             activeRecordDir = path.join(examRecordsDir, targetRecordId);
           }
         }
@@ -3245,14 +3274,12 @@ adminRouter.get(
           postSessionEvents: coreStats.postCount,
           outsideDateEvents: coreStats.outsideDateCount,
         },
-        metadata: metadata || {
-          examSessionId: path.basename(activeRecordDir),
-          examStartAt:
-            sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
-          examEndAt:
-            sessionEndTime ||
-            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
-            Date.now(),
+        uploadTimestamp: sessionEndTime,
+        metadata: {
+          ...(metadata || {}),
+          examSessionId: metadata?.examSessionId || path.basename(activeRecordDir),
+          examStartAt: sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
+          examEndAt: sessionEndTime || clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp || Date.now(),
         },
         coreRecords: clampedCoreRecords,
         aiRecords: clampedAiRecords,
