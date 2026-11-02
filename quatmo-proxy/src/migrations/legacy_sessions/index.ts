@@ -6,7 +6,7 @@ import { redis } from "../../services/redis";
 import { s3Storage } from "../../services/s3Storage";
 import { SESSIONS_META } from "./session_metadata";
 
-const CHECKPOINT_FILE = path.resolve(process.cwd(), "logs", ".migrated_legacy_sessions_v2");
+const CHECKPOINT_FILE = path.resolve(process.cwd(), "logs", ".migrated_legacy_sessions_v3");
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T | null> {
   let timer: any;
@@ -377,7 +377,7 @@ export async function runLegacySessionMigration(): Promise<void> {
       JSON.stringify(
         {
           migratedAt: new Date().toISOString(),
-          version: "v2",
+          version: "v3",
           sessions: sessionCodes,
         },
         null,
