@@ -11,7 +11,6 @@ import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
 import { syncAllDataToRedis } from "./services/sessionStore";
-import { runTelemetryMigration } from "./services/telemetryMigration";
 import dotenv from "dotenv";
 import { maskSecret, validateSecretsAtStartup } from "./services/security";
 import { logOnce } from "./services/clientGate";
@@ -19,24 +18,6 @@ import { logOnce } from "./services/clientGate";
 dotenv.config();
 validateSecretsAtStartup();
 
-void runTelemetryMigration().catch((err) => {
-  console.warn("[Proxy] Background telemetry migration warning:", err);
-});
-
-// Auto-run legacy session migration for SS-6X47 & SS-QLHK if folder exists (self-cleaning safe dynamic import)
-void (async () => {
-  try {
-    const migrationModule = "./migrations/legacy_sessions";
-    const legacyMigration: any = await import(/* @vite-ignore */ migrationModule);
-    if (legacyMigration && typeof legacyMigration.runLegacySessionMigration === "function") {
-      await legacyMigration.runLegacySessionMigration();
-    }
-  } catch (err: any) {
-    if (err?.code !== "MODULE_NOT_FOUND" && !err?.message?.includes("Cannot find module")) {
-      console.warn("[Proxy] Legacy migration warning:", err);
-    }
-  }
-})();
 
 /**
  * CORS allowlist. Desktop clients (Node fetch) send no Origin and are unaffected.

@@ -30,7 +30,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { s3Storage } from "../services/s3Storage";
-import { reconcileStudentPromptTurns } from "../services/telemetryMigration";
+import { reconcileStudentPromptTurns } from "../services/promptLogService";
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -1582,7 +1582,7 @@ adminRouter.post("/sessions/:sessionCode/sync-tokens", async (c) => {
     return c.json({ error: "Session code is required." }, 400);
   }
 
-  const { reconcileStudentPromptTurns, safeParseJson } = await import("../services/telemetryMigration");
+  const { reconcileStudentPromptTurns, safeParseJson } = await import("../services/promptLogService");
   const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
   const updatedStudents: Array<{ studentId: string; oldTokens: number; newTokens: number }> = [];
 
