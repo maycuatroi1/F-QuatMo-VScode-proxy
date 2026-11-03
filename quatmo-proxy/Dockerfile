@@ -9,8 +9,9 @@ COPY package.json bun.lock ./
 # Install dependencies
 RUN bun install --production
 
-# Copy source code
+# Copy source code and release metadata
 COPY tsconfig.json ./
+COPY release_manifest.json* ./
 COPY src ./src
 
 # Ensure logs directory exists for SQLite database persistence

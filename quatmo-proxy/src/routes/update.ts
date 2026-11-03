@@ -117,17 +117,22 @@ if (!fs.existsSync(RELEASES_DIR)) {
 }
 
 let currentRelease: ReleaseManifest = {
-  version: "1.95.1",
+  version: "1.96.9",
   commit: "0c305f1b8afea035cdb283bef94edb88b7029f98",
-  name: "Fvscode 1.95.1",
-  productVersion: "1.95.1",
-  filename: "Fvscode-UserSetup-x64.exe",
-  s3Key: "releases/Fvscode-UserSetup-x64.exe",
-  downloadUrl: "http://localhost:3000/v1/releases/Fvscode-UserSetup-x64.exe",
-  notes:
-    "Phiên bản chuẩn thi cử FPT University: tích hợp hệ thống giám sát thời gian thực và IEM widget.",
-  releasedAt: new Date().toISOString(),
-  mandatory: false,
+  name: "Fvscode 1.96.9",
+  productVersion: "1.96.9",
+  updateType: "patch",
+  filename: "Fvscode-Patch-1.96.9.zip",
+  s3Key: "releases/Fvscode-Patch-1.96.9.zip",
+  downloadUrl: "https://fvscode-proxy.iahn.hanoi.vn/v1/releases/Fvscode-Patch-1.96.9.zip",
+  sha256hash: "666cc0b207069376190eb9fe397d5f65d7968fcaf92ca0092be2f9f3b7fe40ec",
+  sizeBytes: 36624591,
+  sizeMB: 34.93,
+  buildHash: "b7646fb5eed6c6401786547e9a3f86d1e58c8fecababd6338a1367be70694ae3",
+  signature: "ed25519:surVJEZZdhgx2R4uEY4EF/t0ZCQbYspk8umphddwnW2mGI/TM1d05+MnI4+iISWeIeSA+uyvZYzJyZfk3ykIDQ==",
+  notes: "Bản vá 1.96.9: Tối ưu submit log và close app",
+  releasedAt: "2026-10-28T21:06:26.313Z",
+  mandatory: true,
 };
 
 try {
