@@ -30,8 +30,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import { s3Storage } from "../services/s3Storage";
-import { summaryStorageService } from "../services/summaryStorage";
-import { reconcileStudentPromptTurns } from "../services/telemetryMigration";
+import { reconcileStudentPromptTurns } from "../services/promptLogService";
 
 function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -1575,6 +1574,103 @@ adminRouter.get("/sessions", async (c) => {
   return c.json({ success: true, sessions: sessionList });
 });
 
+// ─── SYNC TOKENS (RECALCULATE FROM LOGS / MANIFEST & UPDATE SQLITE + REDIS) ────
+adminRouter.post("/sessions/:sessionCode/sync-tokens", async (c) => {
+  requireCaller(c);
+  const sessionCode = sanitizeFilename(c.req.param("sessionCode") || "").toUpperCase();
+  if (!sessionCode) {
+    return c.json({ error: "Session code is required." }, 400);
+  }
+
+  const { reconcileStudentPromptTurns, safeParseJson } = await import("../services/promptLogService");
+  const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
+  const updatedStudents: Array<{ studentId: string; oldTokens: number; newTokens: number }> = [];
+
+  // 1. Check directory logs if available
+  if (fs.existsSync(sessionLogDir)) {
+    try {
+      const files = await fs.promises.readdir(sessionLogDir);
+      for (const f of files) {
+        if (!f.endsWith(".json") || f.includes("manifest")) continue;
+        const studentId = f.replace(/\.json$/, "").toUpperCase();
+        const stateKey = `${sessionCode}:${studentId}`;
+        const st = sessionStates.get(stateKey);
+        const oldTokens = st?.tokensConsumed ?? 0;
+        const res = await reconcileStudentPromptTurns(sessionCode, studentId, sessionLogDir);
+        const newTokens = res.turns.reduce((acc, t) => acc + (t.tokensConsumedTotal || 0), 0);
+        if (st && (st.tokensConsumed !== newTokens || res.wasRepaired)) {
+          st.tokensConsumed = newTokens;
+          st.promptCount = res.turns.length;
+          sessionStates.set(stateKey, st);
+          if (redis && redis.status === "ready") {
+            await redis.hset(`session:user:${sessionCode}:${studentId}`, "consumed", String(newTokens));
+          }
+          updatedStudents.push({ studentId, oldTokens, newTokens });
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Check session_manifest.json in sessionLogDir or root zip files
+  const manifestPath = path.join(sessionLogDir, "session_manifest.json");
+  let manifestData: any = null;
+  if (fs.existsSync(manifestPath)) {
+    try {
+      manifestData = safeParseJson(await fs.promises.readFile(manifestPath, "utf-8"));
+    } catch {}
+  }
+
+  if (!manifestData) {
+    const zipCandidates = [
+      path.join(process.cwd(), `logs_${sessionCode}.zip`),
+      path.join(process.cwd(), `session-${sessionCode}-logs.zip`),
+      path.join(process.cwd(), "logs", `logs_${sessionCode}.zip`),
+      path.join(process.cwd(), "logs", `session-${sessionCode}-logs.zip`),
+      path.join(process.cwd(), "..", `logs_${sessionCode}.zip`),
+    ];
+    for (const zPath of zipCandidates) {
+      if (fs.existsSync(zPath)) {
+        try {
+          const zip = new AdmZip(zPath);
+          const entry = zip.getEntry("session_manifest.json");
+          if (entry) {
+            manifestData = safeParseJson(entry.getData().toString("utf-8"));
+            break;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  if (manifestData && Array.isArray(manifestData.students)) {
+    for (const sItem of manifestData.students) {
+      if (!sItem.studentId || typeof sItem.tokensConsumed !== "number") continue;
+      const safeSid = sItem.studentId.toUpperCase();
+      const stateKey = `${sessionCode}:${safeSid}`;
+      const st = sessionStates.get(stateKey);
+      const oldTokens = st?.tokensConsumed ?? 0;
+      if (st && st.tokensConsumed !== sItem.tokensConsumed) {
+        st.tokensConsumed = sItem.tokensConsumed;
+        if (typeof sItem.promptTurns === "number") st.promptCount = sItem.promptTurns;
+        sessionStates.set(stateKey, st);
+        if (redis && redis.status === "ready") {
+          await redis.hset(`session:user:${sessionCode}:${safeSid}`, "consumed", String(sItem.tokensConsumed));
+        }
+        if (!updatedStudents.some((u) => u.studentId === safeSid)) {
+          updatedStudents.push({ studentId: safeSid, oldTokens, newTokens: sItem.tokensConsumed });
+        }
+      }
+    }
+  }
+
+  return c.json({
+    success: true,
+    sessionCode,
+    updatedCount: updatedStudents.length,
+    students: updatedStudents,
+  });
+});
+
 // ─── LOG DOWNLOAD HELPER & ENDPOINTS ──────────────────────────────────────────
 
 /** Secrets / databases that must never leave the server through log exports. */
@@ -1874,6 +1970,20 @@ adminRouter.get("/visualize/sessions", async (c) => {
             withFileTypes: true,
           });
           for (const sub of subEntries) {
+            const subNameLower = sub.name.toLowerCase();
+            if (
+              subNameLower.includes("manifest") ||
+              subNameLower.includes("metadata") ||
+              subNameLower.includes("upload_info") ||
+              subNameLower.includes("package") ||
+              subNameLower.startsWith(".") ||
+              subNameLower.endsWith(".tmp") ||
+              subNameLower.endsWith(".bak") ||
+              subNameLower === "__macosx"
+            ) {
+              continue;
+            }
+
             const subPath = path.join(sessionPath, sub.name);
             const stat = await fs.promises.stat(subPath);
             if (stat.mtimeMs > lastActivity) lastActivity = stat.mtimeMs;
@@ -2069,6 +2179,20 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
         withFileTypes: true,
       });
       for (const entry of entries) {
+        const entryNameLower = entry.name.toLowerCase();
+        if (
+          entryNameLower.includes("manifest") ||
+          entryNameLower.includes("metadata") ||
+          entryNameLower.includes("upload_info") ||
+          entryNameLower.includes("package") ||
+          entryNameLower.startsWith(".") ||
+          entryNameLower.endsWith(".tmp") ||
+          entryNameLower.endsWith(".bak") ||
+          entryNameLower === "__macosx"
+        ) {
+          continue;
+        }
+
         const entryPath = path.join(sessionLogDir, entry.name);
         const stat = await fs.promises.stat(entryPath);
 
@@ -2330,7 +2454,16 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
     }
   }
 
-  const accounts = Array.from(accountMap.values());
+  const accounts = Array.from(accountMap.values()).filter((a) => {
+    const sid = (a.studentId || "").toLowerCase();
+    return (
+      !sid.includes("manifest") &&
+      !sid.includes("metadata") &&
+      !sid.includes("package") &&
+      !sid.startsWith(".") &&
+      sid !== "__macosx"
+    );
+  });
   accounts.sort((a, b) => {
     const aHas = a.hasPromptLog || a.hasEventLog ? 1 : 0;
     const bHas = b.hasPromptLog || b.hasEventLog ? 1 : 0;
@@ -2722,6 +2855,22 @@ async function loadEventLogFromS3(
       } catch {}
     }
 
+    // If default record produced 0 core events, search other S3 records
+    if (!reqRecordId && s3Records.length > 1 && coreRecords.length === 0) {
+      for (const altRecId of s3Records) {
+        if (altRecId === targetRecordId) continue;
+        const altEventsRaw = await s3Storage.getExamRecordArtifact(
+          sessionCode,
+          studentId,
+          altRecId,
+          "events.jsonl",
+        );
+        if (typeof altEventsRaw === "string" && altEventsRaw.trim().length > 0) {
+          return loadEventLogFromS3(sessionCode, studentId, altRecId);
+        }
+      }
+    }
+
     let uploadTimestamp: number | null = null;
     let uploadTimeISO: string | null = null;
     let validityWindow: any = null;
@@ -2959,10 +3108,23 @@ adminRouter.get(
           if (availableRecords.length > 0) {
             availableRecords.sort().reverse();
             const reqRecordId = c.req.query("recordId");
-            const targetRecordId =
+            let targetRecordId =
               reqRecordId && availableRecords.includes(reqRecordId)
                 ? reqRecordId
                 : availableRecords[0];
+
+            // If no explicit record requested and multiple exist, prioritize the one with actual events
+            if (!reqRecordId && availableRecords.length > 1) {
+              for (const rId of availableRecords) {
+                const evFile = path.join(examRecordsDir, rId, "events.jsonl");
+                try {
+                  if (fs.existsSync(evFile) && fs.statSync(evFile).size > 0) {
+                    targetRecordId = rId;
+                    break;
+                  }
+                } catch {}
+              }
+            }
             activeRecordDir = path.join(examRecordsDir, targetRecordId);
           }
         }
@@ -3180,6 +3342,7 @@ adminRouter.get(
         toMs(validityWindow?.expireTimestamp) || null;
 
       if (
+        !sessionEndTime &&
         uploadTimestamp &&
         sessionBeginTime &&
         uploadTimestamp >= sessionBeginTime
@@ -3193,7 +3356,7 @@ adminRouter.get(
         }
       }
 
-      if (metadata?.examEndAt) {
+      if (!sessionEndTime && metadata?.examEndAt) {
         const metaEnd = toMs(metadata.examEndAt);
         if (metaEnd && sessionBeginTime && metaEnd >= sessionBeginTime) {
           if (
@@ -3323,14 +3486,12 @@ adminRouter.get(
           postSessionEvents: coreStats.postCount,
           outsideDateEvents: coreStats.outsideDateCount,
         },
-        metadata: metadata || {
-          examSessionId: path.basename(activeRecordDir),
-          examStartAt:
-            sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
-          examEndAt:
-            sessionEndTime ||
-            clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp ||
-            Date.now(),
+        uploadTimestamp: sessionEndTime,
+        metadata: {
+          ...(metadata || {}),
+          examSessionId: metadata?.examSessionId || path.basename(activeRecordDir),
+          examStartAt: sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
+          examEndAt: sessionEndTime || clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp || Date.now(),
         },
         coreRecords: clampedCoreRecords,
         aiRecords: clampedAiRecords,

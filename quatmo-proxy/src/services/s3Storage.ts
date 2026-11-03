@@ -277,6 +277,57 @@ export class S3StorageService {
     }
   }
 
+  public async uploadSessionManifest(
+    sessionCode: string,
+    content: string | Buffer | Uint8Array,
+  ): Promise<boolean> {
+    if (!this.isAvailable() || !this.client) return false;
+
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const key = `sessions/${safeSession}/session_manifest.json`;
+
+    try {
+      await this.sendCommand(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: content,
+          ContentType: "application/json",
+        }),
+      );
+      return true;
+    } catch (err) {
+      console.error(`[S3 Storage] Failed to upload session manifest ${key}:`, err);
+      return false;
+    }
+  }
+
+  public async getSessionManifest(
+    sessionCode: string,
+  ): Promise<string | Buffer | null> {
+    if (!this.isAvailable() || !this.client) return null;
+
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const key = `sessions/${safeSession}/session_manifest.json`;
+
+    try {
+      const resp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        }),
+      );
+      if (!resp.Body) return null;
+      return await resp.Body.transformToString("utf-8");
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.error(`[S3 Storage] Failed to get session manifest ${key}:`, err);
+      return null;
+    }
+  }
+
   public async getStudentFile(
     sessionCode: string,
     studentId: string,

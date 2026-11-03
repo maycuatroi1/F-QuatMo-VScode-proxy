@@ -40,6 +40,27 @@ export async function atomicWriteJson(
   await fs.promises.rename(tmpPath, filePath);
 }
 
+export function safeParseJson<T = any>(raw: string): T | null {
+  if (!raw) return null;
+  const clean = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  try {
+    return JSON.parse(clean);
+  } catch {
+    return null;
+  }
+}
+
+export function isGhostPromptTurn(turn: PromptTurnRecord): boolean {
+  if (!turn) return false;
+  const p = (turn.prompt || "").toString();
+  return (
+    p.includes("Text before cursor:") ||
+    p.includes("Text after cursor:") ||
+    p.includes("You complete code. Return ONLY the completion") ||
+    p.startsWith("Complete:\n")
+  );
+}
+
 export async function reconcileStudentPromptTurns(
   sessionCode: string,
   studentId: string,
@@ -79,13 +100,17 @@ export async function reconcileStudentPromptTurns(
     } catch {}
   }
 
+
   let existingTurns: PromptTurnRecord[] = [];
+  let hadExistingGhostTurns = false;
   if (fs.existsSync(jsonPath)) {
     try {
       const raw = await fs.promises.readFile(jsonPath, "utf-8");
-      const parsed = JSON.parse(raw);
+      const parsed = safeParseJson(raw);
       if (Array.isArray(parsed)) {
-        existingTurns = parsed;
+        const initialCount = parsed.length;
+        existingTurns = parsed.filter((t) => !isGhostPromptTurn(t));
+        hadExistingGhostTurns = existingTurns.length < initialCount;
       }
     } catch {}
   }
@@ -104,7 +129,11 @@ export async function reconcileStudentPromptTurns(
         try {
           const decrypted = decryptLogFile(logPath, key) as any[];
           const valid = decrypted.filter(
-            (t) => t && !t._error && (t.prompt || t.tokensConsumedTotal),
+            (t) =>
+              t &&
+              !t._error &&
+              (t.prompt || t.tokensConsumedTotal) &&
+              !isGhostPromptTurn(t),
           );
           if (valid.length > 0) {
             logTurns = valid;
@@ -194,7 +223,7 @@ export async function reconcileStudentPromptTurns(
   );
 
   if (existingTurns.length >= maxAvailableTurns && existingTurns.length > 0) {
-    let modified = false;
+    let modified = hadExistingGhostTurns;
     for (let i = 0; i < existingTurns.length; i++) {
       const turn = existingTurns[i];
       if (
@@ -248,13 +277,69 @@ export async function reconcileStudentPromptTurns(
       }
     }
 
+    const totalTokens = existingTurns.reduce(
+      (acc, t) => acc + (t.tokensConsumedTotal || 0),
+      0,
+    );
+
     if (modified) {
       try {
+        if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
+          const bakPath = `${jsonPath}.bak.${Date.now()}`;
+          try {
+            await fs.promises.copyFile(jsonPath, bakPath);
+          } catch {}
+        }
         await atomicWriteJson(jsonPath, existingTurns);
+
+        // Synchronize tokens consumed in session_manifest.json
+        const manifestPath = path.join(sessionDir, "session_manifest.json");
+        if (fs.existsSync(manifestPath)) {
+          try {
+            const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
+            const mJson = safeParseJson(mRaw);
+            if (mJson && Array.isArray(mJson.students)) {
+              const sItem = mJson.students.find(
+                (s: any) =>
+                  s.studentId &&
+                  s.studentId.toUpperCase() === safeStudentId,
+              );
+              if (sItem) {
+                sItem.tokensConsumed = totalTokens;
+                sItem.promptTurns = existingTurns.length;
+                await atomicWriteJson(manifestPath, mJson);
+              }
+            }
+          } catch {}
+        }
       } catch {}
     }
 
-    return { turns: existingTurns, wasRepaired: modified, source: "json" };
+    // Always synchronize SQLite table session_states and Redis if tokens differ
+    try {
+      const { sessionStates } = await import("./sessionStore");
+      const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
+      const st = sessionStates.get(stateKey);
+      if (st && (st.tokensConsumed !== totalTokens || modified)) {
+        st.tokensConsumed = totalTokens;
+        st.promptCount = existingTurns.length;
+        sessionStates.set(stateKey, st); // Persist to SQLite
+        const { redis } = await import("./redis");
+        if (redis && redis.status === "ready") {
+          await redis.hset(
+            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
+            "consumed",
+            String(totalTokens),
+          );
+        }
+      }
+    } catch {}
+
+    return {
+      turns: existingTurns,
+      wasRepaired: modified,
+      source: hadExistingGhostTurns ? "sanitized_ghost_turns" : "json",
+    };
   }
 
   let synthesizedTurns: PromptTurnRecord[] = [];
@@ -385,6 +470,49 @@ export async function reconcileStudentPromptTurns(
   if (synthesizedTurns.length > existingTurns.length) {
     try {
       await atomicWriteJson(jsonPath, synthesizedTurns);
+      const totalTokens = synthesizedTurns.reduce(
+        (acc, t) => acc + (t.tokensConsumedTotal || 0),
+        0,
+      );
+      const manifestPath = path.join(sessionDir, "session_manifest.json");
+      if (fs.existsSync(manifestPath)) {
+        try {
+          const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
+          const mJson = safeParseJson(mRaw);
+          if (mJson && Array.isArray(mJson.students)) {
+            const sItem = mJson.students.find(
+              (s: any) =>
+                s.studentId &&
+                s.studentId.toUpperCase() === safeStudentId,
+            );
+            if (sItem) {
+              sItem.tokensConsumed = totalTokens;
+              sItem.promptTurns = synthesizedTurns.length;
+              await atomicWriteJson(manifestPath, mJson);
+            }
+          }
+        } catch {}
+      }
+
+      // Synchronize in SQLite memory & table and Redis
+      try {
+        const { sessionStates } = await import("./sessionStore");
+        const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
+        const st = sessionStates.get(stateKey);
+        if (st) {
+          st.tokensConsumed = totalTokens;
+          st.promptCount = synthesizedTurns.length;
+          sessionStates.set(stateKey, st); // Persist to SQLite
+        }
+        const { redis } = await import("./redis");
+        if (redis && redis.status === "ready") {
+          await redis.hset(
+            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
+            "consumed",
+            String(totalTokens),
+          );
+        }
+      } catch {}
       return {
         turns: synthesizedTurns,
         wasRepaired: true,
@@ -392,7 +520,7 @@ export async function reconcileStudentPromptTurns(
       };
     } catch (err) {
       console.error(
-        `[TelemetryMigration] Failed to write repaired JSON to ${jsonPath}:`,
+        `[PromptLogService] Failed to write repaired JSON to ${jsonPath}:`,
         err,
       );
     }
@@ -403,78 +531,4 @@ export async function reconcileStudentPromptTurns(
     wasRepaired: false,
     source: "fallback",
   };
-}
-
-export async function runTelemetryMigration(): Promise<void> {
-  const sessionsBaseDir = path.resolve(process.cwd(), "logs", "sessions");
-  if (!fs.existsSync(sessionsBaseDir)) return;
-
-  try {
-    const sessionEntries = await fs.promises.readdir(sessionsBaseDir, {
-      withFileTypes: true,
-    });
-    let totalRepaired = 0;
-
-    for (const sessionEntry of sessionEntries) {
-      if (!sessionEntry.isDirectory()) continue;
-      const sessionCode = sessionEntry.name.toUpperCase();
-      const sessionDir = path.join(sessionsBaseDir, sessionEntry.name);
-
-      const files = await fs.promises.readdir(sessionDir);
-      const studentIds = new Set<string>();
-
-      for (const f of files) {
-        if (f.endsWith(".json") && !f.includes("manifest")) {
-          studentIds.add(f.replace(/\.json$/, "").toUpperCase());
-        } else if (f.endsWith(".log")) {
-          studentIds.add(f.replace(/\.log$/, "").toUpperCase());
-        } else {
-          const subPath = path.join(sessionDir, f);
-          try {
-            const stat = fs.statSync(subPath);
-            if (stat.isDirectory()) {
-              studentIds.add(f.toUpperCase());
-            }
-          } catch {}
-        }
-      }
-
-      for (const studentId of studentIds) {
-        try {
-          const res = await reconcileStudentPromptTurns(
-            sessionCode,
-            studentId,
-            sessionDir,
-          );
-          if (res.wasRepaired) {
-            totalRepaired++;
-            const totalTokens = res.turns.reduce(
-              (acc, t) => acc + (t.tokensConsumedTotal || 0),
-              0,
-            );
-            console.log(
-              `[TelemetryMigration] [OK] Repaired session ${sessionCode}/${studentId}: upgraded to ${res.turns.length} turns (${totalTokens.toLocaleString()} tokens).`,
-            );
-          }
-        } catch (err: any) {
-          console.warn(
-            `[TelemetryMigration] Warning for ${sessionCode}/${studentId}:`,
-            err?.message || err,
-          );
-        }
-      }
-    }
-
-    if (totalRepaired > 0) {
-      console.log(
-        `[TelemetryMigration] Complete: Successfully audited and repaired ${totalRepaired} student log(s).`,
-      );
-    } else {
-      console.log(
-        `[TelemetryMigration] Audit complete: All session logs on disk are fully synchronized.`,
-      );
-    }
-  } catch (err) {
-    console.error("[TelemetryMigration] Migration run error:", err);
-  }
 }

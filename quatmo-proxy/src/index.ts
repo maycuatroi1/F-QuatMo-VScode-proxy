@@ -11,7 +11,6 @@ import { proxyKeyConfig } from "./services/proxyKey";
 import { unifiedAuthMiddleware } from "./middleware/authUnified";
 import { logGlobal } from "./services/secureLogger";
 import { syncAllDataToRedis } from "./services/sessionStore";
-import { runTelemetryMigration } from "./services/telemetryMigration";
 import dotenv from "dotenv";
 import { maskSecret, validateSecretsAtStartup } from "./services/security";
 import { logOnce } from "./services/clientGate";
@@ -19,9 +18,6 @@ import { logOnce } from "./services/clientGate";
 dotenv.config();
 validateSecretsAtStartup();
 
-void runTelemetryMigration().catch((err) => {
-  console.warn("[Proxy] Background telemetry migration warning:", err);
-});
 
 /**
  * CORS allowlist. Desktop clients (Node fetch) send no Origin and are unaffected.
