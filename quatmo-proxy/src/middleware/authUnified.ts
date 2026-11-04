@@ -85,7 +85,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
           const sessionData = await redis.hgetall(sessionKey);
           if (sessionData && Object.keys(sessionData).length > 0) {
             budget = parseInt(sessionData.budget || "0", 10);
-            consumed = parseInt(sessionData.consumed || "0", 10);
+            consumed = parseInt(sessionData.consumed || sessionData.tokensConsumed || "0", 10);
           } else {
             // RAM cache miss after Redis restart or flush.
             // Verify JWT against SQLite persistent state and lazily re-hydrate Redis key to prevent session disruption.
@@ -114,6 +114,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
                 sessionCode: payload.sessionCode,
                 hasLoggedIn: "true",
                 tokensConsumed: String(consumed),
+                consumed: String(consumed),
                 budget: String(budget),
                 latestClassification: state.latestClassification || "none",
               });

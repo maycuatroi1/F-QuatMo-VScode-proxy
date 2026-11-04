@@ -5,6 +5,7 @@ import { streamSSE } from "hono/streaming";
 import { authMiddleware, type UserSession } from "../middleware/auth";
 import { rateLimitMiddleware } from "../middleware/rateLimit";
 import { countMessagesTokens, countTokens } from "../services/token";
+import { TokenBudgetGuard } from "../services/tokenBudgetGuard";
 import { redis } from "../services/redis";
 import { unifiedAuthMiddleware } from "../middleware/authUnified";
 import { verifyFingerprintMiddleware } from "../middleware/verifyFingerprint";
@@ -299,8 +300,6 @@ chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
   });
   return c.json({ success: true });
 });
-
-// Removed old 6-level classifier code
 
 function getUpstreamConfig(
   model: string,
@@ -1515,29 +1514,25 @@ chatRouter.post(
 
     const model = body.model || "gpt-4o";
     const upstream = getUpstreamConfig(model, token);
-    const remainingBudget = user.monthlyTokenLimit - user.tokensConsumed;
-
-    console.log(
-      `\x1b[36m[Proxy]\x1b[0m ➔ Request: ${model} | Stream: ${body.stream} | Budget: ${remainingBudget}`,
-    );
-    // console.log(
-    //   `\x1b[36m[Proxy]\x1b[0m ➔ Messages Count: ${body.messages?.length ?? 0}`,
-    // );
-    // if (Array.isArray(body.messages)) {
-    //   for (const msg of body.messages) {
-    //     const contentStr = typeof msg.content === "string"
-    //       ? msg.content
-    //       : Array.isArray(msg.content)
-    //         ? JSON.stringify(msg.content)
-    //         : "";
-    //     console.log(`  - [${msg.role}]: ${contentStr.slice(0, 120).replace(/\n/g, " ")}`);
-    //   }
-    // }
-
     const inputTokens = countMessagesTokens(body.messages);
 
-    if (remainingBudget <= 0) {
-      const errorMsg = "Monthly token budget exceeded. Access Denied.";
+    // ─── STRICT TOKEN BUDGET GUARD: Pre-flight Atomic Reservation ───────────
+    const reservation = await TokenBudgetGuard.preReserveTokens({
+      authMode,
+      sessionCode: finalSessionCode,
+      studentId: finalStudentId,
+      token,
+      user,
+      inputTokens,
+    });
+
+    console.log(
+      `\x1b[36m[Proxy]\x1b[0m ➔ Request: ${model} | Stream: ${body.stream} | Input: ${inputTokens} | Budget: ${reservation.budget} | Consumed: ${reservation.consumed} | AllowedOut: ${reservation.allowedOutputTokens}`,
+    );
+
+    if (!reservation.allowed) {
+      const errorMsg =
+        reservation.message || "Monthly token budget exceeded. Access Denied.";
       await logStudentError(
         finalSessionCode,
         finalStudentId,
@@ -1545,7 +1540,9 @@ chatRouter.post(
         body,
         errorMsg,
         "Rate Limiting",
-        "BUDGET_EXCEEDED",
+        reservation.reason === "prompt_exceeds_budget"
+          ? "PROMPT_EXCEEDS_BUDGET"
+          : "BUDGET_EXCEEDED",
         402,
         authMode === "session",
         machineId,
@@ -1560,6 +1557,14 @@ chatRouter.post(
                 finish_reason: "error",
               },
             ],
+            error: {
+              message: errorMsg,
+              code:
+                reservation.reason === "prompt_exceeds_budget"
+                  ? "PROMPT_EXCEEDS_BUDGET"
+                  : "BUDGET_EXCEEDED",
+              type: "budget_error",
+            },
           };
           await stream.writeSSE({ data: JSON.stringify(errChunk) });
           await stream.writeSSE({ data: "[DONE]" });
@@ -1569,6 +1574,22 @@ chatRouter.post(
     }
 
     const upstreamBody = normalizeUpstreamBody(body, upstream);
+
+    // ─── HARD UPPER BOUND CLAMPING: max_tokens cannot exceed remaining quota ──
+    const maxOut = parseInt(process.env.MAX_OUTPUT_TOKENS || "8192", 10);
+    const maxAllowedTokens = Math.max(
+      1,
+      Math.min(maxOut, reservation.allowedOutputTokens),
+    );
+    upstreamBody.max_tokens = upstreamBody.max_tokens
+      ? Math.min(upstreamBody.max_tokens, maxAllowedTokens)
+      : maxAllowedTokens;
+    if (upstreamBody.max_completion_tokens) {
+      upstreamBody.max_completion_tokens = Math.min(
+        upstreamBody.max_completion_tokens,
+        maxAllowedTokens,
+      );
+    }
     if (body.stream) {
       // Only inject stream_options for providers known to support it (OpenAI, OpenRouter)
       // iahn/custom and LM Studio may reject this field with 400/422
@@ -1592,6 +1613,7 @@ chatRouter.post(
       headers["Authorization"] = `Bearer ${upstream.key}`;
     }
 
+    const upstreamAbortController = new AbortController();
     let response: Response;
     const mainLlmStart = performance.now();
     try {
@@ -1599,13 +1621,22 @@ chatRouter.post(
         method: "POST",
         headers,
         body: JSON.stringify(upstreamBody),
-        // verbose: true, //stress test
+        signal: upstreamAbortController.signal,
       } as any);
       const mainLlmDuration = performance.now() - mainLlmStart;
       console.log(
         `[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`,
       );
     } catch (err: any) {
+      await TokenBudgetGuard.rollbackReservation({
+        authMode,
+        sessionCode: finalSessionCode,
+        studentId: finalStudentId,
+        token,
+        keyId: user?.keyId,
+        reservedTokens: reservation.reservedTokens,
+        user,
+      });
       console.error("[Proxy] Upstream connection failed:", err.message);
       logGlobal({
         level: "error",
@@ -1632,6 +1663,15 @@ chatRouter.post(
     }
 
     if (!response.ok) {
+      await TokenBudgetGuard.rollbackReservation({
+        authMode,
+        sessionCode: finalSessionCode,
+        studentId: finalStudentId,
+        token,
+        keyId: user?.keyId,
+        reservedTokens: reservation.reservedTokens,
+        user,
+      });
       const errBody = await response.text();
       console.error(
         "[Proxy] Upstream returned error:",
@@ -1659,39 +1699,6 @@ chatRouter.post(
       ).catch(() => {});
       return c.text(errBody, response.status as any);
     }
-
-    const recordTokenUsage = async (consumed: number) => {
-      if (authMode === "session") {
-        if (redis && redis.status === "ready") {
-          try {
-            await redis.hincrby(sessionKey, "consumed", consumed);
-          } catch (err) {
-            console.error("[Proxy] Redis budget increment failed:", err);
-          }
-        }
-        const { sessionStates } = await import("../services/sessionStore");
-        const stateKey = `${sessionContext.sessionCode}:${sessionContext.studentId}`;
-        const state = sessionStates.get(stateKey);
-        if (state) {
-          state.tokensConsumed += consumed;
-        }
-      } else {
-        user.tokensConsumed += consumed;
-        if (redis && redis.status === "ready") {
-          try {
-            await redis.set(
-              `key:auth:${token}`,
-              JSON.stringify(user),
-              "EX",
-              600,
-            );
-            await redis.incrby(`budget:consumed:${user.keyId}`, consumed);
-          } catch (err) {
-            console.error("[Proxy] Budget update failed:", err);
-          }
-        }
-      }
-    };
 
     if (!body.stream) {
       const responseData: any = await response.json();
@@ -1732,6 +1739,15 @@ chatRouter.post(
           `[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`,
         );
         if (!outputSafety.allowed && outputSafety.violation) {
+          await TokenBudgetGuard.rollbackReservation({
+            authMode,
+            sessionCode: finalSessionCode,
+            studentId: finalStudentId,
+            token,
+            keyId: user?.keyId,
+            reservedTokens: reservation.reservedTokens,
+            user,
+          });
           const v = outputSafety.violation;
           await logStudentError(
             finalSessionCode,
@@ -1792,7 +1808,18 @@ chatRouter.post(
         ).catch((e) => console.error("[Queue Evaluation] Error:", e));
       }
 
-      await recordTokenUsage(totalConsumed);
+      const usageResult = await TokenBudgetGuard.finalizeUsage({
+        authMode,
+        sessionCode: finalSessionCode,
+        studentId: finalStudentId,
+        token,
+        keyId: user?.keyId,
+        reservedTokens: reservation.reservedTokens,
+        actualOutputTokens: Math.max(0, totalConsumed - inputTokens),
+        allowedOutputTokens: reservation.allowedOutputTokens,
+        user,
+      });
+      totalConsumed = usageResult.totalCharged;
 
       const requestEndTime = Date.now();
       logStudentInteraction(
@@ -2099,20 +2126,20 @@ chatRouter.post(
           }
           const currentOutputTokensApprox =
             outputTokens + Math.ceil(accumulatedDeltaText.length / 4);
-          const totalConsumed = inputTokens + currentOutputTokensApprox;
 
-          if (totalConsumed >= remainingBudget) {
-            // Flush remaining text for exact final token count
+          if (currentOutputTokensApprox >= reservation.allowedOutputTokens) {
+            upstreamAbortController.abort();
             outputTokens += countTokens(accumulatedDeltaText);
             accumulatedDeltaText = "";
-            const exactTotalConsumed = inputTokens + outputTokens;
+            const exactOutputTokens = Math.min(outputTokens, reservation.allowedOutputTokens);
+            const exactTotalConsumed = inputTokens + exactOutputTokens;
             const errorChunk = {
               choices: [
                 {
                   index: 0,
                   delta: {
                     content:
-                      "\n\n**[Proxy Notice: Token limit exceeded for this session. Response truncated.]**\n\n",
+                      "\n\n**[Proxy Notice: Token budget limit reached for this session. Response stopped exactly at the ceiling.]**\n\n",
                   },
                   finish_reason: "length",
                 },
@@ -2124,7 +2151,7 @@ chatRouter.post(
               choices: [],
               usage: {
                 prompt_tokens: inputTokens,
-                completion_tokens: outputTokens,
+                completion_tokens: exactOutputTokens,
                 total_tokens: exactTotalConsumed,
               },
             };
@@ -2142,7 +2169,9 @@ chatRouter.post(
             await stream.writeSSE({ data: JSON.stringify(stopChunk) });
             await stream.writeSSE({ data: "[DONE]" });
             await stream.close();
-            reader.cancel();
+            try {
+              reader.cancel();
+            } catch (_) {}
             isTerminated = true;
             return;
           }
@@ -2243,11 +2272,37 @@ chatRouter.post(
           `\x1b[36m[Proxy]\x1b[0m ➔ Completed | Total: ${totalConsumed} tokens`,
         );
         if (!wasBlockedByGuardrail) {
-          await recordTokenUsage(totalConsumed);
+          const usageResult = await TokenBudgetGuard.finalizeUsage({
+            authMode,
+            sessionCode: finalSessionCode,
+            studentId: finalStudentId,
+            token,
+            keyId: user?.keyId,
+            reservedTokens: reservation.reservedTokens,
+            actualOutputTokens: finalOutputTokens,
+            allowedOutputTokens: reservation.allowedOutputTokens,
+            user,
+          });
+          totalConsumed = usageResult.totalCharged;
+          finalOutputTokens = Math.max(0, totalConsumed - inputTokens);
+          console.log(
+            `\x1b[36m[Proxy]\x1b[0m ➔ Completed | Total: ${totalConsumed} tokens`,
+          );
         } else {
           console.log(
             `\x1b[33m[Proxy]\x1b[0m ➔ Blocked by Guardrail | Charged 0 tokens`,
           );
+          await TokenBudgetGuard.rollbackReservation({
+            authMode,
+            sessionCode: finalSessionCode,
+            studentId: finalStudentId,
+            token,
+            keyId: user?.keyId,
+            reservedTokens: reservation.reservedTokens,
+            user,
+          });
+          totalConsumed = 0;
+          finalOutputTokens = 0;
         }
 
         if (!isInlineCompletion) {

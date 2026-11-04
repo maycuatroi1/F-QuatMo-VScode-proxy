@@ -771,6 +771,7 @@ export async function syncAllDataToRedis() {
           sessionCode: session.sessionCode,
           hasLoggedIn: "true",
           tokensConsumed: String(state.tokensConsumed || 0),
+          consumed: String(state.tokensConsumed || 0),
           budget: String(session.defaultTokenBudget || 100000000),
           latestClassification: state.latestClassification || "none",
         });
