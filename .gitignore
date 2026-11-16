@@ -54,6 +54,7 @@ bun-debug.log*
 **/tests/
 !quatmo-proxy/tests/
 quatmo-proxy/tests/*
+!quatmo-proxy/tests/admin-jsonl-parser.test.ts
 !quatmo-proxy/tests/iem-policy.test.ts
 .npm
 .eslintcache

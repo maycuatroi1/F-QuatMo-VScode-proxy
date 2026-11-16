@@ -42,6 +42,40 @@ function toMs(ts: any): number | null {
   return n < 1e11 ? n * 1000 : n;
 }
 
+/** Parse JSONL without allocating a second full-size line array for large telemetry logs. */
+export function appendJsonLines(content: string, target: any[]): void {
+  let lineStart = 0;
+  for (let index = 0; index <= content.length; index++) {
+    if (index !== content.length && content.charCodeAt(index) !== 10) continue;
+    const line = content.slice(lineStart, index).trim();
+    lineStart = index + 1;
+    if (!line) continue;
+    try {
+      target.push(JSON.parse(line));
+    } catch {
+      // Logs are best-effort: retain valid telemetry around malformed lines.
+    }
+  }
+}
+
+function hasNonEmptyLine(content: string): boolean {
+  for (let index = 0; index < content.length; index++) {
+    if (content.charCodeAt(index) > 32) return true;
+  }
+  return false;
+}
+
+function countNonEmptyLines(content: string): number {
+  let count = 0;
+  let lineStart = 0;
+  for (let index = 0; index <= content.length; index++) {
+    if (index !== content.length && content.charCodeAt(index) !== 10) continue;
+    if (content.slice(lineStart, index).trim()) count++;
+    lineStart = index + 1;
+  }
+  return count;
+}
+
 declare const Bun: any;
 import {
   lecturerAccounts,
@@ -2307,15 +2341,8 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
                   foundEvents = true;
                   try {
                     const content = await fs.promises.readFile(full, "utf-8");
-                    const lines = content.split("\n");
                     const recs: any[] = [];
-                    for (const l of lines) {
-                      const trimmed = l.trim();
-                      if (!trimmed) continue;
-                      try {
-                        recs.push(JSON.parse(trimmed));
-                      } catch {}
-                    }
+                    appendJsonLines(content, recs);
                     if (recs.length > 0) {
                       if (
                         sessionBeginTime ||
@@ -2436,7 +2463,7 @@ adminRouter.get("/visualize/sessions/:sessionCode/accounts", async (c) => {
                         "events.jsonl",
                       );
                       if (typeof evRaw === "string") {
-                        const cnt = evRaw.split("\n").filter((l) => l.trim().length > 0).length;
+                        const cnt = countNonEmptyLines(evRaw);
                         if (cnt > 0) {
                           s3EventCount = (s3EventCount || 0) + cnt;
                         }
@@ -2673,26 +2700,8 @@ async function loadEventLogFromS3(
             Object.assign(mergedInitialFiles, readZipTextEntriesSafely(zip));
           } catch {}
         }
-        if (typeof evRaw === "string") {
-          for (const line of evRaw.split("\n")) {
-            const trimmed = line.trim();
-            if (trimmed) {
-              try {
-                allCore.push(JSON.parse(trimmed));
-              } catch {}
-            }
-          }
-        }
-        if (typeof aRaw === "string") {
-          for (const line of aRaw.split("\n")) {
-            const trimmed = line.trim();
-            if (trimmed) {
-              try {
-                allAi.push(JSON.parse(trimmed));
-              } catch {}
-            }
-          }
-        }
+        if (typeof evRaw === "string") appendJsonLines(evRaw, allCore);
+        if (typeof aRaw === "string") appendJsonLines(aRaw, allAi);
       }
 
       const seenCore = new Set<string>();
@@ -2746,24 +2755,8 @@ async function loadEventLogFromS3(
         metadata = JSON.parse(metaRaw);
       } catch {}
     }
-    if (typeof eventsRaw === "string") {
-      for (const line of eventsRaw.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          coreRecords.push(JSON.parse(trimmed));
-        } catch {}
-      }
-    }
-    if (typeof aiRaw === "string") {
-      for (const line of aiRaw.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          aiRecords.push(JSON.parse(trimmed));
-        } catch {}
-      }
-    }
+    if (typeof eventsRaw === "string") appendJsonLines(eventsRaw, coreRecords);
+    if (typeof aiRaw === "string") appendJsonLines(aiRaw, aiRecords);
     if (Buffer.isBuffer(zipBuffer)) {
       try {
         const zip = new AdmZip(zipBuffer);
@@ -3033,27 +3026,13 @@ adminRouter.get(
                 if (fs.existsSync(evPath)) {
                   try {
                     const content = await fs.promises.readFile(evPath, "utf-8");
-                    for (const line of content.split("\n")) {
-                      const trimmed = line.trim();
-                      if (trimmed) {
-                        try {
-                          allCore.push(JSON.parse(trimmed));
-                        } catch {}
-                      }
-                    }
+                    appendJsonLines(content, allCore);
                   } catch {}
                 }
                 if (fs.existsSync(aiPath)) {
                   try {
                     const content = await fs.promises.readFile(aiPath, "utf-8");
-                    for (const line of content.split("\n")) {
-                      const trimmed = line.trim();
-                      if (trimmed) {
-                        try {
-                          allAi.push(JSON.parse(trimmed));
-                        } catch {}
-                      }
-                    }
+                    appendJsonLines(content, allAi);
                   } catch {}
                 }
               }
@@ -3099,10 +3078,7 @@ adminRouter.get(
                   try {
                     if (fs.existsSync(evFile)) {
                       const content = await fs.promises.readFile(evFile, "utf-8");
-                      const lines = content
-                        .split("\n")
-                        .filter((l) => l.trim().length > 0);
-                      if (lines.length > 0) {
+                      if (hasNonEmptyLine(content)) {
                         targetRecordId = rId;
                         break;
                       }
@@ -3130,28 +3106,14 @@ adminRouter.get(
               if (fs.existsSync(eventsPath)) {
                 try {
                   const content = await fs.promises.readFile(eventsPath, "utf-8");
-                  const lines = content.split("\n");
-                  for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-                    try {
-                      coreRecords.push(JSON.parse(trimmed));
-                    } catch {}
-                  }
+                  appendJsonLines(content, coreRecords);
                 } catch {}
               }
 
               if (fs.existsSync(aiPath)) {
                 try {
                   const content = await fs.promises.readFile(aiPath, "utf-8");
-                  const lines = content.split("\n");
-                  for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-                    try {
-                      aiRecords.push(JSON.parse(trimmed));
-                    } catch {}
-                  }
+                  appendJsonLines(content, aiRecords);
                 } catch {}
               }
 

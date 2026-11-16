@@ -16,9 +16,12 @@ export interface IemUpdateEventPayload {
   confidence: number;
   iScoreS?: number;
   eScoreS?: number;
+  iScoreSRaw?: number;
+  eScoreSRaw?: number;
   iScoreTurn?: number;
   eScoreTurn?: number;
   windowSize?: number;
+  featureSchema?: string;
   timestamp?: number;
 }
 

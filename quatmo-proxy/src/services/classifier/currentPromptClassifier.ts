@@ -4,6 +4,7 @@ import {
   deriveIemLabel,
   EXECUTIVE_WEIGHTS,
   INSTRUMENTAL_WEIGHTS,
+  isDelegationRequest,
 } from "./features";
 
 export type IemLabel = "instrumental" | "mixed" | "executive";
@@ -27,9 +28,12 @@ function normalizeText(value: string): string {
 function activate(
   features: Record<string, number>,
   key: string,
-  level: number,
+  weightMap: Record<string, number>,
 ): void {
-  features[key] = Math.max(features[key] ?? 0, level);
+  const w = weightMap[key];
+  if (typeof w === "number" && w > 0) {
+    features[key] = w;
+  }
 }
 
 function scoreFeatures(
@@ -38,14 +42,13 @@ function scoreFeatures(
 ): number {
   return calculateSignalScore(
     Object.entries(weights)
-      .filter(([key]) => key.startsWith("i") || key.startsWith("e"))
-      .map(([key, weight]) => (features[key] ?? 0) * weight),
+      .filter(([key]) => (key.startsWith("i") || key.startsWith("e")) && (features[key] ?? 0) > 0)
+      .map(([, weight]) => weight),
   );
 }
 
 /**
- * Fast deterministic preflight classifier for student prompts.
- * Designed for low-latency preflight checks before streaming AI responses.
+ * Fast deterministic preflight/fallback classifier aligned with IEM v3 feature IDs.
  * Deep semantic evaluation and sliding window history are handled asynchronously
  * via evaluateTurnAndSession with the LLM evaluator.
  */
@@ -56,44 +59,91 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
   const hasCodeContext =
     /attached (context )?file|```|traceback|\b(line|error) \d+\b/i.test(text);
 
-  // Explicit delegation phrasing (e.g. "for me", "cho tôi", "làm hộ tôi", etc.)
   const hasExplicitDelegation =
-    /\b(for me|to me|give me|send me|show me|cho (?:tôi|tao|mình|em)|hộ (?:tôi|tao|mình|em)|giúp (?:tôi|tao|mình|em))\b/i.test(
+    isDelegationRequest(prompt) ||
+    /\b(for me|to me|do it all)\b/i.test(text) ||
+    /(?:viết giúp|làm giúp|code giúp|viết hộ|làm hộ|code hộ|giải hộ|giải giúp)/i.test(
       text,
     );
 
   // --- Instrumental Signals ---
   const asksExplanation =
-    /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|how can|how to|difference between|compare|meaning of|intuition behind)\b/i.test(
+    /\b(what is|what are|why|explain|describe|understand|concept|how does|how do|how can|how to|difference between|compare|meaning of|intuition behind|hint|guide)\b/i.test(
       text,
     ) ||
-    /(?:giải thích|là gì|tại sao|nguyên lý|ý nghĩa|khác nhau thế nào|hoạt động như thế nào|làm thế nào|cách làm|cách cài đặt|hướng dẫn)/i.test(
+    /(?:giải thích|là gì|tại sao|nguyên lý|ý nghĩa|khác nhau thế nào|hoạt động như thế nào|làm thế nào|cách làm|cách cài đặt|hướng dẫn|gợi ý)/i.test(
       text,
     );
+
+  const asksConceptualTopic =
+    /\b(algorithm|data structure|binary search|bubble sort|quick sort|merge sort|sorting|recursion|tree|graph|dp|dynamic programming|complexity|time complexity|space complexity|big o|theory|mechanism)\b/i.test(
+      text,
+    ) ||
+    /(?:thuật toán|cấu trúc dữ liệu|độ phức tạp|nguyên lý|bản chất|khái niệm)/i.test(
+      text,
+    );
+
+  const asksProblemUnderstanding =
+    /\b(documentation|official docs?|specification|reference guide|requirement|requirements|problem statement|problem scope|constraint|clarify)\b/i.test(
+      text,
+    ) || /(?:đề bài|hiểu bài|yêu cầu bài)/i.test(text);
+
+  const asksExample =
+    /\b(example|minimal demo|sample|illustrate|illustration)\b/i.test(text) ||
+    /(?:ví dụ|minh họa)/i.test(text);
+
+  const asksErrorInterpretation =
+    /\b(why\b.*error|root cause|what causes|diagnose|understand (?:the )?error|meaning of (?:this )?traceback|why is (?:my|this) (?:code )?(?:fail|error|wrong|broken)|what is wrong)\b/i.test(
+      text,
+    ) ||
+    /(?:nguyên nhân lỗi|lỗi này nghĩa là gì|tại sao.*lỗi)/i.test(text);
+
+  const asksVerification =
+    /\b(is this (?:approach|way|idea|logic)|is my (?:approach|thought|solution|understanding|code)|am i on the right track|am i right|validate (?:my|this)|check my (?:code|logic|solution)|review my|feedback|scan my code|point out any issues)\b/i.test(
+      text,
+    ) ||
+    /(?:kiểm tra giúp|xem giúp|logic này đúng không|cách này ổn không|tôi làm thế này có đúng không)/i.test(
+      text,
+    );
+
+  const asksSyntaxOrHint =
+    /\b(hint|guide me|how to approach|where is\b|how do i write|how (?:do|can) i use|syntax|api|library|package|function signature|parameter|argument)\b/i.test(
+      text,
+    ) || /(?:gợi ý|cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text);
 
   // --- Executive Signals ---
-  const asksDirectCreation =
-    (
-      /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website)\b/i.test(
-        text,
-      ) &&
-      (!asksExplanation || hasExplicitDelegation)
-    ) ||
-    /\bwrite (?:me )?(?:a |an |the )?(?:full |complete )?(?:code|script|function|program|solution|implementation|app)\b/i.test(
+  const delegatesFix =
+    /\b(fix|repair|correct|solve|debug) (?:this|my|the|it) for me\b/i.test(
       text,
     ) ||
-    /\b(give|provide|send) (?:me )?(?:a |the )?(?:complete |full )?(?:code|script|solution|implementation)\b/i.test(
+    /\b(make it work|fix it for me|do it for me|solve it for me|rewrite (?:it|both|my code))\b/i.test(
       text,
     ) ||
-    /(?:viết|code|tạo|làm|xây dựng|viết giúp|làm giúp|code giúp|viết hộ|làm hộ|code hộ|giải bài).{0,30}(?:code|hàm|function|chương trình|bài|script|dự án|project|app|web|trang web|thuật toán|giúp tôi|hộ tôi)/i.test(
-      text,
-    ) ||
-    /(?:code cho (?:tôi|tao|mình|em)|viết cho (?:tôi|tao|mình|em)|làm bài này|giải bài này|viết code)/i.test(
+    /\bjust (?:fix|correct|solve) (?:it|this|my code)\b/i.test(text) ||
+    /(?:sửa (?:giúp|hộ|cho)|fix (?:giúp|hộ|cho)|sửa lỗi này|làm cho nó chạy)/i.test(
       text,
     );
 
+  const asksDirectCreation =
+    ((
+      /\b(write|create|build|implement|generate|rewrite|complete|finish|code)\b.{0,50}\b(code|file|script|function|class|method|module|app|application|project|solution|program|algorithm|view|model|controller|component|template|page|website|route)\b/i.test(
+        text,
+      ) &&
+      (!asksExplanation || hasExplicitDelegation) &&
+      !/\bhint\b/i.test(text)
+    ) ||
+      /\bwrite (?:me )?(?:a |an |the )?(?:full |complete )?(?:code|script|function|program|solution|implementation|app)\b/i.test(
+        text,
+      ) ||
+      /(?:viết|code|tạo|làm|xây dựng|giải bài).{0,30}(?:code|hàm|function|chương trình|bài|script|dự án|project|app|web|trang web|thuật toán|giúp tôi|hộ tôi)/i.test(
+        text,
+      ) ||
+      /(?:code cho (?:tôi|tao|mình|em)|viết cho (?:tôi|tao|mình|em)|làm bài này|giải bài này|viết code)/i.test(
+        text,
+      ));
+
   const asksDirectAnswer =
-    /\b(give|show|send|provide|tell) (?:me )?(?:the )?(?:exact |full |complete )?(?:code|solution|answer|result)\b/i.test(
+    /\b(give|show|send|provide|tell) (?:me )?(?:the )?(?:exact |full |complete )?(?:solution|answer)\b/i.test(
       text,
     ) ||
     /\bwhat is the (?:solution|answer|complete code|full solution)\b/i.test(
@@ -102,154 +152,100 @@ export function classifyCurrentPrompt(prompt: string): CurrentPromptDecision {
     /\b(solve|do) (?:this|the) (?:problem|exercise|assignment|task|question)\b/i.test(
       text,
     ) ||
-    /(?:cho (?:tôi|tao|mình|em) (?:code|đáp án|lời giải|kết quả)|đưa code|cho xin code|giải hộ)/i.test(
+    /(?:cho (?:tôi|tao|mình|em) (?:đáp án|lời giải)|cho xin full code bài|giải hộ bài)/i.test(
       text,
     );
 
-  const delegatesFix =
-    /\b(fix|repair|correct|solve|debug) (?:this|my|the|it) for me\b/i.test(
-      text,
-    ) ||
-    /\b(make it work|fix it for me|do it for me|solve it for me)\b/i.test(
-      text,
-    ) ||
-    /\bjust (?:fix|correct|solve) (?:it|this|my code)\b/i.test(text) ||
-    /(?:sửa (?:giúp|hộ|cho)|fix (?:giúp|hộ|cho)|sửa lỗi này|làm cho nó chạy|sửa code)/i.test(
-      text,
-    );
-
-  // Instrumental Feature Activations (i1 - i8)
-  if (asksExplanation) activate(features, "i1", 0.75);
-
-  if (
-    /\b(syntax|api|library|package|method|function signature|command|how (?:do|can) i use|usage of|parameter|argument|reference guide|in python|in c\+\+|in java|in javascript|in js|in ts|in c|bằng python|trong python|bằng c|bằng java)\b/i.test(
-      text,
-    ) ||
-    /(?:cú pháp|cách dùng hàm|tham số|cách sử dụng)/i.test(text)
-  ) {
-    activate(features, "i2", 0.75);
-  }
-
+  // --- Map Instrumental Prompt Features (i1 - i8) cleanly ---
   if (
     asksExplanation &&
-    /\b(algorithm|data structure|binary search|bubble sort|quick sort|merge sort|sorting|recursion|tree|graph|dp|dynamic programming|thuật toán|cấu trúc dữ liệu)\b/i.test(
-      text,
-    )
+    !hasCodeContext &&
+    !asksConceptualTopic &&
+    !asksProblemUnderstanding &&
+    !asksVerification
   ) {
-    activate(features, "i3", 0.85);
+    activate(features, "i1", INSTRUMENTAL_WEIGHTS);
   }
-
-  if (
-    (/\b(why\b|root cause|what causes|diagnose|concept|meaning of|intuition behind|theory|mechanism|understand (?:the )?error|meaning of (?:this )?traceback|exception|stack trace)\b/i.test(
-      text,
-    ) ||
-      /(?:tại sao|nguyên lý|ý nghĩa|bản chất|khái niệm|nguyên nhân lỗi|lỗi này nghĩa là gì)/i.test(text)) &&
-    !delegatesFix
-  ) {
-    activate(features, "i3", 0.85);
-  }
-
-  if (
-    /\b(documentation|official docs?|specification|reference guide|man page|docs for|problem statement|problem understanding|đề bài|hiểu bài)\b/i.test(
-      text,
-    )
-  ) {
-    activate(features, "i4", 0.75);
-  }
-
   if (
     hasCodeContext &&
-    /\b(review|feedback|where (?:is|did)|why is (?:my|this)|what is wrong with my|analyze my)\b/i.test(
-      text,
-    ) &&
-    !delegatesFix
+    (asksExplanation || asksErrorInterpretation || asksVerification || asksSyntaxOrHint) &&
+    !delegatesFix &&
+    !asksDirectCreation
   ) {
-    activate(features, "i5", 0.75);
+    activate(features, "i2", INSTRUMENTAL_WEIGHTS);
+  }
+  if (asksExplanation && asksConceptualTopic) {
+    activate(features, "i3", INSTRUMENTAL_WEIGHTS);
+  }
+  if (asksProblemUnderstanding) {
+    activate(features, "i4", INSTRUMENTAL_WEIGHTS);
+  }
+  if (asksExample && !asksDirectCreation && !hasExplicitDelegation) {
+    activate(features, "i5", INSTRUMENTAL_WEIGHTS);
+  }
+  if (asksErrorInterpretation && !delegatesFix) {
+    activate(features, "i6", INSTRUMENTAL_WEIGHTS);
+  }
+  if (asksVerification) {
+    activate(features, "i7", INSTRUMENTAL_WEIGHTS);
+  }
+  if (
+    asksSyntaxOrHint &&
+    !hasExplicitDelegation &&
+    !delegatesFix &&
+    (!asksDirectCreation || /\b(hint|how can|how to|how do i|cách cài đặt|hướng dẫn|gợi ý)\b/i.test(text))
+  ) {
+    activate(features, "i8", INSTRUMENTAL_WEIGHTS);
   }
 
+  // --- Map Executive Prompt Features (e1 - e6) cleanly ---
+  if (asksDirectCreation && !asksVerification) {
+    activate(features, "e1", EXECUTIVE_WEIGHTS);
+  }
   if (
-    /\b(architecture|structure|design pattern|how to organize|modularity|database schema|data structure choice)\b/i.test(
+    hasExplicitDelegation ||
+    asksDirectAnswer ||
+    /\b(i am stuck|i'm stuck|cannot do|can't do|do everything|do it for me|you do it|just do it for me|write it all for me)\b/i.test(
       text,
     ) ||
-    /(?:kiến trúc|cấu trúc thư mục|thiết kế database)/i.test(text)
+    /(?:làm hết hộ|giải hết|làm từ a đến z|làm giúp từ đầu)/i.test(text)
   ) {
-    activate(features, "i6", 0.75);
+    activate(features, "e2", EXECUTIVE_WEIGHTS);
   }
-
-  if (
-    /\b(is this (?:approach|way|idea|logic)|is my (?:approach|thought|solution|understanding)|am i on the right track|am i right|validate (?:my|this)|check my logic)\b/i.test(
-      text,
-    ) ||
-    /(?:logic này đúng không|cách này ổn không|tôi làm thế này có đúng không)/i.test(
-      text,
-    )
-  ) {
-    activate(features, "i7", 0.75);
-  }
-
-  if (
-    /\b(complexity|time complexity|space complexity|big o|optimize|how to improve efficiency|refactor advice|clean code|độ phức tạp)\b/i.test(
-      text,
-    )
-  ) {
-    activate(features, "i8", 0.75);
-  }
-
-  if (
-    asksExplanation &&
-    /\b(implement|code|write|algorithm|function|class|cài đặt|viết code|thuật toán)\b/i.test(text) &&
-    !hasExplicitDelegation
-  ) {
-    activate(features, "i8", 0.75);
-  }
-
-  // Executive Feature Activations (e1 - e6)
   if (
     text.length >= 200 &&
     /\b(requirements?|assignment|task|acceptance criteria|problem statement|input format|output format|sample input|sample output|test case|bài tập|đề bài|yêu cầu bài)\b/i.test(
       text,
     ) &&
-    !asksExplanation
+    !asksExplanation &&
+    !asksProblemUnderstanding
   ) {
-    activate(features, "e1", 0.85);
+    activate(features, "e3", EXECUTIVE_WEIGHTS);
   }
-
-  if (asksDirectCreation) activate(features, "e2", 1.0);
-  if (asksDirectAnswer) activate(features, "e3", 1.0);
-  if (delegatesFix) activate(features, "e4", 1.0);
-
-  if (
-    /\b(give me |provide |generate )(?:a |the )?(?:boilerplate|scaffold|starter template|ready-made|skeleton project|config file)\b/i.test(
-      text,
-    )
-  ) {
-    activate(features, "e5", 0.75);
+  if (delegatesFix && !asksVerification) {
+    activate(features, "e5", EXECUTIVE_WEIGHTS);
   }
-
   if (
-    /\b(i am stuck|i'm stuck|cannot do|can't do|do everything|make it work|do it for me|you do it|just do it for me|write it all for me)\b/i.test(
+    /(?:traceback|assertionerror|syntaxerror|typeerror|nameerror|valueerror|returncode|exit code)/i.test(
       text,
-    ) ||
-    /(?:làm hết hộ|giải hết|làm từ a đến z|làm giúp từ đầu)/i.test(text)
+    ) &&
+    !asksExplanation &&
+    !asksErrorInterpretation &&
+    !asksVerification &&
+    !delegatesFix
   ) {
-    activate(features, "e6", 1.0);
+    activate(features, "e6", EXECUTIVE_WEIGHTS);
   }
 
   const instrumentalScore = scoreFeatures(features, INSTRUMENTAL_WEIGHTS);
   const executiveScore = scoreFeatures(features, EXECUTIVE_WEIGHTS);
 
-  // Apply the exact 3-Gate threshold rules from Research Paper Section III-D:
-  // G_instrumental: I >= HIGH (0.55) && E < MID (0.45) && (I - E) >= MARGIN (0.15)
-  // G_executive:    E >= HIGH (0.55) && I < MID (0.45) && (E - I) >= MARGIN (0.15)
-  // G_conflict:     I >= MID (0.45) && E >= MID (0.45) -> mixed
-  // G_ambiguous:    fallback -> mixed
-  const rawLabel = deriveIemLabel(instrumentalScore, executiveScore);
-  const label: IemLabel =
-    rawLabel === "instrumental" || rawLabel === "executive"
-      ? rawLabel
-      : "mixed";
-
-  const confidence = calculateIemConfidence(rawLabel, instrumentalScore, executiveScore);
+  const label: IemLabel = deriveIemLabel(instrumentalScore, executiveScore);
+  const confidence = calculateIemConfidence(
+    label,
+    instrumentalScore,
+    executiveScore,
+  );
 
   return {
     label,

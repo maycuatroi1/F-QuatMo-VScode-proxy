@@ -5,11 +5,17 @@ export interface TurnLog {
   prompt: string;
   response: string;
   codeSnapshot?: string;
+  activeFilePath?: string;
   terminalOutput?: string;
   lastTerminalCommand?: string;
+  commandType?: string;
+  terminalTimestamp?: number;
   I_score: number;
   E_score: number;
+  I_score_raw?: number;
+  E_score_raw?: number;
   featureVector?: Record<string, number>;
+  schemaVersion?: string;
 }
 
 export interface ClientContext {
@@ -31,6 +37,7 @@ export interface ClientContext {
     output: string;
     lastCommand?: string;
     exitCode?: number;
+    commandType?: string;
     timestamp: number;
   };
 }
@@ -46,7 +53,7 @@ const CLIENT_CONTEXT_TTL_SEC = 120;
 const TURNS_TTL_SEC = 18000;
 const LATEST_CLASS_TTL_SEC = 300;
 const EVAL_PENDING_TTL_SEC = parseInt(
-  process.env.EVAL_PENDING_TTL_SEC || "120",
+  process.env.EVAL_PENDING_TTL_SEC || "180",
   10,
 );
 

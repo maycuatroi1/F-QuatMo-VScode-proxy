@@ -255,6 +255,44 @@ chatRouter.get("/latest-classification", unifiedAuthMiddleware(), async (c) => {
   return c.json(result);
 });
 
+async function resolveTerminalActivity(
+  sessionCode: string,
+  studentId: string,
+  recentTerminal: any,
+  terminalOutput: any,
+) {
+  if (recentTerminal) {
+    if (recentTerminal.timestamp !== undefined) {
+      return recentTerminal;
+    }
+    const existing = await redisStore
+      .getClientContext(sessionCode, studentId)
+      .catch(() => null);
+    if (
+      existing?.recentTerminal &&
+      existing.recentTerminal.output === recentTerminal.output &&
+      existing.recentTerminal.lastCommand === recentTerminal.lastCommand
+    ) {
+      return {
+        ...recentTerminal,
+        timestamp: existing.recentTerminal.timestamp,
+      };
+    }
+    return recentTerminal;
+  }
+  if (!terminalOutput) return undefined;
+  const existing = await redisStore
+    .getClientContext(sessionCode, studentId)
+    .catch(() => null);
+  if (
+    existing?.recentTerminal &&
+    existing.recentTerminal.output === terminalOutput
+  ) {
+    return existing.recentTerminal;
+  }
+  return { output: terminalOutput, timestamp: Date.now() };
+}
+
 chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
   const token = c.get("token");
   if (!token) {
@@ -287,11 +325,12 @@ chatRouter.post("/client-context", unifiedAuthMiddleware(), async (c) => {
 
   const { activeFile, recentPaste, files, recentTerminal, terminalOutput } =
     body;
-  const terminalActivity =
-    recentTerminal ||
-    (terminalOutput
-      ? { output: terminalOutput, timestamp: Date.now() }
-      : undefined);
+  const terminalActivity = await resolveTerminalActivity(
+    sessionCode,
+    studentId,
+    recentTerminal,
+    terminalOutput,
+  );
   await redisStore.saveClientContext(sessionCode, studentId, {
     activeFile,
     recentPaste,
@@ -506,6 +545,10 @@ async function logStudentInteraction(
     clientContext?.recentTerminal?.lastCommand ||
     body?.recentTerminal?.lastCommand ||
     "";
+  const commandType =
+    clientContext?.recentTerminal?.commandType ||
+    body?.recentTerminal?.commandType ||
+    undefined;
 
   // Clean CLASSIFIER_RESULT prefix from completionText
   const cleanCompletion = completionText
@@ -664,6 +707,9 @@ async function logStudentInteraction(
         if (lastTerminalCommand) {
           lastEntry.lastTerminalCommand = lastTerminalCommand;
         }
+        if (commandType) {
+          lastEntry.commandType = commandType;
+        }
         if (
           finalLabel &&
           finalLabel !== "none" &&
@@ -713,6 +759,7 @@ async function logStudentInteraction(
           codeSnapshots,
           terminalOutput,
           lastTerminalCommand,
+          ...(commandType ? { commandType } : {}),
         };
 
         if (toolCalls.length > 0) {
@@ -743,21 +790,22 @@ async function logStudentInteraction(
         await logSession(safeSessionCode, safeStudentId, sessionEntry);
       }
       if (s3Storage.isAvailable() && currentLogsSnapshot.length > 0) {
-        void s3Storage.uploadStudentPromptLog(
-          safeSessionCode,
-          safeStudentId,
-          currentLogsSnapshot,
-        );
+        await s3Storage
+          .uploadStudentPromptLog(
+            safeSessionCode,
+            safeStudentId,
+            currentLogsSnapshot,
+          )
+          .catch((e) => console.warn("[Logger] S3 upload error:", e));
       }
     } else {
       if (sessionEntry) {
         await logGuest(safeLogIdentifier, sessionEntry);
       }
       if (s3Storage.isAvailable() && currentLogsSnapshot.length > 0) {
-        void s3Storage.uploadGuestPromptLog(
-          safeLogIdentifier,
-          currentLogsSnapshot,
-        );
+        await s3Storage
+          .uploadGuestPromptLog(safeLogIdentifier, currentLogsSnapshot)
+          .catch((e) => console.warn("[Logger] Guest S3 upload error:", e));
       }
     }
   } catch (err) {
@@ -1145,11 +1193,12 @@ chatRouter.post(
     const policyPrompt = messageText(latestRealUserMessage);
     // Auto-save client context if provided in body or auto-extracted from prompt
     const extractedCode = extractCodeSnapshot(body, policyPrompt);
-    const terminalActivity =
-      body.recentTerminal ||
-      (body.terminalOutput
-        ? { output: body.terminalOutput, timestamp: Date.now() }
-        : undefined);
+    const terminalActivity = await resolveTerminalActivity(
+      finalSessionCode,
+      finalStudentId,
+      body.recentTerminal,
+      body.terminalOutput,
+    );
     if (body.activeFile || body.files || terminalActivity) {
       await redisStore
         .saveClientContext(finalSessionCode, finalStudentId, {
@@ -1455,6 +1504,12 @@ chatRouter.post(
     );
     const userPrompt = shouldClassify ? policyPrompt : "";
 
+    let pendingCleared = false;
+    const clearPendingEval = () => {
+      if (!shouldClassify || pendingCleared) return Promise.resolve();
+      pendingCleared = true;
+      return redisStore.setEvaluationPending(token, false).catch(() => {});
+    };
     if (shouldClassify) {
       await redisStore.setEvaluationPending(token, true).catch(() => {});
     }
@@ -1531,6 +1586,7 @@ chatRouter.post(
     );
 
     if (!reservation.allowed) {
+      void clearPendingEval();
       const errorMsg =
         reservation.message || "Monthly token budget exceeded. Access Denied.";
       await logStudentError(
@@ -1628,6 +1684,7 @@ chatRouter.post(
         `[Perf] Connected to upstream LLM in ${mainLlmDuration.toFixed(0)}ms`,
       );
     } catch (err: any) {
+      void clearPendingEval();
       await TokenBudgetGuard.rollbackReservation({
         authMode,
         sessionCode: finalSessionCode,
@@ -1663,6 +1720,7 @@ chatRouter.post(
     }
 
     if (!response.ok) {
+      void clearPendingEval();
       await TokenBudgetGuard.rollbackReservation({
         authMode,
         sessionCode: finalSessionCode,
@@ -1739,6 +1797,7 @@ chatRouter.post(
           `[Perf] Output safety check took ${outputSafetyDuration.toFixed(0)}ms`,
         );
         if (!outputSafety.allowed && outputSafety.violation) {
+          void clearPendingEval();
           await TokenBudgetGuard.rollbackReservation({
             authMode,
             sessionCode: finalSessionCode,
@@ -1790,24 +1849,6 @@ chatRouter.post(
         }
       }
 
-      // Only inject classifier into plain text replies.
-      if (
-        shouldClassify &&
-        responseData.choices?.[0]?.message &&
-        !hasToolCalls
-      ) {
-        const completionText = responseData.choices[0].message.content || "";
-        queueEvaluation(
-          finalSessionCode,
-          finalStudentId,
-          token,
-          userPrompt,
-          completionText,
-          body.messages,
-          activeConversationId,
-        ).catch((e) => console.error("[Queue Evaluation] Error:", e));
-      }
-
       const usageResult = await TokenBudgetGuard.finalizeUsage({
         authMode,
         sessionCode: finalSessionCode,
@@ -1821,33 +1862,58 @@ chatRouter.post(
       });
       totalConsumed = usageResult.totalCharged;
 
+      const completionText = responseData.choices?.[0]?.message?.content || "";
+      const willClassify =
+        shouldClassify &&
+        !!responseData.choices?.[0]?.message &&
+        !hasToolCalls;
+      if (!willClassify) {
+        void clearPendingEval();
+      }
+
       const requestEndTime = Date.now();
-      logStudentInteraction(
-        finalSessionCode,
-        finalStudentId,
-        currentAiOption,
-        user?.monthlyTokenLimit || 0,
-        body,
-        responseData.choices?.[0]?.message?.content || "",
-        inputTokens,
-        totalConsumed - inputTokens,
-        totalConsumed,
-        classifierLabel,
-        classifierConfidence,
-        responseData.choices?.[0]?.message?.tool_calls,
-        authMode === "session",
-        machineId,
-        activeConversationId,
-        requestStartTime,
-        requestEndTime,
-      ).catch((err) =>
-        console.error("[Logger] Non-stream logging error:", err),
-      );
+      void (async () => {
+        try {
+          await logStudentInteraction(
+            finalSessionCode,
+            finalStudentId,
+            currentAiOption,
+            user?.monthlyTokenLimit || 0,
+            body,
+            completionText,
+            inputTokens,
+            totalConsumed - inputTokens,
+            totalConsumed,
+            classifierLabel,
+            classifierConfidence,
+            responseData.choices?.[0]?.message?.tool_calls,
+            authMode === "session",
+            machineId,
+            activeConversationId,
+            requestStartTime,
+            requestEndTime,
+          );
+        } catch (err) {
+          console.error("[Logger] Non-stream logging error:", err);
+        }
+        if (willClassify) {
+          await queueEvaluation(
+            finalSessionCode,
+            finalStudentId,
+            token,
+            userPrompt,
+            completionText,
+            body.messages,
+            activeConversationId,
+          ).catch((e) => console.error("[Queue Evaluation] Error:", e));
+        }
+      })();
 
       return c.json(responseData);
     }
 
     if (!response.body) {
+      void clearPendingEval();
       return c.json(
         { error: "Upstream response does not support streaming." },
         502,
@@ -1895,18 +1961,6 @@ chatRouter.post(
             ],
           };
           await stream.writeSSE({ data: JSON.stringify(flushChunk) });
-        }
-
-        if (shouldClassify && !hasAnyToolCalls) {
-          queueEvaluation(
-            finalSessionCode,
-            finalStudentId,
-            token,
-            userPrompt,
-            completionText,
-            body.messages,
-            activeConversationId,
-          ).catch((e) => console.error("[Queue Evaluation] Error:", e));
         }
 
         // Run output safety check asynchronously (non-blocking chunk delivery)
@@ -2305,27 +2359,54 @@ chatRouter.post(
           finalOutputTokens = 0;
         }
 
+        const willClassifyStream =
+          shouldClassify &&
+          !isInlineCompletion &&
+          !wasBlockedByGuardrail &&
+          !hasAnyToolCalls;
+        if (!willClassifyStream) {
+          void clearPendingEval();
+        }
         if (!isInlineCompletion) {
           const requestEndTime = Date.now();
-          logStudentInteraction(
-            finalSessionCode,
-            finalStudentId,
-            currentAiOption,
-            user?.monthlyTokenLimit || 0,
-            body,
-            completionText,
-            inputTokens,
-            finalOutputTokens,
-            totalConsumed,
-            classifierLabel,
-            classifierConfidence,
-            streamToolCalls.filter(Boolean),
-            authMode === "session",
-            machineId,
-            activeConversationId,
-            requestStartTime,
-            requestEndTime,
-          ).catch((err) => console.error("[Logger] Stream logging error:", err));
+          void (async () => {
+            if (!wasBlockedByGuardrail) {
+              try {
+                await logStudentInteraction(
+                  finalSessionCode,
+                  finalStudentId,
+                  currentAiOption,
+                  user?.monthlyTokenLimit || 0,
+                  body,
+                  completionText,
+                  inputTokens,
+                  finalOutputTokens,
+                  totalConsumed,
+                  classifierLabel,
+                  classifierConfidence,
+                  streamToolCalls.filter(Boolean),
+                  authMode === "session",
+                  machineId,
+                  activeConversationId,
+                  requestStartTime,
+                  requestEndTime,
+                );
+              } catch (err) {
+                console.error("[Logger] Stream logging error:", err);
+              }
+            }
+            if (willClassifyStream) {
+              await queueEvaluation(
+                finalSessionCode,
+                finalStudentId,
+                token,
+                userPrompt,
+                completionText,
+                body.messages,
+                activeConversationId,
+              ).catch((e) => console.error("[Queue Evaluation] Error:", e));
+            }
+          })();
         }
       }
     });

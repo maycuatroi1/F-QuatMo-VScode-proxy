@@ -1,707 +1,185 @@
-import { fastLineLCS } from "./algorithms";
-import type { ClientContext, TurnLog } from "./redisStore";
+import {
+  INSTRUMENTAL_WEIGHTS,
+  EXECUTIVE_WEIGHTS,
+  IEM_WINDOW_SIZE,
+  IEM_HIGH_THRESHOLD,
+  IEM_MID_THRESHOLD,
+  IEM_MARGIN_THRESHOLD,
+  IEM_DECISION_GATE,
+} from "./weights";
 
-// Define feature lists and their weights (Sec 12.1 - 12.4)
-export const INSTRUMENTAL_WEIGHTS: Record<string, number> = {
-  // 12.1. Instrumental Prompt Features (i1 - i8)
-  i1: 0.50, // inquire_no_context
-  i2: 0.85, // integrate_with_context
-  i3: 0.65, // conceptual_question
-  i4: 0.70, // problem_understanding
-  i5: 0.60, // example_request
-  i6: 0.80, // error_interpretation
-  i7: 0.75, // verification_request
-  i8: 0.45, // code_implementation_question_soft
+export {
+  NOMINAL_INSTRUMENTAL_WEIGHTS,
+  CALIBRATED_INSTRUMENTAL_WEIGHTS,
+  EMPIRICAL_DISTRIBUTION_NOISE_INSTRUMENTAL_WEIGHTS,
+  WOE_INSTRUMENTAL_WEIGHTS,
+  INSTRUMENTAL_WEIGHTS,
+  NOMINAL_EXECUTIVE_WEIGHTS,
+  CALIBRATED_EXECUTIVE_WEIGHTS,
+  EMPIRICAL_DISTRIBUTION_NOISE_EXECUTIVE_WEIGHTS,
+  WOE_EXECUTIVE_WEIGHTS,
+  EXECUTIVE_WEIGHTS,
+  IEM_DECISION_GATE,
+  IEM_WINDOW_SIZE,
+  IEM_HIGH_THRESHOLD,
+  IEM_MID_THRESHOLD,
+  IEM_MARGIN_THRESHOLD,
+  IEM_DOMINANT_SEPARATION,
+  FEATURE_DESCRIPTIONS,
+} from "./weights";
 
-  // 12.3. Instrumental Output Features (r1 - r6)
-  r1: 0.55, // tutor_role
-  r2: 0.75, // conceptual_explanation
-  r3: 0.75, // code_explanation
-  r4: 0.60, // example_only
-  r5: 0.70, // evaluator_feedback_only
-  r6: 0.85, // stepwise_hint
+export {
+  extractCodeBlocks,
+  extractCodeSnapshot,
+  extractFunctionSignatures,
+  normalizeCodeStructure,
+  calculateProgrammaticFeatures,
+  isDelegationRequest,
+  isExecutionEvidence,
+} from "./programmaticFeatures";
 
-  // Trajectory features (t1 - t5)
-  t1: 0.70, // sustained_inquiry_pattern
-  t2: 0.80, // self_correction_after_hint
-  t3: 0.65, // increasing_specificity_own_reasoning
-  t4: 0.70, // verification_loop
-  t5: 0.85, // rejection_of_full_solution_offer
+/** Online profile: 32 operational features (Prompt 14, Response 8, Trajectory 6, CodeDiff 4). */
+export const ONLINE_FEATURE_KEYS = [
+  "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8",
+  "e1", "e2", "e3", "e4", "e5", "e6",
+  "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8",
+  "t1", "t3", "t4", "t5", "t7", "t10",
+  "c1", "c3", "c5", "c8",
+] as const;
+export const FEATURE_SCHEMA = "fvs-codexgold-online-v3";
 
-  // Code-diff features (c1 - c5)
-  c1: 0.85, // high_student_modification_ratio
-  c2: 0.75, // incremental_small_step_changes
-  c3: 0.70, // structural_divergence_from_ai_suggestion
-  c4: 0.80, // test_driven_iteration
-  c5: 0.75, // own_algorithm_signature
+/** Reliability priors, NOT fitted accuracy estimates or pedagogical weights. */
+export const PROG_TRUST: Readonly<Record<string, number>> = {
+  e2: 0.70, // explicit, scoped implementation delegation only
+  t4: 1.00, // observed current execution record; absent record => abstain
+  t10: 1.00, // count >= 2 within current + four prior turns, using semantic e2
+  c1: 0.85, // current-side LCS coverage, comparable file and bounded work
+  c5: 0.00, // semantic ownership; copying is a separate evidence veto below
 };
+export const PROGRAMMATIC_TRUST_WEIGHTS = PROG_TRUST;
 
-export const EXECUTIVE_WEIGHTS: Record<string, number> = {
-  // 12.2. Executive Prompt Features (e1 - e6)
-  e1: 0.90, // code_generation_request
-  e2: 0.85, // delegate_request
-  e3: 0.80, // assignment_pasted
-  e4: 0.65, // code_pasted_no_question
-  e5: 0.75, // direct_correction_request
-  e6: 0.40, // results_pasted
-
-  // 12.4. Executive Output Features (r7 - r8)
-  r7: 0.85, // executor_role
-  r8: 0.95, // exact_solution_code
-
-  // Trajectory features (t6 - t10)
-  t6: 0.85, // repeated_copy_paste_pattern
-  t7: 0.80, // escalation_to_full_solution
-  t8: 0.60, // abandon_after_code_received
-  t9: 0.55, // minimal_effort_between_turns
-  t10: 0.75, // recurring_delegate_across_session
-
-  // Code-diff features (c6 - c10)
-  c6: 0.90, // exact_copy_ratio
-  c7: 0.90, // single_large_jump
-  c8: 0.85, // structural_identity_with_ai_output
-  c9: 0.80, // no_intermediate_edits
-  c10: 0.65, // zero_own_test_activity
-};
-
-export const IEM_WINDOW_SIZE = 5;
-
-export const IEM_HIGH_THRESHOLD = 0.55;
-export const IEM_MID_THRESHOLD = 0.45;
-export const IEM_MARGIN_THRESHOLD = 0.15;
-
-/**
- * Calculates the SignalScore for a list of weighted activation values.
- * Formula: min(1, v_1 + 0.35 * v_2 + 0.15 * sum(v_j for j >= 3))
- * where values are sorted descending.
- */
-export function calculateSignalScore(values: number[]): number {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((a, b) => b - a);
-  const v1 = sorted[0];
-  const v2 = sorted[1] || 0;
-  let sumRest = 0;
-  for (let i = 2; i < sorted.length; i++) {
-    sumRest += sorted[i];
-  }
-  return Math.min(1.0, v1 + 0.35 * v2 + 0.15 * sumRest);
-}
-
-export function calculateSessionSignalScore(scores: number[]): number {
-  const validScores = scores
-    .filter((score) => Number.isFinite(score))
-    .slice(-IEM_WINDOW_SIZE);
-  if (validScores.length === 0) return 0;
-
-  return calculateSignalScore(
-    validScores.map((score) => Math.max(0, Math.min(1, score))),
-  );
-}
-
-export function deriveIemLabel(
-  instrumentalScore: number,
-  executiveScore: number,
-): "instrumental" | "executive" | "mixed" | "ambiguous" {
-  const delta = instrumentalScore - executiveScore;
-
-  // 1. Dominant signal: Leader is >= HIGH (0.55) and separation is decisive (> 0.20)
-  if (instrumentalScore >= IEM_HIGH_THRESHOLD && delta > 0.20) {
-    return "instrumental";
-  }
-  if (executiveScore >= IEM_HIGH_THRESHOLD && -delta > 0.20) {
-    return "executive";
-  }
-
-  // 2. Both signals are strong/active (>= MID 0.45) and competing -> Mixed
-  if (
-    instrumentalScore >= IEM_MID_THRESHOLD &&
-    executiveScore >= IEM_MID_THRESHOLD
-  ) {
-    return "mixed";
-  }
-
-  // 3. Clear single-sided signals where other signal is weak (< MID 0.45)
-  if (
-    instrumentalScore >= IEM_HIGH_THRESHOLD &&
-    executiveScore < IEM_MID_THRESHOLD &&
-    delta >= IEM_MARGIN_THRESHOLD
-  ) {
-    return "instrumental";
-  }
-  if (
-    executiveScore >= IEM_HIGH_THRESHOLD &&
-    instrumentalScore < IEM_MID_THRESHOLD &&
-    -delta >= IEM_MARGIN_THRESHOLD
-  ) {
-    return "executive";
-  }
-
-  // 4. Ambiguous fallback
-  return "ambiguous";
-}
-
-export function calculateIemConfidence(
-  label: "instrumental" | "executive" | "mixed" | "ambiguous",
-  instrumentalScore: number,
-  executiveScore: number,
-): number {
-  const strongestSignal = Math.max(instrumentalScore, executiveScore);
-  const weakestSignal = Math.min(instrumentalScore, executiveScore);
-  const separation = Math.abs(instrumentalScore - executiveScore);
-
-  if (label === "ambiguous") {
-    return Math.max(
-      0,
-      Math.min(1, 1 - strongestSignal / IEM_MID_THRESHOLD),
-    );
-  }
-
-  if (label === "mixed") {
-    return Math.min(1, weakestSignal / IEM_MID_THRESHOLD);
-  }
-
-  const evidence = Math.min(1, strongestSignal / IEM_HIGH_THRESHOLD);
-  const dominance = Math.min(1, separation / IEM_MARGIN_THRESHOLD);
-  return Math.min(1, evidence * 0.55 + dominance * 0.45);
-}
-
-/**
- * Helper to extract code snippets wrapped in markdown backticks
- */
-export function extractCodeBlocks(text: string): string {
-  const regex = /```(?:[a-zA-Z0-9+#-]+)?\r?\n([\s\S]*?)```/g;
-  let match;
-  const blocks: string[] = [];
-  while ((match = regex.exec(text)) !== null) {
-    blocks.push(match[1]);
-  }
-  if (blocks.length === 0) {
-    // If no backticks, check if there is raw code-like content
-    return "";
-  }
-  return blocks.join("\n");
-}
-
-/**
- * Extracts active code snapshot from either body payload, Fvscode active file header,
- * or markdown code fences in prompt text.
- */
-export function extractCodeSnapshot(
-  body?: any,
-  promptText?: string,
-): {
-  content: string;
-  path: string;
-  languageId: string;
-} {
-  if (body?.activeFile?.content) {
-    return {
-      content: body.activeFile.content,
-      path: body.activeFile.path || "",
-      languageId: body.activeFile.languageId || "",
-    };
-  }
-  if (body?.codeSnapshot) {
-    return {
-      content: body.codeSnapshot,
-      path: body.activeFilePath || "",
-      languageId: body.activeFileLanguageId || "",
-    };
-  }
-  const text = promptText || "";
-  // 1. Match Fvscode active file pattern:
-  // --- (ACTIVE OPEN EDITOR FILE|ATTACHED TARGET FILE): rel (Path: abs) ---\ncontent\n---------------------
-  const activeMatch = text.match(
-    /--- (?:ACTIVE OPEN EDITOR FILE|ATTACHED TARGET FILE): ([^\n]+?) \(Path: ([^\n]+?)\) ---\r?\n([\s\S]*?)\r?\n---------------------/,
-  );
-  if (activeMatch) {
-    const filePath = activeMatch[1].trim();
-    const content = activeMatch[3];
-    const ext = filePath.includes(".")
-      ? filePath.split(".").pop() || "python"
-      : "python";
-    return {
-      content,
-      path: filePath,
-      languageId: ext,
-    };
-  }
-  // 2. Match markdown code blocks: ```python ... ```
-  const codeBlockMatch = text.match(/```(?:([a-zA-Z0-9_-]+))?\r?\n([\s\S]*?)```/);
-  if (codeBlockMatch) {
-    return {
-      content: codeBlockMatch[2],
-      path: "",
-      languageId: codeBlockMatch[1] || "python",
-    };
-  }
-  return { content: "", path: "", languageId: "" };
-}
-
-/**
- * Extracts Python/JS function and class signatures from a code string.
- * Used for structural divergence (c3) and structural identity (c8) computation.
- */
-export function extractFunctionSignatures(code: string): string[] {
-  const sigs: string[] = [];
-  // Python: def func_name(...) and async def
-  const pyDef = /^\s*(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/gm;
-  // Python: class ClassName(...)
-  const pyCls = /^\s*class\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*[:(]/gm;
-  // JS/TS: named function declaration
-  const jsFn = /\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/gm;
-  // JS/TS: arrow function — MUST have => to avoid false-positive on (a + b) * c
-  // Pattern: const name = (...) => or const name = async (...) =>
-  const jsArrow = /\b(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>/gm;
-  // TS/JS: method shorthand in object/class: methodName(...) {
-  const jsMethod = /^\s{2,}([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\([^)]*\)\s*(?::\s*\S+\s*)?\{/gm;
-
-  let m: RegExpExecArray | null;
-  while ((m = pyDef.exec(code)) !== null) sigs.push(`def:${m[1]}`);
-  while ((m = pyCls.exec(code)) !== null) sigs.push(`cls:${m[1]}`);
-  while ((m = jsFn.exec(code)) !== null) sigs.push(`fn:${m[1]}`);
-  while ((m = jsArrow.exec(code)) !== null) sigs.push(`arr:${m[1]}`);
-  while ((m = jsMethod.exec(code)) !== null) sigs.push(`method:${m[1]}`);
-
-  return sigs;
-}
-
-/**
- * Python/JS structural keywords preserved during code normalization.
- * All other identifiers become "VAR" to expose the control-flow skeleton.
- */
-const LANG_KEYWORDS = new Set([
-  // Python keywords
-  "def", "class", "if", "elif", "else", "for", "while", "try", "except",
-  "finally", "with", "return", "yield", "import", "from", "as", "pass",
-  "break", "continue", "and", "or", "not", "in", "is", "lambda", "None",
-  "True", "False", "del", "global", "nonlocal", "raise", "assert", "async", "await",
-  // Python common builtins (structural relevance)
-  "print", "range", "len", "int", "str", "float", "bool", "list", "dict",
-  "set", "tuple", "self", "type", "input", "open", "sum", "max", "min",
-  "abs", "sorted", "reversed", "enumerate", "zip", "map", "filter", "any", "all",
-  // JS/TS keywords
-  "function", "const", "let", "var", "new", "this", "typeof", "instanceof",
-  "null", "undefined", "true", "false", "export", "default", "throw",
-  "switch", "case", "import",
-]);
-
-/**
- * Normalizes code structure for structural skeleton comparison (c8).
- *
- * Critically, this preserves INDENTATION DEPTH as a prefix on each line.
- * This prevents false positives where two different algorithms with the same
- * keywords but different nesting depth (e.g. bubble_sort vs insertion_sort)
- * would otherwise be mistaken for structurally identical.
- *
- * Pipeline per line:
- *   1. Measure indent depth (each 4-space / 1-tab = 1 level)
- *   2. Strip inline comments
- *   3. Collapse strings → STR, numbers → NUM
- *   4. Replace non-keyword identifiers → VAR
- *   5. Prefix normalized line with depth: "2:for VAR in range(VAR):"
- */
-export function normalizeCodeStructure(code: string): string {
-  // Pre-process: collapse multiline docstrings first (before line-splitting)
-  const noDocstrings = code
-    .replace(/\"\"\"[\s\S]*?\"\"\"/g, '"""STR"""')
-    .replace(/'''[\s\S]*?'''/g, "'''STR'''");
-
-  return noDocstrings
-    .split(/\r?\n/)
-    .map((line) => {
-      // Measure indentation depth: 4 spaces or 1 tab = 1 level
-      const indentMatch = line.match(/^([ \t]*)/);
-      const rawIndent = indentMatch ? indentMatch[1] : "";
-      const depth = rawIndent.replace(/\t/g, "    ").length >> 2; // integer division by 4
-
-      // Strip inline comments (after string collapse to avoid stripping # inside strings)
-      const noComment = line.replace(/#[^'"]*$/, "").replace(/\/\/[^'"]*$/, "");
-
-      // Collapse remaining string literals
-      const noStrings = noComment
-        .replace(/"(?:[^"\\]|\\.)*"/g, "STR")
-        .replace(/'(?:[^'\\]|\\.)*'/g, "STR")
-        .replace(/`(?:[^`\\]|\\.)*`/g, "STR");
-
-      // Collapse numeric literals
-      const noNums = noStrings.replace(/\b\d+(?:\.\d+)?([eE][+-]?\d+)?\b/g, "NUM");
-
-      // Replace non-keyword identifiers with VAR
-      const normalized = noNums
-        .replace(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g, (word) =>
-          LANG_KEYWORDS.has(word) ? word : "VAR",
-        )
-        .trim();
-
-      if (!normalized) return null;
-      // Prefix with depth so nesting structure is preserved in the LCS comparison
-      return `${depth}:${normalized}`;
-    })
-    .filter((line): line is string => line !== null && line.length > 0)
-    .join("\n");
-}
-
-/**
- * Computes the programmatic (algorithmic) features for a given turn.
- * These features are derived purely from deterministic measurements:
- * clock time, LCS ratios, and line counts — no natural language processing.
- *
- * Features computed here:
- *   Trajectory : t9  (minimal_effort_between_turns — clock measurement)
- *                t10 (recurring_delegate_across_session — explicit delegation directives)
- *   Code-diff  : c1  (student modification ratio — 1 - max LCS)
- *                c2  (incremental small changes — snapshot line deltas)
- *                c3  (structural divergence — function signature set diff)
- *                c6  (exact copy ratio — LCS against last AI response)
- *                c7  (single large jump — sudden line count increase)
- *                c8  (structural identity — normalized skeleton LCS)
- *                c9  (no intermediate edits — stasis + copy heuristic)
- *                c10 (zero test activity — high-precision prompt scan)
- *
- * NOTE: For t10, programmatic detection identifies explicit delegation phrasing across
- * the sliding window as a deterministic anchor, which is then blended with the LLM
- * evaluator's semantic understanding (PROG_TRUST[t10] = 0.35).
- */
-export function calculateProgrammaticFeatures(
-  prompt: string,
-  response: string,
-  clientContext: ClientContext | null,
-  lastTurn: TurnLog | null,
-  timeDeltaSeconds: number,
-  recentTurns: TurnLog[] = [],
-): Record<string, number> {
-  const features: Record<string, number> = {};
-
-  // ─────────────────────────────────────────────────────────────────
-  // TRAJECTORY FEATURES
-  // ─────────────────────────────────────────────────────────────────
-
-  // t9: minimal_effort_between_turns (weight: 0.55)
-  let t9Activation = 0;
-  if (timeDeltaSeconds > 0 && timeDeltaSeconds < 12) {
-    const hasAiCode =
-      lastTurn && extractCodeBlocks(lastTurn.response).trim().length > 0;
-    if (hasAiCode) {
-      t9Activation = 1;
-    }
-  }
-  features["t9"] = t9Activation;
-
-  // t10: recurring_delegate_across_session (weight: 0.75)
-  const delegatePatterns = [
-    /\b(write|generate|create|implement)\b.{0,30}\b(for me|code for me|it for me|solution for me)\b/i,
-    /\bwrite (?:it|this|the code|a solution|the solution) for me\b/i,
-    /\bdo (?:it|this|the assignment|the homework|the whole thing|everything) for me\b/i,
-    /\bfix (?:it|this|the code|my code|the error) for me\b/i,
-    /\b(solve|complete)\b.{0,20}\bfor me\b/i,
-    /\b(give|provide|send) me (the )?(code|solution|answer)\b/i,
-    /\bjust (write|code|fix|give me the) (the |it|code)\b/i,
-  ];
-  const windowPrompts = [
-    ...recentTurns.slice(-(IEM_WINDOW_SIZE - 1)).map((turn) => turn.prompt),
-    prompt,
-  ];
-  const delegatedTurnCount = windowPrompts.filter((turnPrompt) =>
-    delegatePatterns.some((pattern) => pattern.test(turnPrompt)),
-  ).length;
-  const t10Activation = delegatedTurnCount >= 2 ? 1 : 0;
-  features["t10"] = t10Activation;
-
-  // ─────────────────────────────────────────────────────────────────
-  // CODE-DIFF FEATURES — EXECUTIVE (c6, c7, c8, c9, c10)
-  // ─────────────────────────────────────────────────────────────────
-
-  // c6: exact_copy_ratio (weight: 0.90)
-  let c6Activation = 0;
-  if (lastTurn && clientContext?.activeFile?.content) {
-    const lastAiCode = extractCodeBlocks(lastTurn.response);
-    if (lastAiCode.trim().length > 0) {
-      const ratio = fastLineLCS(lastAiCode, clientContext.activeFile.content);
-      if (ratio >= 0.70) c6Activation = 1;
-    }
-  }
-  features["c6"] = c6Activation;
-
-  // c7: single_large_jump (weight: 0.90)
-  let c7Activation = 0;
-  if (clientContext?.activeFile?.content) {
-    const studentLines = clientContext.activeFile.content
-      .split(/\r?\n/).filter((l) => l.trim().length > 0).length;
-    const prevLines = (lastTurn?.codeSnapshot || "")
-      .split(/\r?\n/).filter((l) => l.trim().length > 0).length;
-    const linesAdded = studentLines - prevLines;
-    if (linesAdded > 40 && prevLines < 15) {
-      c7Activation = 1;
-    }
-  }
-  features["c7"] = c7Activation;
-
-  // c8: structural_identity_with_ai (weight: 0.85)
-  let c8Activation = 0;
-  if (lastTurn && clientContext?.activeFile?.content) {
-    const lastAiCode8 = extractCodeBlocks(lastTurn.response);
-    if (lastAiCode8.trim().length > 20) {
-      const normAi = normalizeCodeStructure(lastAiCode8);
-      const normStudent = normalizeCodeStructure(clientContext.activeFile.content);
-      if (normAi.length > 0 && normStudent.length > 0) {
-        const structRatio = fastLineLCS(normAi, normStudent);
-        if (structRatio >= 0.65) c8Activation = 1;
-      }
-    }
-  }
-  features["c8"] = c8Activation;
-
-  // c9: no_intermediate_edits (weight: 0.80)
-  let c9Activation = 0;
-  const c6Val = features["c6"] ?? 0;
-  if (lastTurn?.codeSnapshot && clientContext?.activeFile?.content) {
-    const stasisRatio = fastLineLCS(lastTurn.codeSnapshot, clientContext.activeFile.content);
-    if (stasisRatio >= 0.80 && c6Val === 1) {
-      c9Activation = 1;
-    } else if (c6Val === 1 && timeDeltaSeconds > 0 && timeDeltaSeconds < 15) {
-      c9Activation = 1;
-    }
-  } else if (c6Val === 1 && timeDeltaSeconds > 0 && timeDeltaSeconds < 10) {
-    c9Activation = 1;
-  }
-  features["c9"] = c9Activation;
-
-  // c10: zero_own_test_activity (weight: 0.65)
-  const testEvidencePatterns = [
-    /traceback \(most recent call last\)/i,
-    /File "[^"]+", line \d+/,
-    /\b\d+\s+(?:failed|passed|error)(?:\s+in\s+[\d.]+s)?\b/i,
-    /\bassertionerror:\s*.+/i,
-    /^\s*>>>\s+\S/m,
-    /\boutput\s*:\s*\n\s*\S/i,
-    /\btest case \d+:\s*(?:passed|failed|wrong)/i,
-  ];
-
-  const terminalExecutionPatterns = [
-    /(?:^|\n|\$|>)\s*(?:python[0-9.]*|py|pytest|unittest|node|bun|ts-node|npm test|cargo test|go test|javac|java)\b/i,
-    /traceback \(most recent call last\)/i,
-    /File "[^"]+", line \d+/,
-    /\b\d+\s+(?:failed|passed|error)(?:\s+in\s+[\d.]+s)?\b/i,
-    /\bRan \d+ tests? in [\d.]+s/i,
-    /\bOK(?:\s*\(.*?\))?$/m,
-    /\bFAILED\s*\(.*?\)/i,
-    /\bassertionerror:\s*.+/i,
-    /\b(?:syntaxerror|nameerror|typeerror|indexerror|valueerror|zerodivisionerror|attributeerror):\s*.+/i,
-    /\[Process exited with code \d+\]/i,
-    /\btest case \d+:\s*(?:passed|failed|wrong)/i,
-  ];
-
-  const allWindowPrompts = [...recentTurns.map((t) => t.prompt), prompt];
-  const hasPromptTestEvidence = allWindowPrompts.some((p) =>
-    testEvidencePatterns.some((pattern) => pattern.test(p)),
-  );
-
-  const hasTerminalTelemetry =
-    Boolean(clientContext?.recentTerminal) ||
-    recentTurns.some((t) => Boolean(t.terminalOutput || t.lastTerminalCommand));
-
-  const isTerminalRunEvidence = (output?: string, cmd?: string, exitCode?: number): boolean => {
-    if (cmd && /(?:^|\s)(?:python[0-9.]*|py|pytest|unittest|node|bun|npm test|javac|java)\b/i.test(cmd)) {
-      return true;
-    }
-    if (output && (terminalExecutionPatterns.some((p) => p.test(output)) || testEvidencePatterns.some((p) => p.test(output)))) {
-      return true;
-    }
-    if (exitCode !== undefined && output && output.trim().length > 0) {
-      return true;
-    }
-    return false;
-  };
-
-  const currentTerminalActive = isTerminalRunEvidence(
-    clientContext?.recentTerminal?.output,
-    clientContext?.recentTerminal?.lastCommand,
-    clientContext?.recentTerminal?.exitCode,
-  );
-
-  const priorTerminalActive = recentTurns.some((t) =>
-    isTerminalRunEvidence(t.terminalOutput, t.lastTerminalCommand),
-  );
-
-  const hasTestEvidence = hasPromptTestEvidence || currentTerminalActive || priorTerminalActive;
-
-  const hasCodeInContext = Boolean(
-    (clientContext?.activeFile?.content && clientContext.activeFile.content.trim().length > 0) ||
-    recentTurns.some((t) => extractCodeBlocks(t.response).trim().length > 0)
-  );
-
-  const isPureInquiry =
-    /\b(what is|what are|why|explain|describe|concept|how does|how to|meaning of|intuition behind|giải thích|là gì|tại sao|nguyên lý|ý nghĩa)\b/i.test(prompt) &&
-    !/\b(write|code|solve|fix|cho tôi code|giải giúp)\b/i.test(prompt);
-
-  if (!hasCodeInContext || isPureInquiry) {
-    features["c10"] = 0;
-  } else if (hasTerminalTelemetry) {
-    features["_hasTerminalTelemetry"] = 1;
-    features["c10"] = (!hasTestEvidence && recentTurns.length >= 2) ? 1 : 0;
-  } else {
-    features["c10"] = (!hasTestEvidence && recentTurns.length >= 3) ? 1 : 0;
-  }
-
-  // ─────────────────────────────────────────────────────────────────
-  // CODE-DIFF FEATURES — INSTRUMENTAL (c1, c2, c3)
-  // ─────────────────────────────────────────────────────────────────
-
-  // c1: high_student_modification_ratio (weight: 0.85)
-  let c1Activation = 0;
-  if (clientContext?.activeFile?.content) {
-    const studentCode = clientContext.activeFile.content;
-    const allAiCodeBlocks = recentTurns
-      .map((t) => extractCodeBlocks(t.response))
-      .filter((code) => code.trim().length > 10);
-
-    if (allAiCodeBlocks.length > 0) {
-      const maxLcsRatio = Math.max(
-        ...allAiCodeBlocks.map((aiCode) => fastLineLCS(aiCode, studentCode)),
-      );
-      const studentOwnRatio = 1 - maxLcsRatio;
-      if (studentOwnRatio >= 0.50) c1Activation = 1;
-    } else {
-      c1Activation = 1;
-    }
-  }
-  features["c1"] = c1Activation;
-
-  // c2: incremental_small_step_changes (weight: 0.75)
-  let c2Activation = 0;
-  const snapshots = recentTurns
-    .filter((t) => t.codeSnapshot && t.codeSnapshot.trim().length > 0)
-    .map((t) => t.codeSnapshot!.split(/\r?\n/).filter((l) => l.trim().length > 0).length);
-
-  if (snapshots.length >= 2) {
-    const deltas: number[] = [];
-    for (let i = 1; i < snapshots.length; i++) {
-      deltas.push(Math.abs(snapshots[i] - snapshots[i - 1]));
-    }
-    const avgDelta = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-    if (avgDelta <= 15) c2Activation = 1;
-  }
-  features["c2"] = c2Activation;
-
-  // c3: structural_divergence_from_ai (weight: 0.70)
-  let c3Activation = 0;
-  if (lastTurn && clientContext?.activeFile?.content) {
-    const lastAiCode3 = extractCodeBlocks(lastTurn.response);
-    if (lastAiCode3.trim().length > 0) {
-      const aiSigs = extractFunctionSignatures(lastAiCode3);
-      const studentSigs = extractFunctionSignatures(clientContext.activeFile.content);
-      if (aiSigs.length > 0 && studentSigs.length > 0) {
-        const aiSet = new Set(aiSigs.map((s) => s.toLowerCase()));
-        const studentSet = new Set(studentSigs.map((s) => s.toLowerCase()));
-        const intersection = [...aiSet].filter((s) => studentSet.has(s)).length;
-        const unionSize = Math.max(aiSet.size, studentSet.size);
-        const divergenceRatio = unionSize > 0 ? 1 - intersection / unionSize : 0;
-        if (divergenceRatio >= 0.45) c3Activation = 1;
-      } else if (aiSigs.length === 0 && studentSigs.length > 0) {
-        c3Activation = 1;
-      }
-    }
-  }
-  features["c3"] = c3Activation;
-
-  return features;
-}
-
-/**
- * Per-feature programmatic trust level [0.0 .. 1.0].
- * Controls how much the algorithmic (programmatic) value outweighs the LLM semantic value
- * when both sources produce an activation for the same feature.
- * llmTrust = 1 - PROG_TRUST[key].
- *
- * Calibration rationale:
- *  1.00 — pure deterministic truth (clock, LCS ratio): LLM adds nothing
- *  0.80-0.90 — highly reliable algorithmic signal, LLM provides minor nuance
- *  0.55-0.65 — decent structural heuristic; LLM and programmatic are complementary
- *  0.25-0.45 — proxy/heuristic signal; LLM semantic understanding dominates
- */
-export const PROG_TRUST: Record<string, number> = {
-  // ── Trajectory ──────────────────────────────────────────────────
-  t9: 1.00,  // exact clock measurement: LLM is irrelevant
-  t10: 0.35, // recurring delegation: LLM dominates (0.65) because true delegation
-             // is semantic intent, but programmatic regex provides a deterministic anchor (0.35).
-
-  // ── Code-diff: pure algorithmic (LCS + arithmetic) ──────────────
-  c6: 1.00,  // exact copy ratio: fastLineLCS ground truth
-  c7: 1.00,  // single large jump: line count arithmetic truth
-  c1: 0.85,  // student modification ratio: 1−max(LCS), very reliable
-  c2: 0.80,  // incremental steps: snapshot line-count deltas, reliable
-
-  // ── Code-diff: structural heuristic ─────────────────────────────
-  c8: 0.60,  // structural identity via normalized LCS + indent-depth.
-             // Solid, but misses semantic equiv (e.g. loop vs comprehension).
-             // LLM catches these remaining 40%.
-  c3: 0.55,  // function signature divergence via regex.
-             // Accurate for Python def/class; weaker for complex JS closures.
-             // LLM handles anonymous patterns and renamed-but-equivalent structures.
-
-  // ── Code-diff: heuristic combination (proxy signals) ────────────
-  c9: 0.40,  // no-intermediate-edits: (stasis × c6) heuristic.
-             // LLM is better at detecting no-edit intent from phrasing.
-  c10: 0.25, // zero test activity: prompt-scan has high false-negative rate
-             // (student ran code but didn't paste output). LLM understands
-             // absence of testing behavior from conversational cues.
-};
-
-/**
- * Blends programmatic and LLM semantic feature activations using PROG_TRUST weights.
- *
- * Merge strategy (replaces the previous naive { ...semantic, ...programmatic } overwrite):
- *  • Feature ONLY in programmatic (c6, c7, t9):              pass through as-is
- *  • Feature ONLY in LLM (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5): pass through as-is
- *  • Feature in BOTH (c1–c3, c8–c10, t10):                   weighted blend:
- *      blended = progTrust × programmatic + (1 − progTrust) × semantic
- *
- * The blend achieves:
- *  - Consensus amplification: when both sources agree (both 1.0 or both 0.0), result stays at extreme
- *  - Disagreement dampening: when sources conflict, result moves to a moderate value reflecting uncertainty
- *  - Explainability: the PROG_TRUST table makes the weighting auditable and tunable
- *
- * @param semantic     Feature map from LLM evaluator
- * @param programmatic Feature map from calculateProgrammaticFeatures
- * @param debugLog     Optional callback for logging per-feature blend (research/debugging)
- */
 export function blendFeatures(
   semantic: Record<string, number>,
   programmatic: Record<string, number>,
-  debugLog?: (key: string, prog: number, llm: number, blended: number) => void,
+  onDisagreement?: (key: string, prog: number, llm: number, blended: number) => void,
 ): Record<string, number> {
-  const allKeys = new Set([
-    ...Object.keys(semantic),
-    ...Object.keys(programmatic),
-  ]);
   const result: Record<string, number> = {};
-
-  for (const key of allKeys) {
-    const hasS = key in semantic;
-    const hasP = key in programmatic;
-    const weight = INSTRUMENTAL_WEIGHTS[key] ?? EXECUTIVE_WEIGHTS[key] ?? 1.0;
-
-    if (hasP && !hasS) {
-      // Programmatic-only (c6, c7, t9) — pass through
-      result[key] = (programmatic[key] ?? 0) > 0 ? weight : 0;
-    } else if (hasS && !hasP) {
-      // LLM-only (i1–i8, e1–e6, r1–r8, t1–t8, c4, c5) — pass through
-      result[key] = (semantic[key] ?? 0) > 0 ? weight : 0;
-    } else {
-      // Both sources available — weighted blend with binary threshold
-      let progTrust = PROG_TRUST[key] ?? 0.50; // default 50/50 for unknown features
-      if (key === "c10" && programmatic["_hasTerminalTelemetry"]) {
-        progTrust = 0.85; // High confidence when terminal telemetry is present
-      }
-      const pVal = (programmatic[key] ?? 0) > 0 ? 1 : 0;
-      const sVal = (semantic[key] ?? 0) > 0 ? 1 : 0;
-      const blended = Math.min(1.0, Math.max(0.0, progTrust * pVal + (1 - progTrust) * sVal));
-      result[key] = blended >= 0.5 ? weight : 0;
-      debugLog?.(key, pVal, sVal, result[key]);
-    }
+  for (const key of ONLINE_FEATURE_KEYS) {
+    const p = programmatic[key];
+    const s = semantic[key];
+    // i/e/r are semantic, except explicit lexical e2 corroboration. No generic
+    // programmatic-only fallback may invent roles, intent, or algorithm novelty.
+    const trust = PROG_TRUST[key] ?? 0;
+    const hasP = trust > 0 && typeof p === "number" && Number.isFinite(p);
+    const hasS = typeof s === "number" && Number.isFinite(s);
+    if (!hasP && !hasS) continue; // missing evidence is not a negative vote
+    const pNorm = hasP && p > 0 ? 1 : 0;
+    const sNorm = hasS && s > 0 ? 1 : 0;
+    const activation = hasP && hasS
+      ? trust * pNorm + (1 - trust) * sNorm
+      : hasP ? pNorm : sNorm;
+    const weight = INSTRUMENTAL_WEIGHTS[key] ?? EXECUTIVE_WEIGHTS[key];
+    result[key] = activation > 0.5 ? weight : 0; // a tie is insufficient
+    if (hasP && hasS && pNorm !== sNorm) onDisagreement?.(key, pNorm, sNorm, result[key]);
   }
-
-  delete result["_hasTerminalTelemetry"];
+  // A complete task solution performs the student's work, including chat delivery.
+  if (result.r8 > 0) {
+    result.r7 = EXECUTIVE_WEIGHTS.r7;
+    // Preserve evidenced review (r5); surrounding pedagogy is subsumed.
+    for (const key of ["r1", "r2", "r3", "r4", "r6"]) result[key] = 0;
+  }
+  // Internal evidence is never an output feature. Copying alone cannot be novelty.
+  if (programmatic._exactCopyOnly === 1) result.c5 = 0;
   return result;
+}
+
+/** min(1, v1 + 0.35*v2 + 0.15*sum(v3...)), sorted descending. */
+export function calculateSignalScore(values: number[]): number {
+  if (values.length === 0) return 0.0;
+  const sorted = [...values].sort((a, b) => b - a);
+  let rest = 0.0;
+  for (let j = 2; j < sorted.length; j++) rest += sorted[j];
+  return Math.min(1.0, sorted[0] + 0.35 * (sorted[1] ?? 0.0) + 0.15 * rest);
+}
+
+/** Unclamped raw score for Session compounding to prevent ceiling saturation artifact. */
+export function calculateRawSignalScore(values: number[]): number {
+  if (values.length === 0) return 0.0;
+  const sorted = [...values].sort((a, b) => b - a);
+  let rest = 0.0;
+  for (let j = 2; j < sorted.length; j++) rest += sorted[j];
+  return sorted[0] + 0.35 * (sorted[1] ?? 0.0) + 0.15 * rest;
+}
+
+/** Apply the identical SignalScore to the latest five Turn positions. */
+export function calculateSessionSignalScore(scores: number[]): number {
+  const window = scores.slice(-IEM_WINDOW_SIZE).filter(Number.isFinite);
+  return calculateSignalScore(window.map((s) => Math.max(0, Math.min(1, s))));
+}
+
+/** Calculate unclamped raw Session compounding score across W=5 turns. */
+export function calculateRawSessionSignalScore(scores: number[]): number {
+  const window = scores.slice(-IEM_WINDOW_SIZE).filter(Number.isFinite);
+  return calculateRawSignalScore(window.map((s) => Math.max(0, s)));
+}
+
+/** Train-calibrated overlap, dominance gaps, then Mixed for ambiguity.
+ * All thresholds are inclusive, with tolerance only for floating point equality.
+ */
+export function deriveSignalScoreOverlap(
+  si: number,
+  se: number,
+): "Instrumental" | "Executive" | "Mixed" {
+  if (!Number.isFinite(si) || !Number.isFinite(se)) return "Mixed";
+  if (si === 0 && se === 0) return "Mixed";
+  const p = IEM_DECISION_GATE;
+  const tolerance = 1e-12;
+  if (si - se >= p.M_I - tolerance) return "Instrumental";
+  if (se - si >= p.M_E - tolerance) return "Executive";
+  return "Mixed";
+}
+
+/** Compatibility entry point; uses the same calibrated mathematical gate. */
+export function deriveSignalScore2D(
+  si: number,
+  se: number,
+): "Instrumental" | "Executive" | "Mixed" {
+  return deriveSignalScoreOverlap(si, se);
+}
+
+/** Shared Turn label rule. */
+export function deriveIemLabel(
+  instrumentalScore: number,
+  executiveScore: number,
+): "instrumental" | "executive" | "mixed" {
+  return deriveSignalScoreOverlap(instrumentalScore, executiveScore).toLowerCase() as
+    "instrumental" | "executive" | "mixed";
+}
+
+/** Session-specific decision gate based on Raw Compounding Margin. */
+export function deriveSessionIemLabel(
+  rawSi: number,
+  rawSe: number,
+): "instrumental" | "executive" | "mixed" {
+  return deriveSignalScoreOverlap(rawSi, rawSe).toLowerCase() as
+    "instrumental" | "executive" | "mixed";
+}
+
+export function calculateIemConfidence(
+  label: "instrumental" | "executive" | "mixed" | string,
+  instrumentalScore: number,
+  executiveScore: number,
+): number {
+  const strongest = Math.max(instrumentalScore, executiveScore);
+  const weakest = Math.min(instrumentalScore, executiveScore);
+  const separation = Math.abs(instrumentalScore - executiveScore);
+  if (label === "ambiguous") {
+    return Math.max(0, Math.min(1, 1 - strongest / IEM_MID_THRESHOLD));
+  }
+  if (label === "mixed") {
+    return Math.min(1, weakest / IEM_MID_THRESHOLD);
+  }
+  const evidence = Math.min(1, strongest / IEM_HIGH_THRESHOLD);
+  const dominance = Math.min(1, separation / IEM_MARGIN_THRESHOLD);
+  return Math.min(1, evidence * 0.55 + dominance * 0.45);
 }

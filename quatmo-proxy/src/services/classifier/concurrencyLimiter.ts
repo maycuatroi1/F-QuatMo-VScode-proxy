@@ -25,6 +25,7 @@ interface QueuedItem {
   resolve: (val: any) => void;
   reject: (err: any) => void;
   enqueuedAt: number;
+  forceFastTrack?: boolean;
 }
 
 export class ClassifierConcurrencyController {
@@ -82,15 +83,14 @@ export class ClassifierConcurrencyController {
     }
 
     const totalQueued = this.getTotalQueuedCount();
+    const isOverflow = totalQueued >= this.maxQueue;
 
-    // Circuit breaker: Queue capacity exceeded
-    if (totalQueued >= this.maxQueue) {
+    // Circuit breaker: mark overflow items Fast-Track without breaking per-client FIFO or maxConcurrent
+    if (isOverflow) {
       this.circuitBreakerTripped = true;
       console.warn(
-        `[ConcurrencyLimiter] Global queue limit reached (${totalQueued}/${this.maxQueue}). Running task for ${clientKey} in Fast-Track mode.`,
+        `[ConcurrencyLimiter] Global queue limit reached (${totalQueued}/${this.maxQueue}). Queueing task for ${clientKey} in Fast-Track mode (FIFO & semaphore preserved).`,
       );
-      this.fastTrackProcessed++;
-      return task(true);
     }
 
     return new Promise<T>((resolve, reject) => {
@@ -106,6 +106,7 @@ export class ClassifierConcurrencyController {
         resolve,
         reject,
         enqueuedAt,
+        forceFastTrack: isOverflow,
       });
 
       this.drain();
@@ -141,7 +142,10 @@ export class ClassifierConcurrencyController {
       const itemToRun = nextItem;
 
       const isWaitTimeout = Date.now() - itemToRun.enqueuedAt > this.maxQueueWaitMs;
-      const isFastTrack = this.circuitBreakerTripped || isWaitTimeout;
+      const isFastTrack =
+        Boolean(itemToRun.forceFastTrack) ||
+        this.circuitBreakerTripped ||
+        isWaitTimeout;
 
       if (isFastTrack) {
         this.fastTrackProcessed++;

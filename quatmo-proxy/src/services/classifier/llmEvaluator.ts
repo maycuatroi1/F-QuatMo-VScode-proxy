@@ -1,37 +1,76 @@
 import fs from "fs";
 import path from "path";
-import { INSTRUMENTAL_WEIGHTS, EXECUTIVE_WEIGHTS } from "./features";
+import {
+  INSTRUMENTAL_WEIGHTS,
+  EXECUTIVE_WEIGHTS,
+  ONLINE_FEATURE_KEYS,
+} from "./features";
 import type { TurnLog } from "./redisStore";
 
 let cachedEvalPrompt = "";
 let lastPromptLoadedTime = 0;
 
-
-
 async function getEvaluationSystemPrompt(): Promise<string> {
   const now = Date.now();
   if (now - lastPromptLoadedTime > 30000 || !cachedEvalPrompt) {
-    try {
-      const filePath = path.join(
-        process.cwd(),
-        "src",
-        "systemPrompts",
-        "session_evaluation.md",
-      );
+    const candidatePaths = [
+      path.join(process.cwd(), "src", "systemPrompts", "session_evaluation.md"),
+      path.resolve(__dirname, "../../systemPrompts/session_evaluation.md"),
+      path.resolve(process.cwd(), "session_evaluation.md"),
+    ];
+    for (const filePath of candidatePaths) {
       if (fs.existsSync(filePath)) {
-        cachedEvalPrompt = await fs.promises.readFile(filePath, "utf-8");
-        lastPromptLoadedTime = now;
+        try {
+          cachedEvalPrompt = await fs.promises.readFile(filePath, "utf-8");
+          lastPromptLoadedTime = now;
+          return cachedEvalPrompt;
+        } catch (e) {
+          console.error(
+            "[Classifier Eval] Error reading session_evaluation.md:",
+            e,
+          );
+        }
       }
-    } catch (e) {
-      console.error(
-        "[Classifier Eval] Error reading session_evaluation.md:",
-        e,
-      );
     }
+    throw new Error(
+      "Required session_evaluation.md is missing; cannot silently use an incompatible schema.",
+    );
   }
-  return (
-    cachedEvalPrompt || "You are a student session evaluator. Return JSON."
-  );
+  return cachedEvalPrompt;
+}
+
+const MAX_CURRENT_CODE_CHARS = 12000;
+const MAX_OTHER_FILES = 4;
+const MAX_OTHER_FILE_CHARS = 4000;
+const MAX_CURRENT_TERMINAL_CHARS = 3000;
+const MAX_HISTORY_MSG_CHARS = 2500;
+const MAX_HISTORY_CODE_CHARS = 4000;
+const MAX_HISTORY_TERMINAL_CHARS = 1500;
+
+function truncateHeadTail(text: string | undefined, maxChars: number): string {
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  const headChars = Math.floor(maxChars * 0.7);
+  const tailChars = Math.max(0, maxChars - headChars);
+  const omitted = text.length - headChars - tailChars;
+  return `${text.slice(0, headChars)}\n...[truncated ${omitted} chars]...\n${tailChars > 0 ? text.slice(-tailChars) : ""}`;
+}
+
+function truncateTail(text: string | undefined, maxChars: number): string {
+  if (!text) return "";
+  if (text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  return `...[truncated ${omitted} chars]...\n${text.slice(-maxChars)}`;
+}
+
+export interface LLMEvalOptions {
+  apiUrl?: string;
+  apiKey?: string;
+  model?: string;
+  timeoutMs?: number;
+  maxAttempts?: number;
+  fallbackModel?: string;
+  verbose?: boolean;
 }
 
 export async function evaluateTurnSemanticFeatures(
@@ -39,54 +78,20 @@ export async function evaluateTurnSemanticFeatures(
   response: string,
   codeSnapshot: string,
   history: Array<{ role: string; content: string }>,
-  codeSnapshots?: Array<{ path: string; content: string; languageId: string }>,
+  codeSnapshots?: Array<{ path: string; content: string; languageId?: string }>,
   activeFile?: { path: string; content: string },
   recentTurns: TurnLog[] = [],
-  recentTerminal?: { output: string; lastCommand?: string; exitCode?: number },
+  recentTerminal?: {
+    output: string;
+    lastCommand?: string;
+    exitCode?: number;
+    commandType?: string;
+    timestamp?: number;
+  },
+  options: LLMEvalOptions = {},
 ): Promise<Record<string, number>> {
   const defaultFeatures: Record<string, number> = {};
-
-  const allKeys = [
-    "i1",
-    "i2",
-    "i3",
-    "i4",
-    "i5",
-    "i6",
-    "i7",
-    "i8",
-    "e1",
-    "e2",
-    "e3",
-    "e4",
-    "e5",
-    "e6",
-    "r1",
-    "r2",
-    "r3",
-    "r4",
-    "r5",
-    "r6",
-    "r7",
-    "r8",
-    "t1",
-    "t2",
-    "t3",
-    "t4",
-    "t5",
-    "t6",
-    "t7",
-    "t8",
-    "t10",
-    "c1",
-    "c2",
-    "c3",
-    "c4",
-    "c5",
-    "c8",
-    "c9",
-    "c10",
-  ];
+  const allKeys = ONLINE_FEATURE_KEYS;
   for (const k of allKeys) {
     defaultFeatures[k] = 0;
   }
@@ -94,95 +99,91 @@ export async function evaluateTurnSemanticFeatures(
   try {
     const systemPrompt = await getEvaluationSystemPrompt();
     const apiUrl =
+      options.apiUrl ||
       process.env.CLASSIFIER_EVAL_API_URL ||
       process.env.CLASSIFIER_API_URL ||
       "https://api.openai.com/v1/chat/completions";
     const apiKey =
-      process.env.CLASSIFIER_EVAL_API_KEY || process.env.CLASSIFIER_API_KEY || "";
+      options.apiKey ||
+      process.env.CLASSIFIER_EVAL_API_KEY ||
+      process.env.CLASSIFIER_API_KEY ||
+      "";
     const model =
-      process.env.CLASSIFIER_EVAL_MODEL || process.env.CLASSIFIER_MODEL || "gpt-4o-mini";
+      options.model ||
+      process.env.CLASSIFIER_EVAL_MODEL ||
+      process.env.CLASSIFIER_MODEL ||
+      "qwen3-coder";
 
     if (!apiUrl) {
       console.warn(
-        "[Classifier LLM] CLASSIFIER_API_URL not set. Skipping LLM evaluation.",
+        "[Classifier LLM] CLASSIFIER_API_URL not set. Semantic extraction abstaining.",
       );
-      return defaultFeatures;
+      return {};
     }
 
-    const formattedHistory =
-      recentTurns.length > 0
-        ? recentTurns
-            .map((turn, idx) => {
-              const turnNumber = idx + 1;
-              const turnParts = [
-                `Turn ${turnNumber}:`,
-                `Student Prompt: ${turn.prompt}`,
-                `AI Response: ${turn.response}`,
-                turn.codeSnapshot
-                  ? `Code Snapshot:\n\`\`\`\n${turn.codeSnapshot}\n\`\`\``
-                  : "Code Snapshot: None",
-              ];
-              if (turn.terminalOutput) {
-                turnParts.push(
-                  `Terminal Activity: ${turn.lastTerminalCommand ? `(Command: ${turn.lastTerminalCommand}) ` : ""}\n\`\`\`\n${turn.terminalOutput}\n\`\`\``,
-                );
+    const prior = recentTurns.slice(-4);
+    const activePath = activeFile?.path || "";
+    const boundedActiveContent = truncateHeadTail(
+      codeSnapshot,
+      MAX_CURRENT_CODE_CHARS,
+    );
+    const boundedOtherFiles = (codeSnapshots || [])
+      .filter((file) => !activePath || file.path !== activePath)
+      .slice(0, MAX_OTHER_FILES)
+      .map((file) => ({
+        path: file.path,
+        content: truncateHeadTail(file.content, MAX_OTHER_FILE_CHARS),
+        ...(file.languageId ? { languageId: file.languageId } : {}),
+      }));
+    const boundedTerminal = recentTerminal
+      ? {
+          ...recentTerminal,
+          ...(recentTerminal.output !== undefined
+            ? {
+                output: truncateTail(
+                  recentTerminal.output,
+                  MAX_CURRENT_TERMINAL_CHARS,
+                ),
               }
-              return turnParts.join("\n");
-            })
-            .join("\n\n")
-        : history
-            .map(
-              (msg) => `[${msg.role.toUpperCase()}]: ${msg.content}`,
-            )
-            .join("\n\n");
+            : {}),
+        }
+      : null;
 
-    let codeSection = "";
-    if (codeSnapshot) {
-      codeSection += `Active Code Snapshot:\n\`\`\`\n${codeSnapshot}\n\`\`\``;
-    } else {
-      codeSection += "Active Code Snapshot: None";
-    }
-
-    if (codeSnapshots && codeSnapshots.length > 0) {
-      const activePath = activeFile?.path;
-      const otherFiles = codeSnapshots.filter(
-        (f) => !activePath || f.path !== activePath,
-      );
-      if (otherFiles.length > 0) {
-        codeSection +=
-          "\n\nOther Changed Files Snapshots:\n" +
-          otherFiles
-            .map(
-              (f) =>
-                `File: ${f.path}\n\`\`\`${f.languageId || ""}\n${f.content}\n\`\`\``,
-            )
-            .join("\n\n");
-      }
-    }
-
-    let terminalSection = "Recent Terminal Activity: None";
-    if (recentTerminal?.output || recentTerminal?.lastCommand) {
-      terminalSection = [
-        "Recent Terminal Activity:",
-        recentTerminal.lastCommand ? `Last Command: ${recentTerminal.lastCommand}` : "",
-        recentTerminal.exitCode !== undefined ? `Exit Code: ${recentTerminal.exitCode}` : "",
-        recentTerminal.output
-          ? `Output:\n\`\`\`\n${recentTerminal.output}\n\`\`\``
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n");
-    }
-
-    const payload = [
-      "## RECENT 5-TURN WINDOW HISTORY",
-      formattedHistory || "None (First Turn)",
-      "\n## CURRENT TURN",
-      `Student Prompt: ${prompt}`,
-      `AI Response: ${response}`,
-      codeSection,
-      terminalSection,
-    ].join("\n\n");
+    const payload = JSON.stringify({
+      current: {
+        studentMessage: prompt,
+        aiResponse: response
+          ? truncateHeadTail(response, MAX_HISTORY_MSG_CHARS * 2)
+          : null,
+        responseKind: "delivered",
+        activeFile: activeFile
+          ? { path: activeFile.path, content: boundedActiveContent }
+          : codeSnapshot
+            ? { path: "", content: boundedActiveContent }
+            : null,
+        otherFiles: boundedOtherFiles,
+        terminal: boundedTerminal,
+      },
+      history: prior.map((turn) => ({
+        studentMessage: truncateHeadTail(turn.prompt, MAX_HISTORY_MSG_CHARS),
+        aiResponse: truncateHeadTail(turn.response, MAX_HISTORY_MSG_CHARS),
+        activeFile: {
+          path: turn.activeFilePath || "",
+          content: truncateHeadTail(turn.codeSnapshot, MAX_HISTORY_CODE_CHARS),
+        },
+        terminal: {
+          lastCommand: turn.lastTerminalCommand,
+          output: truncateTail(turn.terminalOutput, MAX_HISTORY_TERMINAL_CHARS),
+          commandType: turn.commandType,
+        },
+      })),
+      referenceHistory: prior.length
+        ? []
+        : history.slice(-8).map((msg) => ({
+            role: msg.role,
+            content: truncateHeadTail(msg.content, MAX_HISTORY_MSG_CHARS),
+          })),
+    });
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -191,20 +192,29 @@ export async function evaluateTurnSemanticFeatures(
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    const timeoutMs = parseInt(
-      process.env.CLASSIFIER_TIMEOUT_MS || "90000",
-      10,
-    );
+    const timeoutMs =
+      options.timeoutMs ||
+      parseInt(process.env.CLASSIFIER_TIMEOUT_MS || "60000", 10);
+    const maxAttempts =
+      options.maxAttempts ||
+      Math.max(1, parseInt(process.env.CLASSIFIER_MAX_RETRIES || "2", 10));
+    const fallbackModel = (
+      options.fallbackModel ??
+      process.env.CLASSIFIER_FALLBACK_MODEL ??
+      "qwen3-coder"
+    ).trim();
+
     let lastError: any = null;
     let responseText = "";
+    let activeModel = model;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const res = await fetch(apiUrl, {
           method: "POST",
           headers,
           body: JSON.stringify({
-            model,
+            model: activeModel,
             messages: [
               { role: "system", content: systemPrompt },
               { role: "user", content: payload },
@@ -215,16 +225,32 @@ export async function evaluateTurnSemanticFeatures(
         });
 
         if (!res.ok) {
-          throw new Error(`LLM API returned status ${res.status}`);
+          const errBody = await res.text().catch(() => "");
+          throw new Error(`LLM API returned status ${res.status}: ${errBody}`);
         }
 
         responseText = await res.text();
         break;
       } catch (err: any) {
         lastError = err;
-        if (attempt < 2) {
-          console.warn(`[Classifier LLM] Attempt ${attempt} failed (${err.message}). Retrying in 1.5s...`);
-          await new Promise((r) => setTimeout(r, 1500));
+        console.warn(
+          `[Classifier LLM] Attempt ${attempt}/${maxAttempts} failed for '${activeModel}' (${err.message}).`,
+        );
+
+        if (
+          attempt === maxAttempts - 1 &&
+          fallbackModel &&
+          activeModel !== fallbackModel
+        ) {
+          console.warn(
+            `[Classifier LLM] Switching to fallback model '${fallbackModel}' on final attempt.`,
+          );
+          activeModel = fallbackModel;
+        }
+
+        if (attempt < maxAttempts) {
+          const delayMs = attempt * 1500;
+          await new Promise((r) => setTimeout(r, delayMs));
         }
       }
     }
@@ -232,13 +258,11 @@ export async function evaluateTurnSemanticFeatures(
     if (!responseText && lastError) {
       throw lastError;
     }
-    console.log("[Classifier LLM] Raw Response Text:", responseText);
-    let parsed: any = null;
 
+    let parsed: any = null;
     try {
       const responseJson = JSON.parse(responseText);
       const content = responseJson.choices?.[0]?.message?.content || "";
-      console.log("[Classifier LLM] Assistant Message Content:", content);
 
       const arrayStart = content.indexOf("[");
       const arrayEnd = content.lastIndexOf("]");
@@ -256,19 +280,15 @@ export async function evaluateTurnSemanticFeatures(
       } else {
         parsed = JSON.parse(content.replace(/```json|```/g, "").trim());
       }
-      console.log(
-        "[Classifier LLM] Parsed JSON Object:",
-        JSON.stringify(parsed, null, 2),
-      );
-    } catch (e) {
+    } catch {
       console.error(
         "[Classifier LLM] Failed to parse JSON response:",
         responseText,
       );
-      return defaultFeatures;
+      return {};
     }
 
-    if (parsed) {
+    if (parsed && (Array.isArray(parsed) || typeof parsed === "object")) {
       const result: Record<string, number> = { ...defaultFeatures };
       const activeKeys: string[] = [];
 
@@ -277,13 +297,14 @@ export async function evaluateTurnSemanticFeatures(
           if (typeof item === "string") {
             const k = item.toLowerCase().trim();
             if (k in defaultFeatures) {
-              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+              const weight =
+                INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
               result[k] = weight;
               activeKeys.push(k);
             }
           }
         }
-      } else if (typeof parsed === "object" && parsed !== null) {
+      } else {
         const list = Array.isArray(parsed.active_features)
           ? parsed.active_features
           : Array.isArray(parsed.features)
@@ -295,7 +316,8 @@ export async function evaluateTurnSemanticFeatures(
             if (typeof item === "string") {
               const k = item.toLowerCase().trim();
               if (k in defaultFeatures) {
-                const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+                const weight =
+                  INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
                 result[k] = weight;
                 activeKeys.push(k);
               }
@@ -305,17 +327,14 @@ export async function evaluateTurnSemanticFeatures(
           for (const [key, value] of Object.entries(parsed)) {
             const k = key.toLowerCase().trim();
             if (k in defaultFeatures) {
-              const weight = INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
-              if (typeof value === "number") {
-                if (value > 0) {
-                  result[k] = weight;
-                  activeKeys.push(k);
-                }
-              } else if (typeof value === "boolean") {
-                if (value) {
-                  result[k] = weight;
-                  activeKeys.push(k);
-                }
+              const weight =
+                INSTRUMENTAL_WEIGHTS[k] ?? EXECUTIVE_WEIGHTS[k] ?? 1.0;
+              if (typeof value === "number" && value > 0) {
+                result[k] = weight;
+                activeKeys.push(k);
+              } else if (typeof value === "boolean" && value) {
+                result[k] = weight;
+                activeKeys.push(k);
               } else if (typeof value === "string") {
                 const s = value.toLowerCase().trim();
                 if (s !== "none" && s !== "false" && s !== "0" && s !== "") {
@@ -328,22 +347,30 @@ export async function evaluateTurnSemanticFeatures(
         }
       }
 
-      console.log(
-        `[Classifier LLM] Active Features (${activeKeys.length}):`,
-        JSON.stringify(activeKeys),
-      );
-      console.log(
-        "[Classifier LLM] Mapped Features (Pure Criteria Weights):",
-        JSON.stringify(result, null, 2),
-      );
+      if (options.verbose) {
+        console.log(
+          `[Classifier LLM] Active Features (${activeKeys.length}):`,
+          activeKeys.join(", "),
+        );
+      }
+
+      if (!response.trim()) {
+        for (const key of allKeys) {
+          if (key.startsWith("r")) result[key] = 0;
+        }
+      }
       return result;
     }
   } catch (err: any) {
     console.error(
-      "[Classifier LLM] Error calling classifier LLM:",
+      "[Classifier LLM] Error during semantic evaluation:",
       err.message,
     );
+    console.warn(
+      "[Classifier LLM] Semantic extraction unavailable; retaining only observed programmatic evidence.",
+    );
+    return {};
   }
 
-  return defaultFeatures;
+  return {};
 }

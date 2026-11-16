@@ -232,9 +232,12 @@ sessionAuthRouter.get("/events/stream", async (c) => {
               confidence: event.confidence,
               iScoreS: event.iScoreS,
               eScoreS: event.eScoreS,
+              iScoreSRaw: event.iScoreSRaw,
+              eScoreSRaw: event.eScoreSRaw,
               iScoreTurn: event.iScoreTurn,
               eScoreTurn: event.eScoreTurn,
               windowSize: event.windowSize,
+              featureSchema: event.featureSchema,
               timestamp: event.timestamp || Date.now(),
             }),
           });

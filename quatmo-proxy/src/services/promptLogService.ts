@@ -25,7 +25,34 @@ interface PromptTurnRecord {
   codeSnapshots?: any[];
   terminalOutput?: string;
   lastTerminalCommand?: string;
+  commandType?: string;
   [key: string]: any;
+}
+
+const fileLocks = new Map<string, Promise<void>>();
+export async function withFileLock<T>(
+  filePath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = path.resolve(filePath);
+  const current = fileLocks.get(key) || Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  fileLocks.set(
+    key,
+    current.then(() => next),
+  );
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release!();
+    if (fileLocks.get(key) === next) {
+      fileLocks.delete(key);
+    }
+  }
 }
 
 export async function atomicWriteJson(
@@ -284,13 +311,28 @@ export async function reconcileStudentPromptTurns(
 
     if (modified) {
       try {
-        if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
-          const bakPath = `${jsonPath}.bak.${Date.now()}`;
-          try {
-            await fs.promises.copyFile(jsonPath, bakPath);
-          } catch {}
-        }
-        await atomicWriteJson(jsonPath, existingTurns);
+        await withFileLock(jsonPath, async () => {
+          if (fs.existsSync(jsonPath)) {
+            try {
+              const latestRaw = await fs.promises.readFile(jsonPath, "utf-8");
+              const latestParsed = safeParseJson(latestRaw);
+              if (
+                Array.isArray(latestParsed) &&
+                !hadExistingGhostTurns &&
+                latestParsed.length > existingTurns.length
+              ) {
+                return;
+              }
+            } catch {}
+          }
+          if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
+            const bakPath = `${jsonPath}.bak.${Date.now()}`;
+            try {
+              await fs.promises.copyFile(jsonPath, bakPath);
+            } catch {}
+          }
+          await atomicWriteJson(jsonPath, existingTurns);
+        });
 
         // Synchronize tokens consumed in session_manifest.json
         const manifestPath = path.join(sessionDir, "session_manifest.json");
@@ -442,6 +484,12 @@ export async function reconcileStudentPromptTurns(
         codeSnapshots: matchedTurn?.codeSnapshots,
         terminalOutput: matchedTurn?.terminalOutput,
         lastTerminalCommand: matchedTurn?.lastTerminalCommand,
+        ...(matchedTurn?.commandType
+          ? { commandType: matchedTurn.commandType }
+          : {}),
+        ...(matchedTurn?.featureVector
+          ? { featureVector: matchedTurn.featureVector }
+          : {}),
       };
 
       synthesizedTurns.push(turnObj);
@@ -469,7 +517,31 @@ export async function reconcileStudentPromptTurns(
 
   if (synthesizedTurns.length > existingTurns.length) {
     try {
-      await atomicWriteJson(jsonPath, synthesizedTurns);
+      let wroteSynthesized = false;
+      await withFileLock(jsonPath, async () => {
+        if (fs.existsSync(jsonPath)) {
+          try {
+            const latestRaw = await fs.promises.readFile(jsonPath, "utf-8");
+            const latestParsed = safeParseJson(latestRaw);
+            if (
+              Array.isArray(latestParsed) &&
+              latestParsed.length >= synthesizedTurns.length
+            ) {
+              synthesizedTurns = latestParsed;
+              return;
+            }
+          } catch {}
+        }
+        await atomicWriteJson(jsonPath, synthesizedTurns);
+        wroteSynthesized = true;
+      });
+      if (!wroteSynthesized) {
+        return {
+          turns: synthesizedTurns,
+          wasRepaired: false,
+          source: "disk_newer",
+        };
+      }
       const totalTokens = synthesizedTurns.reduce(
         (acc, t) => acc + (t.tokensConsumedTotal || 0),
         0,
