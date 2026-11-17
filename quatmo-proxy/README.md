@@ -139,3 +139,9 @@ Khi chạy service Python Classifier, bạn chỉ cần đặt cấu hình `CLAS
 ## Process Summary
 
 Sinh summary thủ công cho từng sinh viên hoặc cả session: xem [cấu hình engine và báo cáo kiểm thử](docs/summary-integration.md).
+
+Dockerfile đã đóng gói Python và summary engine. Commit cả thư mục `summary_tool/`,
+build bằng Dockerfile rồi deploy branch đang dùng trên Dokploy; không cần cài thêm
+engine thủ công trên server. Nếu đã khai báo ENV đường dẫn, dùng
+`SUMMARY_CLI_PATH=/opt/summary-tool/generate_cli.py` và
+`SUMMARY_PYTHON_BIN=/usr/bin/python3`. Giữ nguyên volume dữ liệu `/app/logs`.

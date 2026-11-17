@@ -150,10 +150,10 @@ for (const [route, name, hash] of [
 // Additive summary integration; every pre-existing registration/body stays pinned.
 const summaryRoutes = [
   ["get", '"/visualize/sessions/:sessionCode/accounts/:studentId/summary"', "getStudentSummary"],
-  ["post", '"/visualize/sessions/:sessionCode/accounts/:studentId/summary/generate"', "generateStudentSummary"],
+  ["post", '"/visualize/sessions/:sessionCode/accounts/:studentId/summary/generate"', "limitSummaryGeneration", "generateStudentSummary"],
   ["get", '"/visualize/sessions/:sessionCode/summary-manifest"', "getSessionSummaryManifest"],
-  ["post", '"/visualize/sessions/:sessionCode/summary/generate-all"', "generateSessionSummaries"],
-  ["post", '"/visualize/summary/generate-from-zip"', "summaryZipLimit", "generateSummaryFromZip"],
+  ["post", '"/visualize/sessions/:sessionCode/summary/generate-all"', "limitSummaryGeneration", "generateSessionSummaries"],
+  ["post", '"/visualize/summary/generate-from-zip"', "limitSummaryGeneration", "summaryZipLimit", "generateSummaryFromZip"],
   ["get", '"/visualize/sessions/:sessionCode/summaries"', "listSessionSummaries"],
 ];
 const summaryPaths = new Set(summaryRoutes.map((row) => row[1]));
@@ -176,6 +176,9 @@ const currentSessionAuth = parse(fs.readFileSync("src/routes/sessionAuth.ts", "u
 const expectedSessionAuth = registrations(originalSessionAuth, false, "sessionAuthRouter");
 const sessionLogin = expectedSessionAuth.find((row) => row[0] === "post" && row[1] === '"/login"');
 sessionLogin[sessionLogin.length - 1] = replaceRequired(sessionLogin[sessionLogin.length - 1], "  state.reassigned = false;", "  state.reassigned = false;\n  sessionStates.set(stateKey, state);");
+const sessionUpload = expectedSessionAuth.find((row) => row[0] === "post" && row[1] === '"/upload-logs"');
+sessionUpload[sessionUpload.length - 1] = replaceRequired(sessionUpload[sessionUpload.length - 1], '// contains "..", or would overwrite the server-generated upload_info.json. The rest', '// contains "..", or would overwrite server-generated upload metadata or summaries. The rest');
+sessionUpload[sessionUpload.length - 1] = replaceRequired(sessionUpload[sessionUpload.length - 1], 'if (!normalized || normalized.toLowerCase() === "upload_info.json") {', 'if (!normalized || ["upload_info.json", "summary.md", "summary.json"].includes(normalized.toLowerCase())) {');
 assert.deepEqual(registrations(currentSessionAuth, true, "sessionAuthRouter"), expectedSessionAuth, "Session-auth registrations or bodies changed beyond the retained login-persistence fix");
 for (const [path, names] of [
   ["src/modules/sessions/uploadArtifacts.ts", ["sanitizeFilename", "toMs", "sanitizeJsonlBuffer", "mergeJsonlBuffers", "mergeMetadataBuffers"]],

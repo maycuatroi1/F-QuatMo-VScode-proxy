@@ -10,6 +10,15 @@ import { validateSummaryZip } from "../../services/summaryArchive";
 
 export const summaryZipLimit = bodyLimit({ maxSize: MAX_UPLOAD_BYTES });
 
+function generationFailure(c: any, err: any) {
+  // Child-process errors may contain full stdout/stderr, reports or credentials.
+  console.error("[Summary API] Generation failed", {
+    code: typeof err?.code === "string" || typeof err?.code === "number" ? err.code : undefined,
+    signal: typeof err?.signal === "string" ? err.signal : undefined,
+  });
+  return c.json({ ok: false, error: "Unable to generate summary. Check the engine configuration or try again." }, 500);
+}
+
 export const getStudentSummary = async (c: any) => {
     const sessionCode = sanitizeFilename(
       c.req.param("sessionCode"),
@@ -50,17 +59,7 @@ export const generateStudentSummary = async (c: any) => {
       );
       return c.json(generated);
     } catch (err: any) {
-      console.error(
-        `[Summary API] Generation failed for ${sessionCode}/${studentId}:`,
-        err,
-      );
-      return c.json(
-        {
-          ok: false,
-          error: err?.message || "Failed to generate student summary.",
-        },
-        500,
-      );
+      return generationFailure(c, err);
     }
   };
 
@@ -100,17 +99,7 @@ export const generateSessionSummaries = async (c: any) => {
         await summaryStorageService.generateSessionSummaries(sessionCode);
       return c.json(res);
     } catch (err: any) {
-      console.error(
-        `[Summary API] Batch generation failed for ${sessionCode}:`,
-        err,
-      );
-      return c.json(
-        {
-          ok: false,
-          error: err?.message || "Failed to batch generate summaries.",
-        },
-        500,
-      );
+      return generationFailure(c, err);
     }
   };
 
@@ -149,8 +138,7 @@ export const generateSummaryFromZip = async (c: any) => {
       : await summaryStorageService.generateStudentSummary(sessionCode, studentId!, zipPath, persist);
     return c.json(result);
   } catch (err: any) {
-    console.error("[Summary API] Failed to generate from uploaded zip:", err);
-    return c.json({ ok: false, error: err?.message || "Failed to process uploaded ZIP." }, 500);
+    return generationFailure(c, err);
   } finally {
     if (tempDir) await fs.promises.rm(tempDir, { recursive: true, force: true });
   }

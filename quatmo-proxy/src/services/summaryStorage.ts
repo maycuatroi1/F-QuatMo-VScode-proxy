@@ -2,10 +2,21 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { randomUUID } from "node:crypto";
 import { s3Storage } from "./s3Storage";
 import { createSummaryArchive, validateSummaryZip } from "./summaryArchive";
 
 const execFileAsync = promisify(execFile);
+
+async function writeSummaryFile(filename: string, content: string): Promise<void> {
+  const temporary = `${filename}.${randomUUID()}.tmp`;
+  try {
+    await fs.promises.writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await fs.promises.rename(temporary, filename);
+  } finally {
+    await fs.promises.unlink(temporary).catch(() => {});
+  }
+}
 
 function sanitizeSegment(name: string): string {
   return name.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -72,7 +83,19 @@ export class SummaryStorageService {
       const args = ["--zip", zipPath, "--output-dir", outputDir, "--json"];
       if (studentId) args.push("--student", studentId);
       const command = binary || process.env.SUMMARY_PYTHON_BIN || (process.platform === "win32" ? "py" : "python3");
+      // The engine needs model credentials, never proxy/JWT/DB/storage credentials.
+      const allowedEnv = new Set([
+        "PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL", "TZ",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+        "CUSTOM_BASE_URL", "CUSTOM_API_KEY", "CUSTOM_MODEL_NAME", "CUSTOM_MODEL_ALIASES",
+        "CLASSIFIER_API_URL", "CLASSIFIER_API_KEY", "CLASSIFIER_MODEL",
+        "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_ENABLED", "LLM_TEMPERATURE", "LLM_TIMEOUT_S", "LLM_MAX_RETRIES",
+        "SUMMARY_LLM_BASE_URL", "SUMMARY_LLM_API_KEY", "SUMMARY_LLM_MODEL", "SUMMARY_LLM_ALIASES", "SUMMARY_LLM_ENABLED", "SUMMARY_LLM_TIMEOUT_S",
+        "SUMMARY_ENGINE_MEMORY_MB", "MAX_UPLOAD_BYTES", "MAX_UPLOAD_FILES",
+      ]);
+      const engineEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => allowedEnv.has(name)));
       const { stdout } = await execFileAsync(command, binary ? args : [cliScriptPath, ...args], {
+        env: { ...engineEnv, PYTHONDONTWRITEBYTECODE: "1" },
         timeout: studentId ? 300000 : 1800000,
         maxBuffer: 50 * 1024 * 1024,
       });
@@ -148,13 +171,13 @@ export class SummaryStorageService {
     const jsonPath = path.join(studentDir, "summary.json");
 
     // Persist local copy
-    await fs.promises.writeFile(mdPath, markdown, "utf-8");
+    await writeSummaryFile(mdPath, markdown);
     if (metadata) {
       const jsonContent =
         typeof metadata === "string"
           ? metadata
           : JSON.stringify(metadata, null, 2);
-      await fs.promises.writeFile(jsonPath, jsonContent, "utf-8");
+      await writeSummaryFile(jsonPath, jsonContent);
     }
 
     let s3Saved = false;
@@ -272,7 +295,7 @@ export class SummaryStorageService {
       sessionDir,
       "session_manifest_summary.md",
     );
-    await fs.promises.writeFile(localManifestPath, manifestMarkdown, "utf-8");
+    await writeSummaryFile(localManifestPath, manifestMarkdown);
 
     if (s3Storage.isAvailable()) {
       await s3Storage.uploadSessionSummaryManifest(

@@ -59,7 +59,7 @@ async function withEngine(run: () => Promise<void>, legacyRoot = false) {
       result = {ok:true, students:['SE1','SE2'], manifest_content:'# Session summary'};
     }
     console.log('pipeline progress');
-    console.log(JSON.stringify({...result,inputEntries:entries}));
+    console.log(JSON.stringify({...result,inputEntries:entries,engineEnvNames:Object.keys(process.env)}));
   `);
   const keys = ["SUMMARY_ENGINE_BIN", "SUMMARY_CLI_PATH", "SUMMARY_PYTHON_BIN"];
   const previous = keys.map(key => process.env[key]);
@@ -160,7 +160,8 @@ test("summary archive fills missing S3 telemetry, excludes secrets and rejects c
     expect(() => validateSummaryZip(new AdmZip().toBuffer())).toThrow("empty");
     const nested = new AdmZip(); nested.addFile("large.txt", Buffer.alloc(2 * 1024 * 1024));
     const outer = new AdmZip(); outer.addFile("SE1/exam_records/REC/snapshot_start.zip", nested.toBuffer());
-    expect(() => validateSummaryZip(outer.toBuffer())).toThrow("limits");
+    // Nested payloads are inspected in the memory-limited Python worker, not the HTTP thread.
+    expect(() => validateSummaryZip(outer.toBuffer())).not.toThrow();
     listing.mockRejectedValue(new Error("storage unavailable"));
     await expect(createSummaryArchive(code, job)).rejects.toThrow("storage unavailable");
   } finally {
@@ -198,7 +199,10 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       const base = `${prefix}/visualize/sessions/${code}`;
       const single = await app.request(`${base}/accounts/SE1/summary/generate`, { method: "POST", headers });
       expect(single.status).toBe(200);
-      expect(await single.json()).toMatchObject({ ok: true, markdown: "# Summary SE1 — thử nghiệm" });
+      const singleResult = await single.json();
+      expect(singleResult).toMatchObject({ ok: true, markdown: "# Summary SE1 — thử nghiệm" });
+      expect(singleResult.engineEnvNames).not.toContain("JWT_SECRET");
+      expect(singleResult.engineEnvNames).not.toContain("PROXY_API_KEY");
       expect(await (await app.request(`${base}/accounts/SE1/summary`, { headers })).json()).toMatchObject({ markdown: "# Summary SE1 — thử nghiệm", metadata: { metrics: { requests_count: 2 } }, source: "local" });
       const batch = await app.request(`${base}/summary/generate-all`, { method: "POST", headers: admin });
       expect(batch.status).toBe(200);
@@ -208,7 +212,7 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       expect(await (await app.request(`${base}/summary-manifest`, { headers })).json()).toMatchObject({ manifestMarkdown: "# Session summary", source: "local" });
       const failed = await app.request(`${base}/accounts/FAIL/summary/generate`, { method: "POST", headers });
       expect(failed.status).toBe(500);
-      expect(await failed.json()).toMatchObject({ ok: false, error: "fixture failure" });
+      expect(await failed.json()).toMatchObject({ ok: false, error: "Unable to generate summary. Check the engine configuration or try again." });
       expect(fs.readdirSync(path.resolve("logs", "temp_summaries"))).toEqual([]);
     }, index === 1); } finally { sessions.delete(code); lecturerAccounts.delete(owner); fs.rmSync(root, { recursive: true, force: true }); }
   });

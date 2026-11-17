@@ -150,14 +150,14 @@ export async function uploadSessionLogs(c: any) {
     return c.json({ error: `Too many files (max ${MAX_UPLOAD_FILES}).` }, 413);
   }
   // Drop (instead of rejecting the whole submission) entries whose path is absolute,
-  // contains "..", or would overwrite the server-generated upload_info.json. The rest
+  // contains "..", or would overwrite server-generated upload metadata or summaries. The rest
   // of the student's work is still stored, and nothing can escape the student folder.
   let totalBytes = 0;
   let droppedFiles = 0;
   for (let i = uploadFiles.length - 1; i >= 0; i--) {
     const f = uploadFiles[i];
     const normalized = normalizeUploadRelPath(f.relativePath);
-    if (!normalized || normalized.toLowerCase() === "upload_info.json") {
+    if (!normalized || ["upload_info.json", "summary.md", "summary.json"].includes(normalized.toLowerCase())) {
       uploadFiles.splice(i, 1);
       droppedFiles++;
       continue;

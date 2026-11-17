@@ -8,9 +8,23 @@ import { s3Storage } from "./s3Storage";
 const artifacts = new Set(["events.jsonl", "ai_interactions.jsonl", "metadata.json", "upload_info.json", "snapshot_start.zip"]);
 
 export function validateSummaryZip(buffer: Buffer): void {
+  if (!Number.isSafeInteger(MAX_UPLOAD_BYTES) || MAX_UPLOAD_BYTES < 1 || !Number.isSafeInteger(MAX_UPLOAD_FILES) || MAX_UPLOAD_FILES < 1) throw new Error("Invalid summary archive limits.");
+  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error("Summary ZIP exceeds upload limits.");
+  // Bound central-directory allocation before adm-zip parses attacker-controlled entries.
+  let end = -1;
+  for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 65557); offset--) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50 && offset + 22 + buffer.readUInt16LE(offset + 20) === buffer.length) {
+      end = offset;
+      break;
+    }
+  }
+  if (end < 0) throw new Error("Invalid summary ZIP directory.");
+  const entries = buffer.readUInt16LE(end + 10);
+  if (buffer.readUInt16LE(end + 4) !== 0 || buffer.readUInt16LE(end + 6) !== 0 || buffer.readUInt16LE(end + 8) !== entries || entries === 65535 || buffer.readUInt32LE(end + 12) + buffer.readUInt32LE(end + 16) > end) throw new Error("Unsupported summary ZIP directory.");
+  if (entries > MAX_UPLOAD_FILES) throw new Error("Summary ZIP contains too many entries.");
   let bytes = 0;
   let count = 0;
-  function inspect(zip: AdmZip, nested: boolean) {
+  function inspect(zip: AdmZip) {
     for (const entry of zip.getEntries()) {
       if (++count > MAX_UPLOAD_FILES) throw new Error("Summary ZIP contains too many entries.");
       if (!normalizeUploadRelPath(entry.entryName)) throw new Error("Summary ZIP contains an unsafe path.");
@@ -19,11 +33,10 @@ export function validateSummaryZip(buffer: Buffer): void {
       if (bytes > MAX_UPLOAD_BYTES || (entry.header.size > 1024 * 1024 && entry.header.size / Math.max(1, entry.header.compressedSize) > 200)) {
         throw new Error("Summary ZIP exceeds decompression limits.");
       }
-      if (!nested && path.posix.basename(entry.entryName) === "snapshot_start.zip") inspect(new AdmZip(entry.getData()), true);
+      // Nested inflation and actual-byte checks run in the memory-limited Python worker.
     }
   }
-  inspect(new AdmZip(buffer), false);
-  if (!count) throw new Error("Summary ZIP is empty.");
+  inspect(new AdmZip(buffer));
   if (!count) throw new Error("Summary ZIP is empty.");
 }
 

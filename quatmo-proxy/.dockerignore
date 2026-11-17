@@ -1,0 +1,20 @@
+# Only build inputs enter the context; never send collected logs or credentials.
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!bun.lock
+!tsconfig.json
+!release_manifest.json
+!src/
+!src/**
+!summary_tool/
+!summary_tool/generate_cli.py
+!summary_tool/engine/
+!summary_tool/engine/*.py
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/__pycache__
+**/*.pyc

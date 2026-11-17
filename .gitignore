@@ -52,6 +52,8 @@ yarn-error.log*
 pnpm-debug.log*
 bun-debug.log*
 **/tests/
+!quatmo-proxy/summary_tool/tests/
+!quatmo-proxy/summary_tool/tests/test_cli.py
 !quatmo-proxy/tests/
 quatmo-proxy/tests/*
 !quatmo-proxy/tests/admin-jsonl-parser.test.ts

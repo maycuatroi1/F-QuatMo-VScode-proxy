@@ -1,0 +1,86 @@
+{
+  "source": "PhaseSUMMARY/summary_tool",
+  "capturedOn": "2026-11-17",
+  "adjustments": [
+    "Remove embedded credential defaults; credentials come from environment.",
+    "Verify HTTPS certificates with the platform trust store.",
+    "Replace development-only default output/archive paths; proxy supplies private job paths.",
+    "CLI validates actual outer/nested ZIP content and student identities before the unchanged research pipeline; Linux worker memory is bounded.",
+    "LLM transport rejects redirects to prevent Authorization forwarding."
+  ],
+  "files": [
+    {
+      "file": "generate_cli.py",
+      "sourceSha256": "ad862934d7f9faa269ef89c1f8860f5fad6ba9d2be4649b3f7e60154dffa0029",
+      "packagedSha256": "7dd626ab627e6a02ced486f794f4711eefc505656dfd19e372e01349a2add24d",
+      "identical": false
+    },
+    {
+      "file": "engine/config.py",
+      "sourceSha256": "961f08c8f15ad12e0306e2bbab1d8ea16dcd63f09654ccbd6e939779618056bb",
+      "packagedSha256": "167b7e9d402b96027e8d7d5e91f83107cec242415b4434d8b9646670b999f6ed",
+      "identical": false
+    },
+    {
+      "file": "engine/constants.py",
+      "sourceSha256": "1b14ecbf428a699ddfd62cb878bd42e33fa91c29dfa85103b13a8648dbccea19",
+      "packagedSha256": "1b14ecbf428a699ddfd62cb878bd42e33fa91c29dfa85103b13a8648dbccea19",
+      "identical": true
+    },
+    {
+      "file": "engine/generator.py",
+      "sourceSha256": "df9bf33e09399938d5e38f3ee0fe35ca5970288640678b9c4d5dc22a868f84a4",
+      "packagedSha256": "df9bf33e09399938d5e38f3ee0fe35ca5970288640678b9c4d5dc22a868f84a4",
+      "identical": true
+    },
+    {
+      "file": "engine/ingestion.py",
+      "sourceSha256": "d49031a60238bed114946df40983860f344ba6fb6283d740cd3d2cdc1b0c5b61",
+      "packagedSha256": "d49031a60238bed114946df40983860f344ba6fb6283d740cd3d2cdc1b0c5b61",
+      "identical": true
+    },
+    {
+      "file": "engine/interpretation.py",
+      "sourceSha256": "987a60bf062262c00faef27ac60272e7f0ae8e990b50b133efd0de89a05ea4c3",
+      "packagedSha256": "987a60bf062262c00faef27ac60272e7f0ae8e990b50b133efd0de89a05ea4c3",
+      "identical": true
+    },
+    {
+      "file": "engine/llm_client.py",
+      "sourceSha256": "aba7437ccd8e6a26329843773561d836cb30510fa34c377662fdeddbce43a698",
+      "packagedSha256": "11f1b55e866733771e0b4eea0c68346c3c3c9813fc9d3ff00db7744e94929296",
+      "identical": false
+    },
+    {
+      "file": "engine/pipeline.py",
+      "sourceSha256": "588dccbd11aa1e0e8beea7389d3c6e9996582a129b3082ac8401629ca64cf3ae",
+      "packagedSha256": "588dccbd11aa1e0e8beea7389d3c6e9996582a129b3082ac8401629ca64cf3ae",
+      "identical": true
+    },
+    {
+      "file": "engine/segmentation.py",
+      "sourceSha256": "c57b70ec1319b1ccf2f3a1fcaebb47dd6f165dff2236342fc691303ca1174f81",
+      "packagedSha256": "c57b70ec1319b1ccf2f3a1fcaebb47dd6f165dff2236342fc691303ca1174f81",
+      "identical": true
+    },
+    {
+      "file": "engine/signals.py",
+      "sourceSha256": "f304e6873f1261376c3ee3722474e5431265d20f9b98cd64c8932f7a8999174d",
+      "packagedSha256": "f304e6873f1261376c3ee3722474e5431265d20f9b98cd64c8932f7a8999174d",
+      "identical": true
+    },
+    {
+      "file": "engine/__init__.py",
+      "sourceSha256": "0e734b833a96266261f56d8fadf19dc3a7e9471d72d5a8eba98c2e7098a6d86d",
+      "packagedSha256": "0e734b833a96266261f56d8fadf19dc3a7e9471d72d5a8eba98c2e7098a6d86d",
+      "identical": true
+    }
+  ],
+  "additionalFiles": [
+    {
+      "file": "engine/archive_security.py",
+      "purpose": "Untrusted ZIP validation and Linux memory bound",
+      "sha256": "d4c3e1456621ac806a123b5914be2210c1c7c325d9cfc8f538f94a8d2574b0e2"
+    }
+  ]
+}
