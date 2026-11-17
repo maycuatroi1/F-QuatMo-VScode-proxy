@@ -5,6 +5,7 @@ import { promisify } from "util";
 import { randomUUID } from "node:crypto";
 import { s3Storage } from "./s3Storage";
 import { createSummaryArchive, validateSummaryZip } from "./summaryArchive";
+import type { SummaryProgressCallback } from "./summaryProgress";
 
 const execFileAsync = promisify(execFile);
 
@@ -66,7 +67,7 @@ export class SummaryStorageService {
     return null;
   }
 
-  private async runEngine(sessionCode: string, studentId?: string, customZipPath?: string): Promise<any> {
+  private async runEngine(sessionCode: string, studentId?: string, customZipPath?: string, onProgress?: SummaryProgressCallback): Promise<any> {
     if (!/^[A-Za-z0-9_-]+$/.test(sessionCode) || (studentId !== undefined && !/^[A-Za-z0-9_-]+$/.test(studentId))) throw new Error("Invalid summary session or student ID.");
     const binary = this.getResolvedEngineBin();
     const cliScriptPath = process.env.SUMMARY_CLI_PATH || path.resolve("..", "..", "PhaseSUMMARY", "summary_tool", "generate_cli.py");
@@ -79,9 +80,11 @@ export class SummaryStorageService {
     try {
       const zipPath = customZipPath || await createSummaryArchive(sessionCode, jobDir);
       if (customZipPath) validateSummaryZip(await fs.promises.readFile(zipPath));
+      onProgress?.({ stage: "validating" });
       const outputDir = path.join(jobDir, "output");
       const args = ["--zip", zipPath, "--output-dir", outputDir, "--json"];
       if (studentId) args.push("--student", studentId);
+      if (onProgress && !binary) args.push("--progress");
       const command = binary || process.env.SUMMARY_PYTHON_BIN || (process.platform === "win32" ? "py" : "python3");
       // The engine needs model credentials, never proxy/JWT/DB/storage credentials.
       const allowedEnv = new Set([
@@ -94,11 +97,29 @@ export class SummaryStorageService {
         "SUMMARY_ENGINE_MEMORY_MB", "MAX_UPLOAD_BYTES", "MAX_UPLOAD_FILES",
       ]);
       const engineEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => allowedEnv.has(name)));
-      const { stdout } = await execFileAsync(command, binary ? args : [cliScriptPath, ...args], {
+      const execution = execFileAsync(command, binary ? args : [cliScriptPath, ...args], {
         env: { ...engineEnv, PYTHONDONTWRITEBYTECODE: "1" },
         timeout: studentId ? 300000 : 1800000,
         maxBuffer: 50 * 1024 * 1024,
       });
+      let pending = "";
+      execution.child.stderr?.on("data", (chunk: Buffer | string) => {
+        if (!onProgress) return;
+        pending += chunk.toString();
+        const lines = pending.split(/\r?\n/);
+        pending = lines.pop() || "";
+        if (pending.length > 4096) pending = "";
+        for (const line of lines) {
+          if (!line.startsWith("SUMMARY_PROGRESS ") || line.length > 4096) continue;
+          try {
+            const event = JSON.parse(line.slice(17));
+            if (Number.isSafeInteger(event.completed) && Number.isSafeInteger(event.total) && event.total >= 0 && event.completed >= 0 && event.completed <= event.total) {
+              onProgress({ stage: "generating", completed: event.completed, total: event.total });
+            }
+          } catch { /* Non-progress stderr is never exposed through the progress API. */ }
+        }
+      });
+      const { stdout } = await execution;
       // The existing CLI writes progress before its final one-line JSON payload.
       const result = JSON.parse(stdout.trim().split(/\r?\n/).at(-1)!);
       if (!result.ok) throw new Error(result.error || "Summary engine failed.");
@@ -131,14 +152,17 @@ export class SummaryStorageService {
     }
   }
 
-  public async generateStudentSummary(sessionCode: string, studentId: string, customZipPath?: string, persist = true): Promise<any> {
-    const result = await this.runEngine(sessionCode, studentId, customZipPath);
+  public async generateStudentSummary(sessionCode: string, studentId: string, customZipPath?: string, persist = true, onProgress?: SummaryProgressCallback): Promise<any> {
+    const result = await this.runEngine(sessionCode, studentId, customZipPath, onProgress);
+    onProgress?.({ stage: "saving", completed: 1, total: 1 });
     if (persist) await this.saveStudentSummary(sessionCode, studentId, result.markdown, { check_report: result.check_report, metrics: result.metrics });
     return result;
   }
 
-  public async generateSessionSummaries(sessionCode: string, customZipPath?: string, persist = true): Promise<any> {
-    const result = await this.runEngine(sessionCode, undefined, customZipPath);
+  public async generateSessionSummaries(sessionCode: string, customZipPath?: string, persist = true, onProgress?: SummaryProgressCallback): Promise<any> {
+    const result = await this.runEngine(sessionCode, undefined, customZipPath, onProgress);
+    const total = Object.keys(result.reports).length;
+    onProgress?.({ stage: "saving", completed: total, total });
     if (persist) {
       for (const [studentId, report] of Object.entries<any>(result.reports)) {
         await this.saveStudentSummary(sessionCode, studentId, report.markdown, { check_report: report.check_report, metrics: report.metrics });

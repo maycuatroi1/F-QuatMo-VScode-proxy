@@ -7,6 +7,7 @@ import { sessions } from "../../services/sessionStore";
 import { requireCaller } from "../../shared/http/adminCaller";
 import { MAX_UPLOAD_BYTES } from "../../config/uploadLimits";
 import { validateSummaryZip } from "../../services/summaryArchive";
+import { reportSummaryProgress } from "./summaryGuard";
 
 export const summaryZipLimit = bodyLimit({ maxSize: MAX_UPLOAD_BYTES });
 
@@ -56,6 +57,9 @@ export const generateStudentSummary = async (c: any) => {
       const generated = await summaryStorageService.generateStudentSummary(
         sessionCode,
         studentId,
+        undefined,
+        true,
+        reportSummaryProgress(c),
       );
       return c.json(generated);
     } catch (err: any) {
@@ -96,7 +100,7 @@ export const generateSessionSummaries = async (c: any) => {
 
     try {
       const res =
-        await summaryStorageService.generateSessionSummaries(sessionCode);
+        await summaryStorageService.generateSessionSummaries(sessionCode, undefined, true, reportSummaryProgress(c));
       return c.json(res);
     } catch (err: any) {
       return generationFailure(c, err);
@@ -134,8 +138,8 @@ export const generateSummaryFromZip = async (c: any) => {
     // Historical imports without a managed session stay in the importing UI.
     const persist = Boolean(session);
     const result = mode === "all"
-      ? await summaryStorageService.generateSessionSummaries(sessionCode, zipPath, persist)
-      : await summaryStorageService.generateStudentSummary(sessionCode, studentId!, zipPath, persist);
+      ? await summaryStorageService.generateSessionSummaries(sessionCode, zipPath, persist, reportSummaryProgress(c))
+      : await summaryStorageService.generateStudentSummary(sessionCode, studentId!, zipPath, persist, reportSummaryProgress(c));
     return c.json(result);
   } catch (err: any) {
     return generationFailure(c, err);

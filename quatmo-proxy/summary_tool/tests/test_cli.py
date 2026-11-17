@@ -50,17 +50,21 @@ class PackagedSummaryTest(unittest.TestCase):
                 }) + "\n")
         original_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
         output_dir = self.work / "output"
-        result, single = self.run_cli("--zip", archive, "--student", "SE1", "--output-dir", output_dir, "--json")
+        result, single = self.run_cli("--zip", archive, "--student", "SE1", "--output-dir", output_dir, "--json", "--progress")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(single["ok"])
         self.assertEqual(single["student_id"], "SE1")
         self.assertTrue(single["markdown"])
         self.assertFalse(single["check_report"]["llm_used"])
-        result, batch = self.run_cli("--zip", archive, "--output-dir", output_dir, "--json")
+        single_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
+        self.assertEqual(single_progress, [{"completed": 0, "total": 1}, {"completed": 1, "total": 1}])
+        result, batch = self.run_cli("--zip", archive, "--output-dir", output_dir, "--json", "--progress")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(batch["ok"])
         self.assertEqual(sorted(batch["students"]), ["SE1", "SE2"])
         self.assertTrue(batch["manifest_content"])
+        batch_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
+        self.assertEqual(batch_progress, [{"completed": value, "total": 2} for value in range(3)])
         for student in batch["students"]:
             self.assertTrue((output_dir / archive.stem / "students" / f"{student}_summary.md").read_text(encoding="utf-8"))
         self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), original_hash)

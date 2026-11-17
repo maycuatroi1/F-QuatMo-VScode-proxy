@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import argparse
+import threading
 
 # Ensure engine is in python path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -25,12 +26,34 @@ from engine.pipeline import SummaryPipeline
 from engine.config import config
 from engine.archive_security import apply_memory_limit, validate_archive, validate_student_ids
 
+
+class ProgressSummaryPipeline(SummaryPipeline):
+    """Observe completed reports without changing the research pipeline."""
+    def __init__(self, *args, report_progress=False, single=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._report_progress = report_progress
+        self._report_total = 1 if single else len(self.get_students())
+        self._report_completed = 0
+        self._report_lock = threading.Lock()
+
+    def emit_progress(self):
+        if self._report_progress:
+            print("SUMMARY_PROGRESS " + json.dumps({"completed": self._report_completed, "total": self._report_total}), file=sys.stderr, flush=True)
+
+    def run_student(self, *args, **kwargs):
+        result = super().run_student(*args, **kwargs)
+        with self._report_lock:
+            self._report_completed += 1
+            self.emit_progress()
+        return result
+
 def main():
     parser = argparse.ArgumentParser(description="PhaseSUMMARY CLI Engine")
     parser.add_argument("--zip", type=str, help="Path to exam session zip archive")
     parser.add_argument("--student", type=str, help="Student ID to generate summary for")
     parser.add_argument("--output-dir", type=str, help="Directory to save output markdown files")
     parser.add_argument("--json", action="store_true", help="Output result as JSON to stdout")
+    parser.add_argument("--progress", action="store_true", help="Emit report-completion counters to stderr")
 
     args = parser.parse_args()
 
@@ -46,8 +69,9 @@ def main():
         if args.student:
             validate_student_ids([args.student])
         out_dir = args.output_dir or config.output_dir
-        pipeline = SummaryPipeline(zip_path, output_dir=out_dir, params=config.model.to_pipeline_params())
+        pipeline = ProgressSummaryPipeline(zip_path, output_dir=out_dir, params=config.model.to_pipeline_params(), report_progress=args.progress, single=bool(args.student))
         validate_student_ids(pipeline.get_students())
+        pipeline.emit_progress()
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
         sys.exit(1)

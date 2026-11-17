@@ -155,6 +155,7 @@ const summaryRoutes = [
   ["post", '"/visualize/sessions/:sessionCode/summary/generate-all"', "limitSummaryGeneration", "generateSessionSummaries"],
   ["post", '"/visualize/summary/generate-from-zip"', "limitSummaryGeneration", "summaryZipLimit", "generateSummaryFromZip"],
   ["get", '"/visualize/sessions/:sessionCode/summaries"', "listSessionSummaries"],
+  ["get", '"/visualize/summary/jobs/:jobId"', "getSummaryJobProgress"],
 ];
 const summaryPaths = new Set(summaryRoutes.map((row) => row[1]));
 const adminRegistrations = registrations(current, true);

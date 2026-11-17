@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { limitSummaryGeneration } from "../modules/visualization/summaryGuard";
+import { getSummaryJobProgress, limitSummaryGeneration } from "../modules/visualization/summaryGuard";
 import { getStudentSummary, generateStudentSummary, getSessionSummaryManifest, generateSessionSummaries, generateSummaryFromZip, listSessionSummaries, summaryZipLimit } from "../modules/visualization/summaryHandlers";
 import { uploadVisualizeRecord } from "../modules/visualization/recordHandlers";
 import { getStorageStatus } from "../modules/storage/adminHandlers";
@@ -176,5 +176,6 @@ adminRouter.get("/visualize/sessions/:sessionCode/summary-manifest", getSessionS
 adminRouter.post("/visualize/sessions/:sessionCode/summary/generate-all", limitSummaryGeneration, generateSessionSummaries);
 adminRouter.post("/visualize/summary/generate-from-zip", limitSummaryGeneration, summaryZipLimit, generateSummaryFromZip);
 adminRouter.get("/visualize/sessions/:sessionCode/summaries", listSessionSummaries);
+adminRouter.get("/visualize/summary/jobs/:jobId", getSummaryJobProgress);
 
 export { adminRouter };

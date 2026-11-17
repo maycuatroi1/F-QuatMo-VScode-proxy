@@ -6,13 +6,14 @@
     "Verify HTTPS certificates with the platform trust store.",
     "Replace development-only default output/archive paths; proxy supplies private job paths.",
     "CLI validates actual outer/nested ZIP content and student identities before the unchanged research pipeline; Linux worker memory is bounded.",
-    "LLM transport rejects redirects to prevent Authorization forwarding."
+    "LLM transport rejects redirects to prevent Authorization forwarding.",
+    "CLI optionally emits only report-completion counters to stderr; research pipeline, prompts and final JSON remain unchanged."
   ],
   "files": [
     {
       "file": "generate_cli.py",
       "sourceSha256": "ad862934d7f9faa269ef89c1f8860f5fad6ba9d2be4649b3f7e60154dffa0029",
-      "packagedSha256": "7dd626ab627e6a02ced486f794f4711eefc505656dfd19e372e01349a2add24d",
+      "packagedSha256": "cc7f566fb5c6aeeae39ae68b6178f195d91a7e7aa9516f738fa5f0ea940d3917",
       "identical": false
     },
     {
