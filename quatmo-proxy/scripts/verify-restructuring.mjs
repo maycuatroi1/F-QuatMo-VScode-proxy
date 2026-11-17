@@ -147,7 +147,19 @@ for (const [route, name, hash] of [
   assert.equal(createHash("sha256").update(body).digest("hex"), hash, `${name} differs from the approved guest-source fix`);
   expectedRegistrations.find((row) => row[0] === "get" && row[1] === route)[2] = body;
 }
-assert.deepEqual(registrations(current, true), expectedRegistrations, "Admin registrations/handlers differ beyond the recorded technical and user-approved policy changes");
+// Additive summary integration; every pre-existing registration/body stays pinned.
+const summaryRoutes = [
+  ["get", '"/visualize/sessions/:sessionCode/accounts/:studentId/summary"', "getStudentSummary"],
+  ["post", '"/visualize/sessions/:sessionCode/accounts/:studentId/summary/generate"', "generateStudentSummary"],
+  ["get", '"/visualize/sessions/:sessionCode/summary-manifest"', "getSessionSummaryManifest"],
+  ["post", '"/visualize/sessions/:sessionCode/summary/generate-all"', "generateSessionSummaries"],
+  ["post", '"/visualize/summary/generate-from-zip"', "summaryZipLimit", "generateSummaryFromZip"],
+  ["get", '"/visualize/sessions/:sessionCode/summaries"', "listSessionSummaries"],
+];
+const summaryPaths = new Set(summaryRoutes.map((row) => row[1]));
+const adminRegistrations = registrations(current, true);
+assert.deepEqual(adminRegistrations.filter((row) => summaryPaths.has(row[1])), summaryRoutes, "Summary route contracts changed");
+assert.deepEqual(adminRegistrations.filter((row) => !summaryPaths.has(row[1])), expectedRegistrations, "Admin registrations/handlers differ beyond the recorded technical and user-approved policy changes");
 for (const name of ["appendJsonLines", "hasNonEmptyLine", "countNonEmptyLines", "requireCaller", "syncGroupWithActiveSessions", "sanitizeFilename", "isSensitiveLogFile", "sendDirectoryZip", "getClientIP", "toMs", "sliceRecordsByTimeRange", "loadEventLogFromS3"]) {
   const original = old.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name);
   let expectedBody = original.body.getText(old);

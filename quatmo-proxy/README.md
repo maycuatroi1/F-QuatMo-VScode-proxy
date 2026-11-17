@@ -135,3 +135,7 @@ bun run build
 ## 🛠️ Hướng Dẫn Triển Khai Web API Cho Classifier (Để chạy chuẩn Production)
 
 Khi chạy service Python Classifier, bạn chỉ cần đặt cấu hình `CLASSIFIER_API_URL=http://127.0.0.1:8000/classify` vào `.env` của Proxy. Mọi cuộc gọi phân loại prompt sẽ chuyển sang gọi HTTP cực kỳ nhẹ nhàng và nhanh chóng.
+
+## Process Summary
+
+Sinh summary thủ công cho từng sinh viên hoặc cả session: xem [cấu hình engine và báo cáo kiểm thử](docs/summary-integration.md).

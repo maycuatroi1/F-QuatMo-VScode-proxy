@@ -767,6 +767,225 @@ export class S3StorageService {
       return null;
     }
   }
+  // ─── Student Summary Storage Methods ─────────────────────────────────────────
+  public async listSessionTelemetryFiles(sessionCode: string): Promise<string[]> {
+    if (!this.isAvailable() || !this.client) return [];
+    const prefix = `sessions/${sanitizeSegment(sessionCode).toUpperCase()}/students/`;
+    const files: string[] = [];
+    let continuationToken: string | undefined;
+    do {
+      const response: any = await this.sendCommand(new ListObjectsV2Command({
+        Bucket: this.bucket, Prefix: prefix, ContinuationToken: continuationToken,
+      }));
+      for (const item of response.Contents || []) {
+        if (item.Key?.startsWith(prefix)) files.push(item.Key.slice(prefix.length));
+      }
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+    return files;
+  }
+
+  public formatStudentSummaryMarkdownKey(
+    sessionCode: string,
+    studentId: string,
+  ): string {
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const safeStudent = sanitizeSegment(studentId).toUpperCase();
+    return `sessions/${safeSession}/students/${safeStudent}/summary.md`;
+  }
+
+  public formatStudentSummaryJsonKey(
+    sessionCode: string,
+    studentId: string,
+  ): string {
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const safeStudent = sanitizeSegment(studentId).toUpperCase();
+    return `sessions/${safeSession}/students/${safeStudent}/summary.json`;
+  }
+
+  public formatSessionSummaryManifestKey(sessionCode: string): string {
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    return `sessions/${safeSession}/session_manifest_summary.md`;
+  }
+
+  public async uploadStudentSummary(
+    sessionCode: string,
+    studentId: string,
+    markdown: string,
+    metadata?: any,
+  ): Promise<boolean> {
+    if (!this.isAvailable() || !this.client) return false;
+
+    const mdKey = this.formatStudentSummaryMarkdownKey(sessionCode, studentId);
+    const jsonKey = this.formatStudentSummaryJsonKey(sessionCode, studentId);
+
+    try {
+      await Promise.all([
+        this.sendCommand(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: mdKey,
+            Body: markdown,
+            ContentType: "text/markdown; charset=utf-8",
+          }),
+        ),
+        metadata
+          ? this.sendCommand(
+              new PutObjectCommand({
+                Bucket: this.bucket,
+                Key: jsonKey,
+                Body:
+                  typeof metadata === "string"
+                    ? metadata
+                    : JSON.stringify(metadata, null, 2),
+                ContentType: "application/json",
+              }),
+            )
+          : Promise.resolve(),
+      ]);
+      return true;
+    } catch (err) {
+      console.error(
+        `[S3 Storage] Failed to upload student summary for ${sessionCode}/${studentId}:`,
+        err,
+      );
+      return false;
+    }
+  }
+
+  public async getStudentSummary(
+    sessionCode: string,
+    studentId: string,
+  ): Promise<{ markdown: string; metadata: any } | null> {
+    if (!this.isAvailable() || !this.client) return null;
+
+    const mdKey = this.formatStudentSummaryMarkdownKey(sessionCode, studentId);
+    const jsonKey = this.formatStudentSummaryJsonKey(sessionCode, studentId);
+
+    try {
+      const mdResp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: mdKey,
+        }),
+      );
+      if (!mdResp.Body) return null;
+      const markdown = await mdResp.Body.transformToString("utf-8");
+
+      let metadata: any = null;
+      try {
+        const jsonResp = await this.sendCommand(
+          new GetObjectCommand({
+            Bucket: this.bucket,
+            Key: jsonKey,
+          }),
+        );
+        if (jsonResp.Body) {
+          const jsonStr = await jsonResp.Body.transformToString("utf-8");
+          metadata = JSON.parse(jsonStr);
+        }
+      } catch {}
+
+      return { markdown, metadata };
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.error(
+        `[S3 Storage] Failed to get summary for ${sessionCode}/${studentId}:`,
+        err,
+      );
+      return null;
+    }
+  }
+
+  public async uploadSessionSummaryManifest(
+    sessionCode: string,
+    manifestMarkdown: string,
+  ): Promise<boolean> {
+    if (!this.isAvailable() || !this.client) return false;
+
+    const key = this.formatSessionSummaryManifestKey(sessionCode);
+    try {
+      await this.sendCommand(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: manifestMarkdown,
+          ContentType: "text/markdown; charset=utf-8",
+        }),
+      );
+      return true;
+    } catch (err) {
+      console.error(
+        `[S3 Storage] Failed to upload session summary manifest for ${sessionCode}:`,
+        err,
+      );
+      return false;
+    }
+  }
+
+  public async getSessionSummaryManifest(
+    sessionCode: string,
+  ): Promise<string | null> {
+    if (!this.isAvailable() || !this.client) return null;
+
+    const key = this.formatSessionSummaryManifestKey(sessionCode);
+    try {
+      const resp = await this.sendCommand(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+        }),
+      );
+      if (!resp.Body) return null;
+      return await resp.Body.transformToString("utf-8");
+    } catch (err: any) {
+      if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+        return null;
+      }
+      console.error(
+        `[S3 Storage] Failed to get session summary manifest for ${sessionCode}:`,
+        err,
+      );
+      return null;
+    }
+  }
+
+  public async listStudentSummariesFromS3(
+    sessionCode: string,
+  ): Promise<string[]> {
+    if (!this.isAvailable() || !this.client) return [];
+
+    const safeSession = sanitizeSegment(sessionCode).toUpperCase();
+    const studentsPrefix = `sessions/${safeSession}/students/`;
+
+    try {
+      const studentIds = new Set<string>();
+      let continuationToken: string | undefined;
+      do {
+        const resp: any = await this.sendCommand(new ListObjectsV2Command({
+          Bucket: this.bucket, Prefix: studentsPrefix, ContinuationToken: continuationToken,
+        }));
+        for (const item of resp.Contents || []) {
+          if (item.Key?.startsWith(studentsPrefix)) {
+            const parts = item.Key.slice(studentsPrefix.length).split("/");
+            if (parts.length === 2 && parts[1] === "summary.md") {
+              studentIds.add(parts[0]);
+            }
+          }
+        }
+        continuationToken = resp.NextContinuationToken;
+      } while (continuationToken);
+      return Array.from(studentIds);
+    } catch (err) {
+      console.error(
+        `[S3 Storage] Failed to list student summaries for session ${sessionCode}:`,
+        err,
+      );
+      return [];
+    }
+  }
 }
 
 export const s3Storage = new S3StorageService();

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { getStudentSummary, generateStudentSummary, getSessionSummaryManifest, generateSessionSummaries, generateSummaryFromZip, listSessionSummaries, summaryZipLimit } from "../modules/visualization/summaryHandlers";
 import { uploadVisualizeRecord } from "../modules/visualization/recordHandlers";
 import { getStorageStatus } from "../modules/storage/adminHandlers";
 
@@ -167,5 +168,12 @@ adminRouter.post("/groups/:name/students", addGroupStudents);
 adminRouter.delete("/groups/:name/students/:studentId", removeGroupStudent);
 
 adminRouter.delete("/groups/:name", deleteGroup);
+
+adminRouter.get("/visualize/sessions/:sessionCode/accounts/:studentId/summary", getStudentSummary);
+adminRouter.post("/visualize/sessions/:sessionCode/accounts/:studentId/summary/generate", generateStudentSummary);
+adminRouter.get("/visualize/sessions/:sessionCode/summary-manifest", getSessionSummaryManifest);
+adminRouter.post("/visualize/sessions/:sessionCode/summary/generate-all", generateSessionSummaries);
+adminRouter.post("/visualize/summary/generate-from-zip", summaryZipLimit, generateSummaryFromZip);
+adminRouter.get("/visualize/sessions/:sessionCode/summaries", listSessionSummaries);
 
 export { adminRouter };
