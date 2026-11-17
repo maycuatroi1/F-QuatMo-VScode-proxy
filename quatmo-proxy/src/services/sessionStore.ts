@@ -402,6 +402,9 @@ export class PersistedSessions extends Map<string, Session> {
     if (existed) {
       stmtDeleteSession.run({ $code: key });
       db.run(`DELETE FROM session_states WHERE session_code = ?`, [key]);
+      for (const [stateKey, state] of sessionStates) {
+        if (state.sessionCode === key) sessionStates.delete(stateKey);
+      }
     }
     return existed;
   }

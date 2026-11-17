@@ -13,20 +13,32 @@ quatmo-proxy/
 ├── bin/
 │   └── classifier.exe       # Trình phân loại Prompt cục bộ (Fallback Local Dev)
 ├── src/
-│   ├── middleware/
-│   │   ├── auth.ts          # Middleware xác thực an toàn thông tin (API Key)
-│   │   └── rateLimit.ts     # Middleware giới hạn tần suất yêu cầu bằng Redis
-│   ├── routes/
-│   │   └── chat.ts          # Route chính xử lý chat streaming, XML Tool Calls & Classifier
+│   ├── config/             # Giới hạn upload và vị trí manifest/artifact release
+│   ├── middleware/         # Xác thực, ownership, fingerprint, phiên bản, rate limit
+│   ├── routes/             # Khai báo endpoint, thứ tự middleware và export tương thích
+│   ├── modules/
+│   │   ├── auth/           # Đăng nhập tài khoản và admin
+│   │   ├── sessions/       # Quản trị phiên, login, status, SSE, upload log
+│   │   ├── chat/           # Context, completions, upstream, prompt, tool call, logging
+│   │   ├── visualization/  # Danh sách, prompt/event log, snapshot, record upload
+│   │   ├── telemetry/      # JSONL, đồng bộ token, tải log
+│   │   ├── releases/       # Manifest, cache, update protocol, artifact, publish
+│   │   └── ...             # users, groups, lecturers, security, storage
+│   ├── shared/http/        # Caller và client-IP dùng chung
 │   ├── services/
 │   │   ├── proxyKey.ts      # Khởi tạo và quản lý Access Key của Proxy
-│   │   ├── redis.ts         # Quản lý kết nối & cơ chế fail-open của Redis Cache
+│   │   ├── redis.ts         # Kết nối Redis và reconnect/fallback
 │   │   └── token.ts         # Tính toán lượng token tiêu thụ (dựa trên Tiktoken)
 │   └── index.ts             # Entry point khởi tạo Hono Server
 ├── .env.example             # File mẫu cấu hình biến môi trường
 ├── package.json             # Định nghĩa dependencies & scripts chạy dự án
 └── tsconfig.json            # Cấu hình TypeScript compiler
 ```
+
+Tài liệu chuyển giao: [kiến trúc và cách kiểm tra](docs/architecture-handoff.md),
+[bảng kết quả từng task](docs/restructuring-baseline.md). Đợt tách module giữ nguyên
+API/nghiệp vụ trừ các sửa lỗi được ghi rõ trong báo cáo; kiểm thử local không thay
+thế kiểm tra môi trường triển khai thực tế.
 
 ---
 

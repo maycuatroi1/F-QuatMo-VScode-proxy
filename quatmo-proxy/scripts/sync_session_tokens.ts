@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
 import AdmZip from "adm-zip";
-import { sessionStates, stmtSaveState } from "../src/services/sessionStore";
-import { safeParseJson } from "../src/services/telemetryMigration";
+import { sessionStates } from "../src/services/sessionStore";
+import { safeParseJson } from "../src/services/promptLogService";
 import { redis } from "../src/services/redis";
 
 async function main() {
