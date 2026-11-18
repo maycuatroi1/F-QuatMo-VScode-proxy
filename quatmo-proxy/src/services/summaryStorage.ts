@@ -122,6 +122,7 @@ export class SummaryStorageService {
         "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_ENABLED", "LLM_TEMPERATURE", "LLM_TIMEOUT_S", "LLM_MAX_RETRIES",
         "SUMMARY_LLM_BASE_URL", "SUMMARY_LLM_API_KEY", "SUMMARY_LLM_MODEL", "SUMMARY_LLM_ALIASES", "SUMMARY_LLM_ENABLED", "SUMMARY_LLM_TIMEOUT_S",
         "SUMMARY_ENGINE_MEMORY_MB", "MAX_UPLOAD_BYTES", "MAX_UPLOAD_FILES",
+        "SUMMARY_MAX_ARCHIVE_BYTES", "SUMMARY_MAX_ARCHIVE_FILES",
       ]);
       const engineEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => allowedEnv.has(name)));
       const execution = execFileAsync(command, binary ? args : [cliScriptPath, ...args], {

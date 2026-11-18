@@ -22,8 +22,8 @@ def apply_memory_limit():
 
 
 def validate_archive(filename):
-    maximum_bytes = int(os.getenv("MAX_UPLOAD_BYTES") or str(100 * 1024 * 1024))
-    maximum_files = int(os.getenv("MAX_UPLOAD_FILES") or "5000")
+    maximum_bytes = int(os.getenv("SUMMARY_MAX_ARCHIVE_BYTES") or str(512 * 1024 * 1024))
+    maximum_files = int(os.getenv("SUMMARY_MAX_ARCHIVE_FILES") or "50000")
     if maximum_bytes < 1 or maximum_files < 1:
         raise ValueError("Invalid summary archive limits.")
     if Path(filename).stat().st_size > maximum_bytes:

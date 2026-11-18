@@ -1,15 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import AdmZip from "adm-zip";
-import { MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES } from "../config/uploadLimits";
+import { SUMMARY_MAX_ARCHIVE_BYTES, SUMMARY_MAX_ARCHIVE_FILES } from "../config/summaryLimits";
 import { normalizeUploadRelPath } from "./security";
 import { s3Storage } from "./s3Storage";
 
 const artifacts = new Set(["events.jsonl", "ai_interactions.jsonl", "metadata.json", "upload_info.json", "snapshot_start.zip"]);
 
 export function validateSummaryZip(buffer: Buffer): void {
-  if (!Number.isSafeInteger(MAX_UPLOAD_BYTES) || MAX_UPLOAD_BYTES < 1 || !Number.isSafeInteger(MAX_UPLOAD_FILES) || MAX_UPLOAD_FILES < 1) throw new Error("Invalid summary archive limits.");
-  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error("Summary ZIP exceeds upload limits.");
+  if (!Number.isSafeInteger(SUMMARY_MAX_ARCHIVE_BYTES) || SUMMARY_MAX_ARCHIVE_BYTES < 1 || !Number.isSafeInteger(SUMMARY_MAX_ARCHIVE_FILES) || SUMMARY_MAX_ARCHIVE_FILES < 1) throw new Error("Invalid summary archive limits.");
+  if (buffer.length > SUMMARY_MAX_ARCHIVE_BYTES) throw new Error("Summary ZIP exceeds archive limits.");
   // Bound central-directory allocation before adm-zip parses attacker-controlled entries.
   let end = -1;
   for (let offset = buffer.length - 22; offset >= Math.max(0, buffer.length - 65557); offset--) {
@@ -21,16 +21,16 @@ export function validateSummaryZip(buffer: Buffer): void {
   if (end < 0) throw new Error("Invalid summary ZIP directory.");
   const entries = buffer.readUInt16LE(end + 10);
   if (buffer.readUInt16LE(end + 4) !== 0 || buffer.readUInt16LE(end + 6) !== 0 || buffer.readUInt16LE(end + 8) !== entries || entries === 65535 || buffer.readUInt32LE(end + 12) + buffer.readUInt32LE(end + 16) > end) throw new Error("Unsupported summary ZIP directory.");
-  if (entries > MAX_UPLOAD_FILES) throw new Error("Summary ZIP contains too many entries.");
+  if (entries > SUMMARY_MAX_ARCHIVE_FILES) throw new Error("Summary ZIP contains too many entries.");
   let bytes = 0;
   let count = 0;
   function inspect(zip: AdmZip) {
     for (const entry of zip.getEntries()) {
-      if (++count > MAX_UPLOAD_FILES) throw new Error("Summary ZIP contains too many entries.");
+      if (++count > SUMMARY_MAX_ARCHIVE_FILES) throw new Error("Summary ZIP contains too many entries.");
       if (!normalizeUploadRelPath(entry.entryName)) throw new Error("Summary ZIP contains an unsafe path.");
       if (entry.isDirectory) continue;
       bytes += entry.header.size;
-      if (bytes > MAX_UPLOAD_BYTES || (entry.header.size > 1024 * 1024 && entry.header.size / Math.max(1, entry.header.compressedSize) > 200)) {
+      if (bytes > SUMMARY_MAX_ARCHIVE_BYTES || (entry.header.size > 1024 * 1024 && entry.header.size / Math.max(1, entry.header.compressedSize) > 200)) {
         throw new Error("Summary ZIP exceeds decompression limits.");
       }
       // Nested inflation and actual-byte checks run in the memory-limited Python worker.
@@ -49,7 +49,7 @@ export async function createSummaryArchive(sessionCode: string, tempDir: string)
     if (files.has(name)) return;
     const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
     bytes += buffer.length;
-    if (bytes > MAX_UPLOAD_BYTES || files.size >= MAX_UPLOAD_FILES) throw new Error("Session telemetry exceeds summary archive limits.");
+    if (bytes > SUMMARY_MAX_ARCHIVE_BYTES || files.size >= SUMMARY_MAX_ARCHIVE_FILES) throw new Error("Session telemetry exceeds summary archive limits.");
     zip.addFile(name, buffer);
     files.add(name);
   }

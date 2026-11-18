@@ -8,7 +8,8 @@
     "CLI validates actual outer/nested ZIP content and student identities before the unchanged research pipeline; Linux worker memory is bounded.",
     "LLM transport rejects redirects to prevent Authorization forwarding.",
     "CLI optionally emits only report-completion counters to stderr; research pipeline, prompts and final JSON remain unchanged.",
-    "CLI failure JSON adds processing phase and exception type for allowlisted diagnostics; raw errors remain private to the worker adapter."
+    "CLI failure JSON adds processing phase and exception type for allowlisted diagnostics; raw errors remain private to the worker adapter.",
+    "Summary archive byte/file budgets use independent SUMMARY_MAX_ARCHIVE_* settings, with defaults 512 MiB and 50000 entries for whole-session processing."
   ],
   "files": [
     {
@@ -82,7 +83,7 @@
     {
       "file": "engine/archive_security.py",
       "purpose": "Untrusted ZIP validation and Linux memory bound",
-      "sha256": "d4c3e1456621ac806a123b5914be2210c1c7c325d9cfc8f538f94a8d2574b0e2"
+      "sha256": "d851b9fa5ff0ac31b74c1d919ea18c377a9e1ddc227eb6fd6b347d0394e244c5"
     }
   ]
 }

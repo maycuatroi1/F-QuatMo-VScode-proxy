@@ -54,6 +54,7 @@ No real student record or credential is used. An end-to-end Bun adapter -> Pytho
 returns HTTP 429 before upload parsing or generation starts. The Python worker
 receives only allowlisted model/runtime ENV, not JWT/admin/Redis/S3 credentials.
 `SUMMARY_ENGINE_MEMORY_MB` defaults to 1024 (Linux virtual address space), and ZIP
-limits reuse MAX_UPLOAD_BYTES/MAX_UPLOAD_FILES. Set the worker budget below the
+limits use SUMMARY_MAX_ARCHIVE_BYTES (default 512 MiB) and SUMMARY_MAX_ARCHIVE_FILES
+(default 50000), including nested snapshot content. Set the worker budget below the
 actual container memory limit with headroom for Bun; this is not a load-test or
 distributed-queue guarantee. Native binary overrides do not use Python's limiter.

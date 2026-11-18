@@ -29,6 +29,7 @@ class PackagedSummaryTest(unittest.TestCase):
             "CUSTOM_MODEL_NAME": "qwen3-coder", "CUSTOM_API_KEY": "synthetic-only-key",
             "SUMMARY_LLM_BASE_URL": "https://summary-fixture.invalid/v1",
             "MAX_UPLOAD_BYTES": "", "MAX_UPLOAD_FILES": "", "SUMMARY_ENGINE_MEMORY_MB": "",
+            "SUMMARY_MAX_ARCHIVE_BYTES": "", "SUMMARY_MAX_ARCHIVE_FILES": "",
         })
 
     def run_cli(self, *args):
@@ -143,6 +144,27 @@ class PackagedSummaryTest(unittest.TestCase):
             result, payload = self.run_cli("--zip", archive, "--output-dir", self.work / "out", "--json")
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(payload["ok"])
+
+    def test_summary_budget_is_independent_and_enforces_nested_file_and_byte_limits(self):
+        archive = self.work / "budget.zip"
+        snapshot = io.BytesIO()
+        with zipfile.ZipFile(snapshot, "w") as nested:
+            for index in range(10):
+                nested.writestr(f"file{index}.txt", b"synthetic" * 100)
+        with zipfile.ZipFile(archive, "w") as outer:
+            outer.writestr("SE1/exam_records/REC/snapshot_start.zip", snapshot.getvalue())
+        self.env.update({"MAX_UPLOAD_FILES": "1", "MAX_UPLOAD_BYTES": "1", "SUMMARY_MAX_ARCHIVE_FILES": "20", "SUMMARY_MAX_ARCHIVE_BYTES": "100000"})
+        result, payload = self.run_cli("--zip", archive, "--student", "SE1", "--output-dir", self.work / "ok", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["ok"])
+        self.env["SUMMARY_MAX_ARCHIVE_FILES"] = "10"
+        result, payload = self.run_cli("--zip", archive, "--output-dir", self.work / "file-fail", "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["error"], "Summary archive contains too many entries.")
+        self.env.update({"SUMMARY_MAX_ARCHIVE_FILES": "20", "SUMMARY_MAX_ARCHIVE_BYTES": str(archive.stat().st_size + 100)})
+        result, payload = self.run_cli("--zip", archive, "--output-dir", self.work / "byte-fail", "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["error"], "Summary archive exceeds decompression limits.")
 
     def test_redirects_cannot_forward_authorization(self):
         sys.path.insert(0, str(ROOT))

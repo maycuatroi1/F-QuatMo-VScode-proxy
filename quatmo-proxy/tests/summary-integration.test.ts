@@ -12,6 +12,7 @@ const { sessions, lecturerAccounts } = await import("../src/services/sessionStor
 const { s3Storage, S3StorageService } = await import("../src/services/s3Storage");
 const { summaryStorageService: storage, getSummaryEngineDiagnostic } = await import("../src/services/summaryStorage");
 const { createSummaryArchive, validateSummaryZip } = await import("../src/services/summaryArchive");
+const { SUMMARY_MAX_ARCHIVE_BYTES } = await import("../src/config/summaryLimits");
 const { getJwtSecret } = await import("../src/services/jwtKey");
 const app = new Hono();
 app.route("/admin", adminRouter);
@@ -252,7 +253,7 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     }
     try { await withEngine(async () => {
       expect((await app.request(url, { method: "POST", body: form() })).status).toBe(401);
-      expect((await app.request(url, { method: "POST", headers: { ...headers, "Content-Length": String(101 * 1024 * 1024) }, body: form() })).status).toBe(413);
+      expect((await app.request(url, { method: "POST", headers: { ...headers, "Content-Length": String(SUMMARY_MAX_ARCHIVE_BYTES + 1) }, body: form() })).status).toBe(413);
       expect((await app.request(url, { method: "POST", headers: other, body: form() })).status).toBe(403);
       expect(fs.existsSync(storage.getLocalSessionDir(code))).toBe(false);
       expect((await app.request(url, { method: "POST", headers, body: form("../BAD") })).status).toBe(400);
@@ -270,6 +271,22 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     }); } finally { sessions.delete(code); lecturerAccounts.delete(owner); lecturerAccounts.delete(stranger); fs.rmSync(storage.getLocalSessionDir(code), { recursive: true, force: true }); }
   });
 }
+
+test("summary archive ENV budgets are independent from student-upload limits", () => {
+  const input = path.resolve("summary-budget-fixture.zip");
+  fs.writeFileSync(input, archive());
+  const moduleUrl = new URL("../src/services/summaryArchive.ts", import.meta.url).href;
+  const script = `import fs from 'node:fs'; const {validateSummaryZip}=await import(${JSON.stringify(moduleUrl)}); validateSummaryZip(fs.readFileSync(${JSON.stringify(input)}));`;
+  function check(files: string, bytes: string) {
+    return Bun.spawnSync({ cmd: [process.execPath, "--no-env-file", "--eval", script], cwd: process.cwd(), env: { ...process.env, MAX_UPLOAD_BYTES: "1", MAX_UPLOAD_FILES: "1", SUMMARY_MAX_ARCHIVE_FILES: files, SUMMARY_MAX_ARCHIVE_BYTES: bytes }, stdout: "pipe", stderr: "pipe" });
+  }
+  try {
+    expect(check("2", "1048576").exitCode).toBe(0);
+    expect(check("1", "1048576").stderr.toString()).toContain("too many entries");
+    expect(check("2", "1").stderr.toString()).toContain("archive limits");
+    expect(check("invalid", "1048576").stderr.toString()).toContain("Invalid summary archive limits");
+  } finally { fs.unlinkSync(input); }
+});
 
 test("summary fails clearly when engine is not installed without altering telemetry", async () => {
   const cli = process.env.SUMMARY_CLI_PATH, binary = process.env.SUMMARY_ENGINE_BIN;

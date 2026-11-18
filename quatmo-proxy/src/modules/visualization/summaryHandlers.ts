@@ -5,11 +5,11 @@ import { sanitizeFilename } from "../telemetry/logFiles";
 import { bodyLimit } from "hono/body-limit";
 import { sessions } from "../../services/sessionStore";
 import { requireCaller } from "../../shared/http/adminCaller";
-import { MAX_UPLOAD_BYTES } from "../../config/uploadLimits";
+import { SUMMARY_MAX_ARCHIVE_BYTES } from "../../config/summaryLimits";
 import { validateSummaryZip } from "../../services/summaryArchive";
 import { reportSummaryProgress } from "./summaryGuard";
 
-export const summaryZipLimit = bodyLimit({ maxSize: MAX_UPLOAD_BYTES });
+export const summaryZipLimit = bodyLimit({ maxSize: SUMMARY_MAX_ARCHIVE_BYTES });
 
 function generationFailure(c: any, err: any) {
   // Child-process errors may contain full stdout/stderr, reports or credentials.
@@ -124,7 +124,7 @@ export const generateSummaryFromZip = async (c: any) => {
     if (session && caller.role !== "admin" && (session.createdBy || "admin").toLowerCase() !== caller.username.toLowerCase()) {
       return c.json({ ok: false, error: "Forbidden. You do not own this session." }, 403);
     }
-    if (!(file instanceof File) || !file.size || file.size > MAX_UPLOAD_BYTES) {
+    if (!(file instanceof File) || !file.size || file.size > SUMMARY_MAX_ARCHIVE_BYTES) {
       return c.json({ ok: false, error: "A valid telemetry ZIP within the upload limit is required." }, 400);
     }
     const buffer = Buffer.from(await file.arrayBuffer());
