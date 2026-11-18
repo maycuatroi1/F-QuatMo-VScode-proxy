@@ -7,13 +7,14 @@
     "Replace development-only default output/archive paths; proxy supplies private job paths.",
     "CLI validates actual outer/nested ZIP content and student identities before the unchanged research pipeline; Linux worker memory is bounded.",
     "LLM transport rejects redirects to prevent Authorization forwarding.",
-    "CLI optionally emits only report-completion counters to stderr; research pipeline, prompts and final JSON remain unchanged."
+    "CLI optionally emits only report-completion counters to stderr; research pipeline, prompts and final JSON remain unchanged.",
+    "CLI failure JSON adds processing phase and exception type for allowlisted diagnostics; raw errors remain private to the worker adapter."
   ],
   "files": [
     {
       "file": "generate_cli.py",
       "sourceSha256": "ad862934d7f9faa269ef89c1f8860f5fad6ba9d2be4649b3f7e60154dffa0029",
-      "packagedSha256": "cc7f566fb5c6aeeae39ae68b6178f195d91a7e7aa9516f738fa5f0ea940d3917",
+      "packagedSha256": "614fc0b9a3a67ab0c8534b96b9e2dbeec28d9e37797d3d40bc81e8ef34f16443",
       "identical": false
     },
     {

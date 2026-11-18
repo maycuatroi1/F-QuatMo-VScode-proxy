@@ -16,6 +16,7 @@ function generationFailure(c: any, err: any) {
   console.error("[Summary API] Generation failed", {
     code: typeof err?.code === "string" || typeof err?.code === "number" ? err.code : undefined,
     signal: typeof err?.signal === "string" ? err.signal : undefined,
+    engineDiagnostic: err?.engineDiagnostic,
   });
   return c.json({ ok: false, error: "Unable to generate summary. Check the engine configuration or try again." }, 500);
 }

@@ -76,6 +76,16 @@ class PackagedSummaryTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse(output.exists())
 
+    def test_invalid_zip_returns_structured_failure_phase_and_type(self):
+        archive = self.work / "invalid.zip"
+        archive.write_bytes(b"synthetic invalid zip")
+        result, payload = self.run_cli("--zip", archive, "--output-dir", self.work / "out", "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["phase"], "archive_validation")
+        self.assertEqual(payload["error_type"], "BadZipFile")
+        self.assertFalse(payload["ok"])
+        self.assertFalse((self.work / "out").exists())
+
     def test_runtime_env_selects_summary_model_and_existing_custom_key(self):
         code = "from engine.config import config; import json; print(json.dumps({'model': config.model.model_name, 'uses_custom_key': config.model.api_key == 'synthetic-only-key'}))"
         result = subprocess.run([sys.executable, "-c", code], cwd=self.work, env=self.env,

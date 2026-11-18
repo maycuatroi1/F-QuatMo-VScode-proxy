@@ -9,6 +9,33 @@ import type { SummaryProgressCallback } from "./summaryProgress";
 
 const execFileAsync = promisify(execFile);
 
+export function getSummaryEngineDiagnostic(stdout: unknown) {
+  if (typeof stdout !== "string") return undefined;
+  const line = stdout.trim().split(/\r?\n/).at(-1)!;
+  if (line.length > 8192) return undefined;
+  try {
+    const result = JSON.parse(line);
+    if (result?.ok !== false) return undefined;
+    const phases = ["memory_limit", "archive_validation", "student_validation", "pipeline_initialization", "single_generation", "batch_generation"];
+    const types = ["MemoryError", "ValueError", "BadZipFile", "LargeZipFile", "PermissionError", "FileNotFoundError", "OSError", "RuntimeError", "KeyError", "TypeError", "AttributeError", "JSONDecodeError", "UnicodeDecodeError"];
+    const reasons = new Map([
+      ["Summary archive exceeds size limits.", "archive_size_limit"],
+      ["Summary archive contains too many entries.", "archive_file_limit"],
+      ["Summary archive contains unsafe or duplicate paths.", "archive_unsafe_paths"],
+      ["Summary archive exceeds decompression limits.", "archive_decompression_limit"],
+      ["Summary archive is empty.", "archive_empty"],
+      ["Unsafe or ambiguous student ID in summary archive.", "student_identity_invalid"],
+      ["Invalid summary memory limit.", "memory_limit_invalid"],
+      ["Invalid summary archive limits.", "archive_limits_invalid"],
+    ]);
+    return {
+      phase: phases.includes(result.phase) ? result.phase : "unknown",
+      errorType: types.includes(result.error_type) ? result.error_type : "unknown",
+      reason: reasons.get(result.error) || "unclassified",
+    };
+  } catch { return undefined; }
+}
+
 async function writeSummaryFile(filename: string, content: string): Promise<void> {
   const temporary = `${filename}.${randomUUID()}.tmp`;
   try {
@@ -119,7 +146,15 @@ export class SummaryStorageService {
           } catch { /* Non-progress stderr is never exposed through the progress API. */ }
         }
       });
-      const { stdout } = await execution;
+      const { stdout } = await execution.catch(error => {
+        // Keep only allowlisted diagnostic fields from the worker's final JSON.
+        const failure = Object.assign(new Error("Summary engine execution failed."), {
+          code: error.code,
+          signal: error.signal,
+          engineDiagnostic: getSummaryEngineDiagnostic(error.stdout),
+        });
+        throw failure;
+      });
       // The existing CLI writes progress before its final one-line JSON payload.
       const result = JSON.parse(stdout.trim().split(/\r?\n/).at(-1)!);
       if (!result.ok) throw new Error(result.error || "Summary engine failed.");

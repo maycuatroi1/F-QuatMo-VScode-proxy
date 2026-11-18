@@ -27,6 +27,10 @@ from engine.config import config
 from engine.archive_security import apply_memory_limit, validate_archive, validate_student_ids
 
 
+def error_payload(error, phase):
+    return {"ok": False, "error": str(error), "phase": phase, "error_type": type(error).__name__}
+
+
 class ProgressSummaryPipeline(SummaryPipeline):
     """Observe completed reports without changing the research pipeline."""
     def __init__(self, *args, report_progress=False, single=False, **kwargs):
@@ -63,17 +67,22 @@ def main():
         print(json.dumps(err, ensure_ascii=False))
         sys.exit(1)
 
+    phase = "memory_limit"
     try:
         apply_memory_limit()
+        phase = "archive_validation"
         validate_archive(zip_path)
+        phase = "student_validation"
         if args.student:
             validate_student_ids([args.student])
         out_dir = args.output_dir or config.output_dir
+        phase = "pipeline_initialization"
         pipeline = ProgressSummaryPipeline(zip_path, output_dir=out_dir, params=config.model.to_pipeline_params(), report_progress=args.progress, single=bool(args.student))
+        phase = "student_validation"
         validate_student_ids(pipeline.get_students())
         pipeline.emit_progress()
     except Exception as e:
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        print(json.dumps(error_payload(e, phase), ensure_ascii=False))
         sys.exit(1)
 
     if args.student:
@@ -93,7 +102,7 @@ def main():
             else:
                 print(f"Summary generated for {args.student}: {res['out_path']}")
         except Exception as e:
-            err = {"ok": False, "error": str(e), "student_id": args.student}
+            err = {**error_payload(e, "single_generation"), "student_id": args.student}
             print(json.dumps(err, ensure_ascii=False))
             sys.exit(1)
     else:
@@ -119,7 +128,7 @@ def main():
             else:
                 print(f"Batch processed {len(results)} students in {pipeline.output_dir}")
         except Exception as e:
-            err = {"ok": False, "error": str(e)}
+            err = error_payload(e, "batch_generation")
             print(json.dumps(err, ensure_ascii=False))
             sys.exit(1)
 

@@ -10,7 +10,7 @@ if (process.env.PROXY_REFACTOR_SANDBOX !== "1") throw new Error("Use scripts/tes
 const { adminRouter } = await import("../src/routes/admin");
 const { sessions, lecturerAccounts } = await import("../src/services/sessionStore");
 const { s3Storage, S3StorageService } = await import("../src/services/s3Storage");
-const { summaryStorageService: storage } = await import("../src/services/summaryStorage");
+const { summaryStorageService: storage, getSummaryEngineDiagnostic } = await import("../src/services/summaryStorage");
 const { createSummaryArchive, validateSummaryZip } = await import("../src/services/summaryArchive");
 const { getJwtSecret } = await import("../src/services/jwtKey");
 const app = new Hono();
@@ -45,6 +45,7 @@ async function withEngine(run: () => Promise<void>, legacyRoot = false) {
     const input = value('--zip'), id = args.includes('--student') ? value('--student') : null;
     const entries = new Zip(input).getEntries().map(e => e.entryName);
     if (id === 'FAIL') { console.log(JSON.stringify({ok:false,error:'fixture failure'})); process.exit(0); }
+    if (id === 'EXIT1') { console.error('synthetic private credential'); console.log(JSON.stringify({ok:false,error:'Summary archive exceeds decompression limits.',phase:'archive_validation',error_type:'ValueError'})); process.exit(1); }
     const report = student => ({student_id:student, markdown:'# Summary ' + student + ' — thử nghiệm', check_report:{ok:true}, metrics:{requests_count:2}});
     let result;
     if (id) result = {...report(id), ok:true};
@@ -71,6 +72,29 @@ async function withEngine(run: () => Promise<void>, legacyRoot = false) {
     await fs.promises.rm(directory, { recursive: true, force: true });
   }
 }
+
+test("summary exit-one diagnostics preserve only fixed categories and clean up the job", async () => {
+  const expected = { phase: "archive_validation", errorType: "ValueError", reason: "archive_decompression_limit" };
+  expect(getSummaryEngineDiagnostic(JSON.stringify({ ok: false, phase: "archive_validation", error_type: "ValueError", error: "Summary archive exceeds decompression limits." }))).toEqual(expected);
+  expect(getSummaryEngineDiagnostic(JSON.stringify({ ok: false, phase: "private path", error_type: "private key", error: "private report" }))).toEqual({ phase: "unknown", errorType: "unknown", reason: "unclassified" });
+  expect(getSummaryEngineDiagnostic("private traceback")).toBeUndefined();
+  expect(getSummaryEngineDiagnostic("null")).toBeUndefined();
+  await withEngine(async () => {
+    const input = path.resolve("diagnostic-fixture.zip");
+    fs.writeFileSync(input, archive());
+    try {
+      await storage.generateStudentSummary("DIAGNOSTIC_FIXTURE", "EXIT1", input);
+      throw new Error("Expected engine to fail");
+    } catch (error: any) {
+      expect(error.code).toBe(1);
+      expect(error.engineDiagnostic).toEqual(expected);
+      expect(error.stdout).toBeUndefined();
+      expect(error.stderr).toBeUndefined();
+      expect(error.message).not.toContain("private");
+      expect(fs.readdirSync(path.resolve("logs", "temp_summaries"))).toEqual([]);
+    } finally { fs.unlinkSync(input); }
+  });
+});
 
 test("summary local persistence, S3 fallback and purge only after successful sync", async () => {
   const code = "SUMMARY_STORAGE";
