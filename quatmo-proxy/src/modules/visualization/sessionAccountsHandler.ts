@@ -39,13 +39,17 @@ export async function listVisualizeSessionAccounts(c: any) {
     } catch {}
   }
   const sessionCreationMs =
-    toMs(sessionObj?.startTime) ||
     toMs(sessionObj?.createdAt) ||
+    toMs(sessionObj?.startTime) ||
     toMs(manifest?.createdAt) ||
     toMs(manifest?.startTime) ||
     null;
   const durationMin =
     sessionObj?.durationMinutes || manifest?.durationMinutes || 90;
+  const scheduledSessionEnd = sessionCreationMs
+    ? sessionCreationMs +
+      (durationMin === -1 ? 24 * 60 : durationMin) * 60 * 1000
+    : null;
 
   if (fs.existsSync(sessionLogDir)) {
     try {
@@ -130,10 +134,18 @@ export async function listVisualizeSessionAccounts(c: any) {
             }
           }
 
+          const uploadExpiry = toMs(
+            uploadInfoData?.validityWindow?.expireTimestamp,
+          );
+          const uploadMetricMatchesSchedule =
+            !scheduledSessionEnd ||
+            !uploadExpiry ||
+            uploadExpiry === scheduledSessionEnd;
           if (
             uploadInfoData?.metrics &&
             typeof uploadInfoData.metrics.inWindowEvents === "number" &&
-            uploadInfoData.metrics.inWindowEvents > 0
+            uploadInfoData.metrics.inWindowEvents > 0 &&
+            uploadMetricMatchesSchedule
           ) {
             totalEvents = uploadInfoData.metrics.inWindowEvents;
             foundEvents = true;
@@ -142,20 +154,9 @@ export async function listVisualizeSessionAccounts(c: any) {
             const sessionBeginTime =
               toMs(uploadInfoData?.validityWindow?.signinTimestamp) ||
               sessionCreationMs;
-            let sessionEndTime =
+            const sessionEndTime =
+              scheduledSessionEnd ||
               toMs(uploadInfoData?.validityWindow?.expireTimestamp);
-            const uploadTime = toMs(uploadInfoData?.uploadTimestamp);
-
-            if (
-              durationMin >= 180 ||
-              (sessionEndTime && uploadTime && uploadTime < sessionEndTime)
-            ) {
-              sessionEndTime = uploadTime || sessionEndTime;
-            }
-            if (!sessionEndTime && sessionBeginTime) {
-              sessionEndTime =
-                sessionBeginTime + Math.min(durationMin, 180) * 60 * 1000;
-            }
 
             const allowedDates = new Set<string>();
             if (sessionBeginTime) {

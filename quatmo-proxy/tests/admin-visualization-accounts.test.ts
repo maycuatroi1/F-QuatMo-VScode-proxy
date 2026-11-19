@@ -55,6 +55,27 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     } finally { data.cleanup(); }
   });
 
+  test(`${prefix}: account event counts ignore an upload metric with a different expiry`, async () => {
+    const code = `VIS_SCHEDULE_${index}`;
+    const data = fixture(code);
+    data.write("SEWINDOW/upload_info.json", JSON.stringify({
+      metrics: { inWindowEvents: 99 },
+      validityWindow: { expireTimestamp: time + 2 * 60 * 60 * 1000 },
+    }));
+    data.write(
+      "SEWINDOW/exam_records/R1/events.jsonl",
+      [time + 1000, time + 60 * 60 * 1000 + 1]
+        .map((timestamp) => JSON.stringify({ timestamp }))
+        .join("\n"),
+    );
+    try {
+      const response = await app.request(`${prefix}/visualize/sessions/${code}/accounts`, { headers });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.accounts.find((row: any) => row.studentId === "SEWINDOW")).toMatchObject({ eventCount: 1 });
+    } finally { data.cleanup(); }
+  });
+
   test(`${prefix}: account catalog merges remote metrics and record fallback without duplicate students`, async () => {
     const code = `VIS_ACCOUNTS_REMOTE_${index}`;
     const data = fixture(code);

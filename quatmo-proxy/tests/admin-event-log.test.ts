@@ -83,6 +83,26 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     } finally { data.cleanup(); }
   });
 
+  test(`${prefix}: event expiry follows session creation plus duration, not upload time`, async () => {
+    const code = `EVENT_SCHEDULE_${index}`;
+    const data = fixture(code);
+    const records = [event(60000), event(120000), event(120001)];
+    data.write("SEEVENT/exam_records/R1/events.jsonl", lines(records));
+    data.write("SEEVENT/upload_info.json", JSON.stringify({
+      uploadTimestamp: time + 10 * 60 * 1000,
+      validityWindow: {
+        signinTimestamp: time,
+        expireTimestamp: time + 10 * 60 * 1000,
+      },
+    }));
+    try {
+      const body = await read(code);
+      expect(body.coreRecords).toEqual([event(60000), event(120000)]);
+      expect(body.validityWindow.expireTimestamp).toBe(time + 60000);
+      expect(body.rangeApplied.to).toBe(time + 120000);
+    } finally { data.cleanup(); }
+  });
+
   test(`${prefix}: local event records merge deterministically and explicit selection stays isolated`, async () => {
     const code = `EVENT_MERGE_${index}`;
     const data = fixture(code);

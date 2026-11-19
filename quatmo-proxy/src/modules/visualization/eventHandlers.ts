@@ -375,6 +375,16 @@ export async function getVisualizeStudentEventLog(c: any) {
         manifest?.durationMinutes ||
         validityWindow?.durationMinutes ||
         90;
+      const sessionCreationMs =
+        toMs(session?.createdAt) ||
+        toMs(session?.startTime) ||
+        toMs(manifest?.createdAt) ||
+        toMs(manifest?.startTime) ||
+        null;
+      const scheduledSessionEnd = sessionCreationMs
+        ? sessionCreationMs +
+          (durationMin === -1 ? 24 * 60 : durationMin) * 60 * 1000
+        : null;
 
       if (!sessionBeginTime && uploadTimestamp) {
         sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
@@ -383,46 +393,14 @@ export async function getVisualizeStudentEventLog(c: any) {
         if (metaStart) sessionBeginTime = metaStart;
       }
 
-      // 2. Resolve Authoritative Session Expiration Boundary
+      // 2. The scheduled session window, never the log-upload time, sets expiry.
       let sessionEndTime: number | null =
-        toMs(validityWindow?.expireTimestamp) || null;
-
-      if (
-        !sessionEndTime &&
-        uploadTimestamp &&
-        sessionBeginTime &&
-        uploadTimestamp >= sessionBeginTime
-      ) {
-        if (
-          !sessionEndTime ||
-          durationMin >= 180 ||
-          uploadTimestamp < sessionEndTime
-        ) {
-          sessionEndTime = uploadTimestamp;
-        }
-      }
+        scheduledSessionEnd || toMs(validityWindow?.expireTimestamp) || null;
 
       if (!sessionEndTime && metadata?.examEndAt) {
         const metaEnd = toMs(metadata.examEndAt);
         if (metaEnd && sessionBeginTime && metaEnd >= sessionBeginTime) {
-          if (
-            !sessionEndTime ||
-            durationMin >= 180 ||
-            metaEnd < sessionEndTime
-          ) {
-            sessionEndTime = metaEnd;
-          }
-        }
-      }
-
-      if (!sessionEndTime) {
-        if (session?.endedAt && session.endedAt > 0) {
-          sessionEndTime = toMs(session.endedAt);
-        } else if (manifest?.endedAt && manifest.endedAt > 0) {
-          sessionEndTime = toMs(manifest.endedAt);
-        } else if (sessionBeginTime) {
-          sessionEndTime =
-            sessionBeginTime + Math.min(durationMin, 180) * 60 * 1000;
+          sessionEndTime = metaEnd;
         }
       }
 
@@ -432,13 +410,6 @@ export async function getVisualizeStudentEventLog(c: any) {
         : null;
 
       // 3. Session Calendar Date Isolation
-      const sessionCreationMs =
-        toMs(session?.createdAt) ||
-        toMs(session?.startTime) ||
-        toMs(manifest?.createdAt) ||
-        toMs(manifest?.startTime) ||
-        sessionBeginTime;
-
       const allowedDates = new Set<string>();
       if (sessionBeginTime) {
         allowedDates.add(new Date(sessionBeginTime).toISOString().slice(0, 10));
