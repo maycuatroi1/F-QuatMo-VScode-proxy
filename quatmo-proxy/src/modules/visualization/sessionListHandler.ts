@@ -4,6 +4,7 @@ import { sessions } from "../../services/sessionStore";
 import { s3Storage } from "../../services/s3Storage";
 import { requireCaller } from "../../shared/http/adminCaller";
 import { toMs } from "./time";
+import { readSessionDefinition } from "./sessionWindow";
 
 export async function listVisualizeSessions(c: any) {
   const sessionsLogDir = path.resolve(process.cwd(), "logs", "sessions");
@@ -32,7 +33,7 @@ export async function listVisualizeSessions(c: any) {
         const code = entry.name.toUpperCase();
         scannedCodes.add(code);
         const sessionPath = path.join(sessionsLogDir, entry.name);
-        const sessionObj = sessions.get(code);
+        const sessionObj = await readSessionDefinition(code);
 
         let promptLogCount = 0;
         let eventLogCount = 0;
@@ -89,7 +90,7 @@ export async function listVisualizeSessions(c: any) {
           studentCount: studentIds.size,
           startTime: sStart || sCreated || undefined,
           createdAt: sCreated || sStart || undefined,
-          durationMinutes: sessionObj?.durationMinutes || 90,
+          durationMinutes: sessionObj?.durationMinutes,
           endedAt: sEnd || undefined,
         });
       }
@@ -114,7 +115,7 @@ export async function listVisualizeSessions(c: any) {
           : 0,
         startTime: sStart || sCreated || undefined,
         createdAt: sCreated || sStart || undefined,
-        durationMinutes: sessionObj.durationMinutes || 90,
+        durationMinutes: sessionObj.durationMinutes,
         endedAt: sEnd || undefined,
       });
     }
@@ -128,7 +129,7 @@ export async function listVisualizeSessions(c: any) {
         if (!scannedCodes.has(code)) {
           scannedCodes.add(code);
           const students = await s3Storage.listStudentsInSessionFromS3(code);
-          const sessionObj = sessions.get(code);
+          const sessionObj = await readSessionDefinition(code);
           const promptLogCount = students.filter((s) => s.hasPromptLog).length;
           const eventLogCount = students.filter((s) => s.hasEventLog).length;
           const sStart = toMs(sessionObj?.startTime);
@@ -148,7 +149,7 @@ export async function listVisualizeSessions(c: any) {
               students.length || sessionObj?.allowedStudentIds?.size || 0,
             startTime: sStart || sCreated || undefined,
             createdAt: sCreated || sStart || undefined,
-            durationMinutes: sessionObj?.durationMinutes || 90,
+            durationMinutes: sessionObj?.durationMinutes,
             endedAt: sEnd || undefined,
           });
         }

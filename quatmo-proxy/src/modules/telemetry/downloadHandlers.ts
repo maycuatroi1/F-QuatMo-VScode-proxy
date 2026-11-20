@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import { sessions, sessionStates } from "../../services/sessionStore";
 import { sanitizeFilename } from "./logFiles";
+import { readSessionDefinition } from "../visualization/sessionWindow";
 
 /** Secrets / databases that must never leave the server through log exports. */
 function isSensitiveLogFile(name: string): boolean {
@@ -26,6 +27,7 @@ async function sendDirectoryZip(
   zipFileName: string,
   c: any,
   fallbackMsg: string = "No log files found.",
+  manifest?: object,
 ) {
   if (!fs.existsSync(dirPath)) {
     return c.json({ error: fallbackMsg }, 404);
@@ -72,6 +74,9 @@ async function sendDirectoryZip(
       return c.json({ error: fallbackMsg }, 404);
     }
 
+    if (manifest && !zip.getEntry("session_manifest.json")) {
+      zip.addFile("session_manifest.json", Buffer.from(JSON.stringify(manifest, null, 2)));
+    }
     const zipBuffer = zip.toBuffer();
     c.header("Content-Type", "application/zip");
     c.header("Content-Disposition", `attachment; filename=${zipFileName}`);
@@ -98,9 +103,9 @@ export const handleSessionLogDownload = async (c: any) => {
     sessionCode,
   );
 
+  let exportManifest: object | undefined;
   try {
     const session = sessions.get(sessionCode);
-    const manifestPath = path.join(sessionLogDir, "session_manifest.json");
     const manifestStudents: any[] = [];
     if (session) {
       for (const studentId of session.allowedStudentIds) {
@@ -114,22 +119,14 @@ export const handleSessionLogDownload = async (c: any) => {
         });
       }
     }
-    await fs.promises.writeFile(
-      manifestPath,
-      JSON.stringify(
-        {
+    if (session) exportManifest = {
           sessionCode,
           createdAt: session?.createdAt,
           endedAt: session?.endedAt,
           durationMinutes: session?.durationMinutes,
           exportedAt: Date.now(),
           students: manifestStudents,
-        },
-        null,
-        2,
-      ),
-      "utf-8",
-    );
+        };
   } catch {}
 
   return await sendDirectoryZip(
@@ -137,6 +134,7 @@ export const handleSessionLogDownload = async (c: any) => {
     `session-${sessionCode}-logs.zip`,
     c,
     `No logs found for session ${sessionCode}.`,
+    exportManifest,
   );
 };
 
@@ -187,6 +185,14 @@ export async function handleStudentLogDownload(c: any) {
         zip.addLocalFile(studentJsonPath, "");
       }
       zip.addLocalFolder(studentDir, studentId);
+      const manifestPath = path.join(path.dirname(studentDir), "session_manifest.json");
+      if (fs.existsSync(manifestPath)) zip.addLocalFile(manifestPath, "");
+      else {
+        const definition = await readSessionDefinition(sessionCode);
+        if (definition.createdAt || definition.startTime) zip.addFile("session_manifest.json", Buffer.from(JSON.stringify({
+          ...definition, students: [{ studentId, loginTimestamp: sessionStates.get(`${sessionCode}:${studentId}`)?.loginTimestamp }],
+        })));
+      }
       const buffer = zip.toBuffer();
       c.header("Content-Type", "application/zip");
       c.header(

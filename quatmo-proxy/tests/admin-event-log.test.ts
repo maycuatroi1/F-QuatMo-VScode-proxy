@@ -62,19 +62,19 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     data.write("SEEVENT/upload_info.json", JSON.stringify({ uploadTimestamp: (time + 180000) / 1000, validityWindow: { signinTimestamp: time / 1000, expireTimestamp: (time + 60000) / 1000 } }));
     try {
       const body = await read(code);
-      expect(body.coreRecords).toEqual([event(2000), event(60000), event(120000)]);
+      expect(body.coreRecords).toEqual([event(2000), event(60000)]);
       expect(body.aiRecords).toEqual([event(1000, "query")]);
       expect(body.activeRecordDir).toBe("R1");
       expect(body.availableRecords).toEqual(["R1"]);
-      expect(body.validityWindow).toMatchObject({ signinTimestamp: time, expireTimestamp: time + 60000, graceSeconds: 60, durationMinutes: 1 });
-      expect(body.rangeApplied).toEqual({ from: time, to: time + 120000, mode: "session_validity" });
-      expect(body.stats).toMatchObject({ totalRawEvents: 5, inWindowEvents: 3, preSessionEvents: 1, postSessionEvents: 1 });
-      expect(body.metadata).toMatchObject({ examSessionId: "metadata-id", retained: true, examStartAt: time, examEndAt: time + 60000 });
+      expect(body.validityWindow).toMatchObject({ signinTimestamp: time, expireTimestamp: time + 60000, graceSeconds: 0, durationMinutes: 1 });
+      expect(body.rangeApplied).toEqual({ from: time, to: time + 60000, mode: "session_validity" });
+      expect(body.stats).toMatchObject({ totalRawEvents: 5, inWindowEvents: 2, preSessionEvents: 1, postSessionEvents: 2 });
+      expect(body.metadata).toEqual({ examSessionId: "metadata-id", retained: true });
       expect(body.initialFiles).toEqual({ "src/main.py": "print('fixture')\n" });
       expect(body.isClamped).toBe(true);
       for (const query of ["?unclamped=true", "?mode=full_raw"]) {
         const full = await read(code, query);
-        expect(full.coreRecords).toEqual(records);
+        expect(full.coreRecords).toEqual([...records].sort((a, b) => a.timestamp - b.timestamp));
         expect(full.isClamped).toBe(false);
         expect(full.rangeApplied.mode).toBe("full_raw");
       }
@@ -97,9 +97,9 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     }));
     try {
       const body = await read(code);
-      expect(body.coreRecords).toEqual([event(60000), event(120000)]);
+      expect(body.coreRecords).toEqual([event(60000)]);
       expect(body.validityWindow.expireTimestamp).toBe(time + 60000);
-      expect(body.rangeApplied.to).toBe(time + 120000);
+      expect(body.rangeApplied.to).toBe(time + 60000);
     } finally { data.cleanup(); }
   });
 
@@ -139,7 +139,7 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       if (name === "metadata.json") return JSON.stringify({ examSessionId: record });
       return null;
     });
-    const upload = spyOn(s3Storage, "getStudentFile").mockResolvedValue(JSON.stringify({ validityWindow: { signinTimestamp: time, expireTimestamp: time + 60000 } }));
+    const upload = spyOn(s3Storage, "getStudentFile").mockImplementation(async (_c, _s, name) => name === "upload_info.json" ? JSON.stringify({ validityWindow: { signinTimestamp: time, expireTimestamp: time + 60000 } }) : null);
     try {
       const merged = await read(code);
       expect(merged.coreRecords).toEqual([event(1000), event(2000), event(3000)]);
@@ -172,15 +172,16 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     } finally { data.cleanup(); for (const username of [owner, other]) lecturerAccounts.delete(username); }
   });
 
-  test(`${prefix}: existing pre-sign-in fail-safe keeps same-day evidence without rewriting it`, async () => {
+  test(`${prefix}: pre-sign-in records remain available only in raw mode without rewriting evidence`, async () => {
     const code = `EVENT_ANONYMOUS_${index}`;
     const data = fixture(code);
     const records = [event(-10000), event(-5000)];
     data.write("SEEVENT/exam_records/R1/events.jsonl", lines(records));
     try {
       const body = await read(code);
-      expect(body.coreRecords).toEqual(records);
-      expect(body.stats).toMatchObject({ totalRawEvents: 2, inWindowEvents: 2, preSessionEvents: 2 });
+      expect(body.coreRecords).toEqual([]);
+      expect(body.stats).toMatchObject({ totalRawEvents: 2, inWindowEvents: 0, preSessionEvents: 2 });
+      expect((await read(code, "?unclamped=true")).coreRecords).toEqual(records);
       expect(fs.readFileSync(path.join(data.directory, "SEEVENT/exam_records/R1/events.jsonl"), "utf8")).toBe(lines(records));
     } finally { data.cleanup(); }
   });

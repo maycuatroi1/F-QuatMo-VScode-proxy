@@ -2,8 +2,7 @@
 """
 Ingestion module for PhaseSUMMARY Engine (M0).
 Strictly implements developer specs '01 Dữ liệu đầu vào và chuẩn hóa.md' & Section 2.2 of the audit report:
-- Exam cluster isolation (_isolate_exam_cluster) removing multi-day leftover logs
-- Trailing UI-only noise trimming (_trim_trailing_ui_noise)
+- Scheduled sign-in window applied before scientific feature extraction (scheduled-signin-v1)
 - Extraction of snapshot_start.zip (starter_files & statement_paragraphs >= 40 chars)
 - Merging proxy <student_id>.json (terminalOutput & codeSnapshots attached to terminal_command)
 - Deduplication of typing_chunk, paste, and edit_detected events; filtering virtual URIs
@@ -21,6 +20,7 @@ import re
 import difflib
 from typing import Dict, List, Any, Optional, Tuple, Set
 from .constants import DEFAULT_PARAMS
+from .session_window import resolve_window, select_records, request_time, exclude_request_conflicts
 
 NON_CODE_URI_PATTERNS = [
     r'^vscode-chat-code-block:',
@@ -209,6 +209,7 @@ class ZipSessionIngester:
 
         with zipfile.ZipFile(self.zip_path, 'r') as z:
             # 1. Read upload_info or metadata if available
+            window_begin, window_end = resolve_window(z, student_id, files['upload_info'])
             for up_path in files['upload_info']:
                 try:
                     up_info = json.loads(z.read(up_path).decode('utf-8'))
@@ -293,27 +294,18 @@ class ZipSessionIngester:
                     pass
 
         # Sort raw events chronologically
+        raw_events = select_records(raw_events, window_begin, window_end)
+        raw_ai = exclude_request_conflicts(select_records(raw_ai, window_begin, window_end))
         raw_events.sort(key=lambda x: x.get('timestamp', 0))
         raw_ai.sort(key=lambda x: x.get('timestamp', 0))
-
-        # 6. Isolate active exam cluster (eliminates multi-day leftover sessions)
-        events_isolated, ai_isolated = self._isolate_exam_cluster(raw_events, raw_ai)
-
-        # 7. Trim trailing UI-only noise (window_state_change, etc. at end of session)
-        events_trimmed = self._trim_trailing_ui_noise(events_isolated)
+        data.prompts = exclude_request_conflicts([p for p in data.prompts if isinstance(p, dict) and request_time(p) is not None and window_begin <= request_time(p) <= window_end])
 
         # 8. Deduplicate paste / typing_chunk / edit_detected events & filter non-code URIs
-        clean_events, clean_ai = self._clean_and_deduplicate_events(events_trimmed, ai_isolated, data.prompts)
+        clean_events, clean_ai = self._clean_and_deduplicate_events(raw_events, raw_ai, data.prompts)
 
         # 9. Establish master start & end timestamps
-        all_timestamps = [e.get('timestamp') for e in clean_events if e.get('timestamp')]
-        all_timestamps += [a.get('timestamp') for a in clean_ai if a.get('timestamp')]
-        if all_timestamps:
-            data.start_ts = min(all_timestamps)
-            data.end_ts = max(all_timestamps)
-        else:
-            data.start_ts = data.start_ts or 0
-            data.end_ts = data.end_ts or (data.start_ts + 3600000)
+        data.start_ts = window_begin
+        data.end_ts = window_end
 
         # Normalize relative timestamps (t = timestamp - start_ts)
         for idx, e in enumerate(clean_events):

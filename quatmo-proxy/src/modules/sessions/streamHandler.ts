@@ -1,4 +1,5 @@
 import { streamSSE } from "hono/streaming";
+import { sessionEndMs } from "../../shared/sessionTime";
 import { verify } from "hono/jwt";
 import { getJwtSecret } from "../../services/jwtKey";
 import { eventBus } from "../../services/eventBus";
@@ -41,8 +42,8 @@ export async function streamSessionEvents(c: any) {
   }
 
   const currentTime = Math.floor(Date.now() / 1000);
-  if (session.durationMinutes > 0) {
-    const sessionEndTime = session.startTime + session.durationMinutes * 60;
+  {
+    const sessionEndTime = (sessionEndMs(session) ?? 0) / 1000;
     if (currentTime >= sessionEndTime) {
       return c.json({ error: "Session duration has expired" }, 403);
     }
@@ -212,9 +213,7 @@ export async function streamSessionEvents(c: any) {
         const tickTime = Math.floor(Date.now() / 1000);
         if (
           !activeSession ||
-          (activeSession.durationMinutes > 0 &&
-            tickTime >=
-              activeSession.startTime + activeSession.durationMinutes * 60)
+          tickTime >= (sessionEndMs(activeSession) ?? 0) / 1000
         ) {
           await stream.writeSSE({
             event: "session_ended",

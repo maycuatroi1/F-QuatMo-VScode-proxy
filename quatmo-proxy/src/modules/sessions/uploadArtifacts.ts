@@ -10,11 +10,8 @@ interface JsonlRecord {
   [key: string]: any;
 }
 
-export function toMs(ts: any): number | null {
-  const n = Number(ts);
-  if (!n || isNaN(n)) return null;
-  return n < 1e11 ? n * 1000 : n;
-}
+import { toMs } from "../../shared/sessionTime";
+export { toMs };
 
 interface SanitizeResult {
   buffer: Buffer;
@@ -89,80 +86,15 @@ export function sanitizeJsonlBuffer(
 }
 
 export function mergeJsonlBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
-  const existingStr = existingBuf.toString("utf-8");
-  const newStr = newBuf.toString("utf-8");
-  const existingLines = existingStr
-    .split("\n")
-    .filter((l) => l.trim().length > 0);
-  const newLines = newStr.split("\n").filter((l) => l.trim().length > 0);
-
-  const parsedRecords: Array<{
-    record: JsonlRecord;
-    raw?: string;
-    isRaw: boolean;
-  }> = [];
-  const seenFingerprints = new Set<string>();
-
-  const processLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    try {
-      const obj = JSON.parse(trimmed) as JsonlRecord;
-      if (
-        typeof obj === "object" &&
-        obj !== null &&
-        typeof obj.timestamp === "number"
-      ) {
-        // Construct semantic fingerprint ignoring transient groupId counter
-        const fp = `${obj.type || ""}_${obj.timestamp}_${JSON.stringify(obj.payload ?? "")}`;
-        if (!seenFingerprints.has(fp)) {
-          seenFingerprints.add(fp);
-          parsedRecords.push({ record: obj, isRaw: false });
-        }
-        return;
-      }
-    } catch {
-      // JSON parse failed; fall back to raw string preservation
-    }
-
-    if (!seenFingerprints.has(trimmed)) {
-      seenFingerprints.add(trimmed);
-      parsedRecords.push({
-        record: { timestamp: 0 },
-        raw: trimmed,
-        isRaw: true,
-      });
-    }
-  };
-
-  for (const l of existingLines) {
-    processLine(l);
-  }
-  for (const l of newLines) {
-    processLine(l);
-  }
-
-  // Strictly sort chronologically by timestamp ascending
-  parsedRecords.sort((a, b) => {
-    if (a.isRaw && !b.isRaw) return -1;
-    if (!a.isRaw && b.isRaw) return 1;
-    return a.record.timestamp - b.record.timestamp;
+  const seen = new Set(existingBuf.toString("utf8").split("\n").filter((l) => l.trim()));
+  const additions = newBuf.toString("utf8").split("\n").filter((line) => {
+    if (!line.trim() || seen.has(line)) return false;
+    seen.add(line);
+    return true;
   });
-
-  // Re-index groupId monotonically across the unified timeline (0, 1, 2, ...)
-  let currentGroupId = 0;
-  const mergedLines: string[] = [];
-
-  for (const item of parsedRecords) {
-    if (item.isRaw && item.raw) {
-      mergedLines.push(item.raw);
-    } else {
-      item.record.groupId = currentGroupId++;
-      mergedLines.push(JSON.stringify(item.record));
-    }
-  }
-
-  return Buffer.from(mergedLines.join("\n") + "\n", "utf-8");
+  if (!additions.length) return existingBuf;
+  const separator = existingBuf.length && existingBuf[existingBuf.length - 1] !== 10 ? "\n" : "";
+  return Buffer.concat([existingBuf, Buffer.from(separator + additions.join("\n") + "\n")]);
 }
 
 export function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffer {
@@ -174,16 +106,11 @@ export function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffe
       ...existingMeta,
       ...newMeta,
       // Preserve earliest exam start time across all machines
-      examStartAt: Math.min(
-        Number(existingMeta.examStartAt) || Date.now(),
-        Number(newMeta.examStartAt) || Date.now(),
-      ),
+      examStartAt: [existingMeta.examStartAt, newMeta.examStartAt]
+        .filter((v) => toMs(v) !== null).sort((a, b) => toMs(a)! - toMs(b)!)[0],
       // Set to latest end time if present
-      examEndAt:
-        Math.max(
-          Number(existingMeta.examEndAt) || 0,
-          Number(newMeta.examEndAt) || 0,
-        ) || undefined,
+      examEndAt: [existingMeta.examEndAt, newMeta.examEndAt]
+        .filter((v) => toMs(v) !== null).sort((a, b) => toMs(b)! - toMs(a)!)[0],
       conversations: [
         ...(Array.isArray(existingMeta.conversations)
           ? existingMeta.conversations
@@ -203,7 +130,7 @@ export function mergeMetadataBuffers(existingBuf: Buffer, newBuf: Buffer): Buffe
     }
 
     return Buffer.from(JSON.stringify(merged, null, 2), "utf-8");
-  } catch {
-    return newBuf;
+  } catch (error) {
+    throw new Error("Cannot merge invalid metadata without losing evidence.", { cause: error });
   }
 }

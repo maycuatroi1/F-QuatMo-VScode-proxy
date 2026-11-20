@@ -16,6 +16,7 @@ export async function syncSessionTokens(c: any) {
   const { reconcileStudentPromptTurns, safeParseJson } = await import("../../services/promptLogService");
   const sessionLogDir = path.resolve(process.cwd(), "logs", "sessions", sessionCode);
   const updatedStudents: Array<{ studentId: string; oldTokens: number; newTokens: number }> = [];
+  const reconciledStudents = new Set<string>();
 
   // 1. Check directory logs if available
   if (fs.existsSync(sessionLogDir)) {
@@ -28,6 +29,8 @@ export async function syncSessionTokens(c: any) {
         const st = sessionStates.get(stateKey);
         const oldTokens = st?.tokensConsumed ?? 0;
         const res = await reconcileStudentPromptTurns(sessionCode, studentId, sessionLogDir);
+        if (!res.turns.length || res.turns.some((t) => !Number.isFinite(t.tokensConsumedTotal))) continue;
+        reconciledStudents.add(studentId);
         const newTokens = res.turns.reduce((acc, t) => acc + (t.tokensConsumedTotal || 0), 0);
         if (st && (st.tokensConsumed !== newTokens || res.wasRepaired)) {
           st.tokensConsumed = newTokens;
@@ -77,6 +80,7 @@ export async function syncSessionTokens(c: any) {
     for (const sItem of manifestData.students) {
       if (!sItem.studentId || typeof sItem.tokensConsumed !== "number") continue;
       const safeSid = sItem.studentId.toUpperCase();
+      if (reconciledStudents.has(safeSid)) continue;
       const stateKey = `${sessionCode}:${safeSid}`;
       const st = sessionStates.get(stateKey);
       const oldTokens = st?.tokensConsumed ?? 0;

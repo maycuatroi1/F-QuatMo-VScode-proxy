@@ -1,4 +1,5 @@
 import { requireCaller } from "../../shared/http/adminCaller";
+import { sessionEndMs } from "../../shared/sessionTime";
 import { hasSessionParticipation } from "../sessions/statePolicy";
 import { redis } from "../../services/redis";
 import { sessions, sessionStates, studentGroups, type Group } from "../../services/sessionStore";
@@ -29,13 +30,7 @@ async function syncGroupWithActiveSessions(
       continue;
     }
 
-    const startSec =
-      session.startTime || Math.floor((session.createdAt || Date.now()) / 1000);
-    const durationSec =
-      session.durationMinutes === -1
-        ? 86400 * 30
-        : (session.durationMinutes || 60) * 60;
-    const endSec = startSec + durationSec;
+    const endSec = Math.floor((sessionEndMs(session) ?? 0) / 1000);
     const isActive = nowSec < endSec;
 
     for (const uid of upperAddedIds) {

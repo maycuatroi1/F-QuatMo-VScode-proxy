@@ -15,6 +15,7 @@ const result = Bun.spawnSync({
     "--preload",
     path.join(root, "tests/setup/isolation.ts"),
     path.join(root, "tests"),
+    ...process.argv.slice(2),
   ],
   cwd: sandbox,
   env: {

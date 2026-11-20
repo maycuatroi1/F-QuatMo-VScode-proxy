@@ -41,6 +41,7 @@ class PackagedSummaryTest(unittest.TestCase):
     def test_single_and_batch_preserve_input_and_emit_reports(self):
         archive = self.work / "SYNTHETIC_SESSION.zip"
         with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("session_manifest.json", json.dumps({"sessionCode": "SYNTHETIC_SESSION", "createdAt": 1700000000000, "durationMinutes": 60, "students": [{"studentId": student, "loginTimestamp": 1700000000000} for student in ("SE1", "SE2")]}))
             for student in ("SE1", "SE2"):
                 output.writestr(f"{student}/upload_info.json", json.dumps({"sessionCode": "SYNTHETIC_SESSION"}))
                 output.writestr(f"{student}/exam_records/REC/metadata.json", json.dumps({
@@ -55,6 +56,7 @@ class PackagedSummaryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(single["ok"])
         self.assertEqual(single["student_id"], "SE1")
+        self.assertEqual(single["analysisRuleVersion"], "scheduled-signin-v1")
         self.assertTrue(single["markdown"])
         self.assertFalse(single["check_report"]["llm_used"])
         single_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
@@ -62,6 +64,7 @@ class PackagedSummaryTest(unittest.TestCase):
         result, batch = self.run_cli("--zip", archive, "--output-dir", output_dir, "--json", "--progress")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(batch["ok"])
+        self.assertEqual(batch["analysisRuleVersion"], "scheduled-signin-v1")
         self.assertEqual(sorted(batch["students"]), ["SE1", "SE2"])
         self.assertTrue(batch["manifest_content"])
         batch_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
@@ -152,6 +155,7 @@ class PackagedSummaryTest(unittest.TestCase):
             for index in range(10):
                 nested.writestr(f"file{index}.txt", b"synthetic" * 100)
         with zipfile.ZipFile(archive, "w") as outer:
+            outer.writestr("session_manifest.json", json.dumps({"createdAt": 1700000000000, "durationMinutes": 60, "students": [{"studentId": "SE1", "loginTimestamp": 1700000000000}]}))
             outer.writestr("SE1/exam_records/REC/snapshot_start.zip", snapshot.getvalue())
         self.env.update({"MAX_UPLOAD_FILES": "1", "MAX_UPLOAD_BYTES": "1", "SUMMARY_MAX_ARCHIVE_FILES": "20", "SUMMARY_MAX_ARCHIVE_BYTES": "100000"})
         result, payload = self.run_cli("--zip", archive, "--student", "SE1", "--output-dir", self.work / "ok", "--json")

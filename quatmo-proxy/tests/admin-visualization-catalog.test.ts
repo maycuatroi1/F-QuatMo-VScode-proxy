@@ -64,7 +64,8 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       expect(data.sessions[1]).toMatchObject({ sessionCode: codes[0], sessionName: codes[0], promptLogCount: 1, eventLogCount: 2, studentCount: 2, startTime: time, createdAt: time, endedAt: time + 60000, durationMinutes: 60, lastActivity: time });
       const all = await (await app.request(`${prefix}/visualize/sessions`, { headers: admin })).json();
       expect(all.sessions.filter((row: any) => row.sessionCode.startsWith(base))).toHaveLength(3);
-      expect(all.sessions.find((row: any) => row.sessionCode === codes[2])).toMatchObject({ studentCount: 1, promptLogCount: 1, durationMinutes: 90 });
+      expect(all.sessions.find((row: any) => row.sessionCode === codes[2])).toMatchObject({ studentCount: 1, promptLogCount: 1 });
+      expect(all.sessions.find((row: any) => row.sessionCode === codes[2])).not.toHaveProperty("durationMinutes");
     } finally {
       lecturerAccounts.delete(owner);
       for (const code of codes) {
@@ -90,7 +91,8 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       const data = await response.json();
       expect(data.sessions.filter((row: any) => row.sessionCode === local)).toHaveLength(1);
       expect(data.sessions.filter((row: any) => row.sessionCode === code)).toHaveLength(1);
-      expect(data.sessions.find((row: any) => row.sessionCode === code)).toMatchObject({ promptLogCount: 2, eventLogCount: 1, studentCount: 2, durationMinutes: 90 });
+      expect(data.sessions.find((row: any) => row.sessionCode === code)).toMatchObject({ promptLogCount: 2, eventLogCount: 1, studentCount: 2 });
+      expect(data.sessions.find((row: any) => row.sessionCode === code)).not.toHaveProperty("durationMinutes");
       expect(students.mock.calls).toEqual([[code]]);
     } finally { available.mockRestore(); listing.mockRestore(); students.mockRestore(); sessions.delete(local); }
   });

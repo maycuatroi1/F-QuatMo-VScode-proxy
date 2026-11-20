@@ -49,7 +49,7 @@ describe("Scientific Telemetry Ingestion & Chronological Merge Integrity", () =>
     sessions.delete(sessionCode);
   });
 
-  it("should merge out-of-order logs into strictly chronological order and re-index groupId", async () => {
+  it("preserves uploaded event bytes and group IDs; chronological deduplication belongs to the derived view", async () => {
     // Events must fall inside the active session's validity window.
     const t1 = Date.now() - 300000;
     const t2 = t1 + 1000;
@@ -151,19 +151,17 @@ describe("Scientific Telemetry Ingestion & Chronological Merge Integrity", () =>
     const mergedLines = mergedContent.trim().split(/\r?\n/).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
 
     // 1. Exact count: exactly 4 unique events (1000, 2000, 3000, 4000)
-    expect(mergedLines.length).toBe(4);
+    expect(mergedLines.length).toBe(5);
 
     // 2. Strict chronological order
-    expect(mergedLines[0].timestamp).toBe(t1);
-    expect(mergedLines[1].timestamp).toBe(t2);
-    expect(mergedLines[2].timestamp).toBe(t3);
-    expect(mergedLines[3].timestamp).toBe(t4);
+    expect(mergedLines.map((e) => e.timestamp)).toEqual([t3, t4, t1, t2, t3]);
 
     // 3. Strict monotonic groupId (0, 1, 2, 3)
     expect(mergedLines[0].groupId).toBe(0);
     expect(mergedLines[1].groupId).toBe(1);
-    expect(mergedLines[2].groupId).toBe(2);
-    expect(mergedLines[3].groupId).toBe(3);
+    expect(mergedLines[2].groupId).toBe(0);
+    expect(mergedLines[3].groupId).toBe(1);
+    expect(mergedLines[4].groupId).toBe(2);
 
     // 4. Metadata verification: earliest start time is preserved (1000), conversations merged
     const metaPath = path.join(targetDir, "exam_records", "sci_session", "metadata.json");

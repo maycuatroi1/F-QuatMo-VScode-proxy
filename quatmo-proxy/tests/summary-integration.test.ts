@@ -47,7 +47,8 @@ async function withEngine(run: () => Promise<void>, legacyRoot = false) {
     const entries = new Zip(input).getEntries().map(e => e.entryName);
     if (id === 'FAIL') { console.log(JSON.stringify({ok:false,error:'fixture failure'})); process.exit(0); }
     if (id === 'EXIT1') { console.error('synthetic private credential'); console.log(JSON.stringify({ok:false,error:'Summary archive exceeds decompression limits.',phase:'archive_validation',error_type:'ValueError'})); process.exit(1); }
-    const report = student => ({student_id:student, markdown:'# Summary ' + student + ' — thử nghiệm', check_report:{ok:true}, metrics:{requests_count:2}});
+    if (id === 'LEGACY') { console.log(JSON.stringify({ok:true,student_id:id,markdown:'unverified legacy result'})); process.exit(0); }
+    const report = student => ({analysisRuleVersion:'scheduled-signin-v1', student_id:student, markdown:'# Summary ' + student + ' — thử nghiệm', check_report:{ok:true}, metrics:{requests_count:2}});
     let result;
     if (id) result = {...report(id), ok:true};
     else {
@@ -58,7 +59,7 @@ async function withEngine(run: () => Promise<void>, legacyRoot = false) {
         fs.mkdirSync(path.join(root, 'stages', student), {recursive:true});
         fs.writeFileSync(path.join(root, 'stages', student, 'check_report.json'), JSON.stringify({ok:true}));
       }
-      result = {ok:true, students:['SE1','SE2'], manifest_content:'# Session summary'};
+      result = {ok:true, analysisRuleVersion:'scheduled-signin-v1', students:['SE1','SE2'], manifest_content:'# Session summary'};
     }
     console.log('pipeline progress');
     console.log(JSON.stringify({...result,inputEntries:entries,engineEnvNames:Object.keys(process.env)}));
@@ -93,6 +94,17 @@ test("summary exit-one diagnostics preserve only fixed categories and clean up t
       expect(error.stderr).toBeUndefined();
       expect(error.message).not.toContain("private");
       expect(fs.readdirSync(path.resolve("logs", "temp_summaries"))).toEqual([]);
+    } finally { fs.unlinkSync(input); }
+  });
+});
+
+test("summary rejects a legacy engine that cannot attest to the scheduled analysis window", async () => {
+  await withEngine(async () => {
+    const input = path.resolve("legacy-engine-fixture.zip");
+    fs.writeFileSync(input, archive());
+    try {
+      await expect(storage.generateStudentSummary("LEGACY_ENGINE", "LEGACY", input)).rejects.toThrow("scheduled-signin-v1");
+      expect(fs.existsSync(path.resolve("logs/sessions/LEGACY_ENGINE/LEGACY/summary.md"))).toBe(false);
     } finally { fs.unlinkSync(input); }
   });
 });
@@ -171,6 +183,7 @@ test("summary archive fills missing S3 telemetry, excludes secrets and rejects c
   fs.writeFileSync(path.join(root, "SE1", "exam_records", "REC", "events.jsonl"), "local evidence");
   fs.writeFileSync(path.join(root, ".env"), "private fixture");
   fs.writeFileSync(path.join(root, "SE1", "summary.md"), "old summary");
+  fs.writeFileSync(path.join(root, "session_manifest.json"), JSON.stringify({sessionCode: code, createdAt: 1700000000000, durationMinutes: 60, students: []}));
   const available = spyOn(s3Storage, "isAvailable").mockReturnValue(true);
   const listing = spyOn(s3Storage, "listSessionTelemetryFiles").mockResolvedValue(["SE1/exam_records/REC/events.jsonl", "SE1/prompt_turns.json", "SE2/exam_records/REC/events.jsonl", "SE2/summary.md"]);
   const read = spyOn(s3Storage, "getStudentFile").mockImplementation(async (_code, _id, name) => name === "prompt_turns.json" ? "[]" : "remote evidence");

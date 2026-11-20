@@ -7,14 +7,18 @@ export async function loadEventLogFromS3(
   sessionCode: string,
   studentId: string,
   reqRecordId?: string,
+  includeSnapshots = true,
 ) {
   if (!s3Storage.isAvailable()) return null;
   try {
-    const s3Records = await s3Storage.listStudentExamRecords(
+    const listedRecords = await s3Storage.listStudentExamRecords(
       sessionCode,
       studentId,
     );
-    if (!s3Records || s3Records.length === 0) return null;
+    const s3Records = listedRecords?.length ? listedRecords : ["legacy"];
+    const artifact = (record: string, name: string) => record === "legacy"
+      ? s3Storage.getStudentFile(sessionCode, studentId, name)
+      : s3Storage.getExamRecordArtifact(sessionCode, studentId, record, name);
     const targetRecordId =
       reqRecordId && s3Records.includes(reqRecordId)
         ? reqRecordId
@@ -22,32 +26,13 @@ export async function loadEventLogFromS3(
 
     const [eventsRaw, aiRaw, metaRaw, zipBuffer, uploadInfoRaw] =
       await Promise.all([
-        s3Storage.getExamRecordArtifact(
-          sessionCode,
-          studentId,
-          targetRecordId,
-          "events.jsonl",
-        ),
-        s3Storage.getExamRecordArtifact(
-          sessionCode,
-          studentId,
-          targetRecordId,
-          "ai_interactions.jsonl",
-        ),
-        s3Storage.getExamRecordArtifact(
-          sessionCode,
-          studentId,
-          targetRecordId,
-          "metadata.json",
-        ),
-        s3Storage.getExamRecordArtifact(
-          sessionCode,
-          studentId,
-          targetRecordId,
-          "snapshot_start.zip",
-        ),
+        artifact(targetRecordId, "events.jsonl"),
+        artifact(targetRecordId, "ai_interactions.jsonl"),
+        artifact(targetRecordId, "metadata.json"),
+        includeSnapshots ? artifact(targetRecordId, "snapshot_start.zip") : null,
         s3Storage.getStudentFile(sessionCode, studentId, "upload_info.json"),
       ]);
+    if (!listedRecords?.length && !eventsRaw && !aiRaw && !metaRaw && !zipBuffer) return null;
 
     let uploadTimestamp: number | null = null;
     let uploadTimeISO: string | null = null;
@@ -78,7 +63,7 @@ export async function loadEventLogFromS3(
           s3Storage.getExamRecordArtifact(sessionCode, studentId, rId, "events.jsonl"),
           s3Storage.getExamRecordArtifact(sessionCode, studentId, rId, "ai_interactions.jsonl"),
           s3Storage.getExamRecordArtifact(sessionCode, studentId, rId, "metadata.json"),
-          s3Storage.getExamRecordArtifact(sessionCode, studentId, rId, "snapshot_start.zip"),
+          includeSnapshots ? s3Storage.getExamRecordArtifact(sessionCode, studentId, rId, "snapshot_start.zip") : null,
         ]);
         if (typeof mRaw === "string" && !mergedMetadata) {
           try {
@@ -95,25 +80,8 @@ export async function loadEventLogFromS3(
         if (typeof aRaw === "string") appendJsonLines(aRaw, allAi);
       }
 
-      const seenCore = new Set<string>();
-      const dedupedCore = allCore
-        .filter((e) => {
-          const k = String(e.timestamp) + "_" + String(e.type);
-          if (seenCore.has(k)) return false;
-          seenCore.add(k);
-          return true;
-        })
-        .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
-
-      const seenAi = new Set<string>();
-      const dedupedAi = allAi
-        .filter((e) => {
-          const k = String(e.timestamp) + "_" + String(e.type);
-          if (seenAi.has(k)) return false;
-          seenAi.add(k);
-          return true;
-        })
-        .sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+      const dedupedCore = allCore;
+      const dedupedAi = allAi;
 
       return {
         sessionCode,
@@ -122,9 +90,6 @@ export async function loadEventLogFromS3(
         availableRecords: ["all_merged", ...s3Records],
         metadata: mergedMetadata || {
           examSessionId: "all_merged",
-          examStartAt: dedupedCore[0]?.timestamp || Date.now(),
-          examEndAt:
-            dedupedCore[dedupedCore.length - 1]?.timestamp || Date.now(),
         },
         coreRecords: dedupedCore,
         aiRecords: dedupedAi,
@@ -166,7 +131,7 @@ export async function loadEventLogFromS3(
           "events.jsonl",
         );
         if (typeof altEventsRaw === "string" && altEventsRaw.trim().length > 0) {
-          return loadEventLogFromS3(sessionCode, studentId, altRecId);
+          return loadEventLogFromS3(sessionCode, studentId, altRecId, includeSnapshots);
         }
       }
     }
@@ -178,8 +143,6 @@ export async function loadEventLogFromS3(
       availableRecords: s3Records,
       metadata: metadata || {
         examSessionId: targetRecordId,
-        examStartAt: coreRecords[0]?.timestamp || Date.now(),
-        examEndAt: coreRecords[coreRecords.length - 1]?.timestamp || Date.now(),
       },
       coreRecords,
       aiRecords,

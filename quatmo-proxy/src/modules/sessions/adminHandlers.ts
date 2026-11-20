@@ -1,6 +1,7 @@
 import { requireCaller } from "../../shared/http/adminCaller";
 import { hasSessionParticipation } from "./statePolicy";
 import { redis } from "../../services/redis";
+import { toMs } from "../../shared/sessionTime";
 import {
   sessions, sessionStates, studentGroups,
   type Session, type StudentSessionState, type SessionRuntimeConfig, type SessionPromptMode,
@@ -618,7 +619,7 @@ export async function listSessions(c: any) {
       promptMode: session.promptMode || "scaffolded_code",
       examQuestions: session.examQuestions || [],
       runtimeConfig: session.runtimeConfig,
-      createdAt: session.createdAt || session.startTime * 1000,
+      createdAt: toMs(session.createdAt) ?? toMs(session.startTime) ?? 0,
       createdBy: session.createdBy || "admin",
       updatedAt: session.updatedAt || session.createdAt || Date.now(),
       updatedBy: session.updatedBy || "admin",

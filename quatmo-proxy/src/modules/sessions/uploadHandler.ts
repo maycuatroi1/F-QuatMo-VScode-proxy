@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
 import { verify } from "hono/jwt";
 import { getJwtSecret } from "../../services/jwtKey";
 import { sessions, sessionStates } from "../../services/sessionStore";
@@ -7,6 +8,8 @@ import { s3Storage } from "../../services/s3Storage";
 import { normalizeUploadRelPath, resolveInside } from "../../services/security";
 import { MAX_UPLOAD_FILES, MAX_UPLOAD_BYTES } from "../../config/uploadLimits";
 import { verifyTokenSignatureOnly } from "./uploadToken";
+import { sessionEndMs } from "../../shared/sessionTime";
+import { withFileLock } from "../../services/promptLogService";
 import { sanitizeFilename, toMs, sanitizeJsonlBuffer, mergeJsonlBuffers, mergeMetadataBuffers } from "./uploadArtifacts";
 
 export async function uploadSessionLogs(c: any) {
@@ -154,6 +157,7 @@ export async function uploadSessionLogs(c: any) {
   // of the student's work is still stored, and nothing can escape the student folder.
   let totalBytes = 0;
   let droppedFiles = 0;
+  const acceptedPaths = new Set<string>();
   for (let i = uploadFiles.length - 1; i >= 0; i--) {
     const f = uploadFiles[i];
     const normalized = normalizeUploadRelPath(f.relativePath);
@@ -163,6 +167,8 @@ export async function uploadSessionLogs(c: any) {
       continue;
     }
     f.relativePath = normalized;
+    if (acceptedPaths.has(normalized)) return c.json({ error: "Duplicate upload path." }, 400);
+    acceptedPaths.add(normalized);
     totalBytes += f.buffer.length;
   }
   if (droppedFiles > 0) {
@@ -189,8 +195,9 @@ export async function uploadSessionLogs(c: any) {
   );
 
   await fs.promises.mkdir(targetDir, { recursive: true });
+  return withFileLock(targetDir, async () => {
 
-  // Resolve authoritative session temporal boundaries for log sanitization [T_signin, T_expire + grace]
+  // Upload metrics are diagnostic; strict analysis is calculated on read.
   const session = sessions.get(sessionCode);
   const stateKey = `${sessionCode}:${studentId}`;
   const state = sessionStates.get(stateKey);
@@ -202,22 +209,10 @@ export async function uploadSessionLogs(c: any) {
     toMs(session?.startTime) ||
     toMs(session?.createdAt);
 
-  const durationMin = session?.durationMinutes || 90;
+  const durationMin = session?.durationMinutes;
   const graceMs = 60 * 1000; // 60s network/flush grace window
 
-  let expireTimeMs: number | null = null;
-  if (tokenPayload?.sessionEndTime) {
-    expireTimeMs = toMs(tokenPayload.sessionEndTime);
-  } else if (session?.endedAt && session.endedAt > 0) {
-    expireTimeMs = toMs(session.endedAt);
-  } else if (signinTimeMs) {
-    expireTimeMs = signinTimeMs + durationMin * 60 * 1000;
-  }
-
-  const nowMs = Date.now();
-  if (expireTimeMs && (durationMin >= 180 || expireTimeMs > nowMs)) {
-    expireTimeMs = Math.min(expireTimeMs, nowMs);
-  }
+  const expireTimeMs = sessionEndMs(session);
 
   const minUploadTimestampMs = signinTimeMs ? signinTimeMs : null;
   const maxUploadTimestampMs = expireTimeMs ? expireTimeMs + graceMs : null;
@@ -247,11 +242,19 @@ export async function uploadSessionLogs(c: any) {
       const destDir = path.dirname(destPath);
       await fs.promises.mkdir(destDir, { recursive: true });
 
+      // Restore a remote baseline before merging an upload on a fresh instance.
+      if (!fs.existsSync(destPath) && s3Storage.isAvailable() &&
+          /(?:events\.jsonl|ai_interactions\.jsonl|metadata\.json|snapshot_start\.zip)$/.test(file.relativePath)) {
+        const prior = await s3Storage.getStudentFile(sessionCode, studentId, file.relativePath, true);
+        if (prior !== null) await fs.promises.writeFile(destPath, prior);
+      }
+
       // Preserve baseline initial snapshot: never overwrite start snapshot from machine 1
       if (
         file.relativePath.endsWith("snapshot_start.zip") &&
         fs.existsSync(destPath)
       ) {
+        file.buffer = await fs.promises.readFile(destPath);
         return;
       }
 
@@ -266,30 +269,21 @@ export async function uploadSessionLogs(c: any) {
           maxUploadTimestampMs,
           allowedDates,
         );
-        file.buffer = sanitizeRes.buffer;
+        // Keep collected bytes; the analysis view applies the session window.
 
         if (file.relativePath.endsWith("events.jsonl")) {
-          logSanitizeMetrics.totalRawEvents = sanitizeRes.totalLines;
-          logSanitizeMetrics.inWindowEvents = sanitizeRes.inWindowLines;
-          logSanitizeMetrics.droppedPreSigninEvents =
-            sanitizeRes.droppedPreSigninLines;
-          logSanitizeMetrics.droppedPostExpireEvents =
-            sanitizeRes.droppedPostExpireLines;
-          logSanitizeMetrics.droppedOutsideDateEvents =
-            sanitizeRes.droppedOutsideDateLines;
+          logSanitizeMetrics.totalRawEvents += sanitizeRes.totalLines;
+          logSanitizeMetrics.inWindowEvents += sanitizeRes.inWindowLines;
+          logSanitizeMetrics.droppedPreSigninEvents += sanitizeRes.droppedPreSigninLines;
+          logSanitizeMetrics.droppedPostExpireEvents += sanitizeRes.droppedPostExpireLines;
+          logSanitizeMetrics.droppedOutsideDateEvents += sanitizeRes.droppedOutsideDateLines;
         }
 
         if (fs.existsSync(destPath)) {
           try {
             const existingBuf = await fs.promises.readFile(destPath);
-            const sanitizedExisting = sanitizeJsonlBuffer(
-              existingBuf,
-              minUploadTimestampMs,
-              maxUploadTimestampMs,
-              allowedDates,
-            );
             file.buffer = mergeJsonlBuffers(
-              sanitizedExisting.buffer,
+              existingBuf,
               file.buffer,
             );
           } catch (err) {
@@ -297,6 +291,7 @@ export async function uploadSessionLogs(c: any) {
               `[Logs] Failed to merge existing ${file.relativePath}:`,
               err,
             );
+            throw err;
           }
         }
       } else if (
@@ -308,10 +303,17 @@ export async function uploadSessionLogs(c: any) {
           file.buffer = mergeMetadataBuffers(existingBuf, file.buffer);
         } catch (err) {
           console.warn(`[Logs] Failed to merge existing metadata.json:`, err);
+          throw err;
         }
       }
 
-      await fs.promises.writeFile(destPath, file.buffer);
+      const pendingPath = `${destPath}.${randomUUID()}.tmp`;
+      try {
+        await fs.promises.writeFile(pendingPath, file.buffer);
+        await fs.promises.rename(pendingPath, destPath);
+      } finally {
+        await fs.promises.rm(pendingPath, { force: true });
+      }
     }),
   );
 
@@ -338,6 +340,7 @@ export async function uploadSessionLogs(c: any) {
       graceSeconds: 60,
     },
     metrics: logSanitizeMetrics,
+    metricsScope: "incoming_upload_with_60s_grace",
   };
   await fs.promises.writeFile(
     metaPath,
@@ -350,11 +353,9 @@ export async function uploadSessionLogs(c: any) {
   );
 
   // 2. High-throughput parallel S3 upload with connection pooling
+  let s3Synced = false;
   if (s3Storage.isAvailable()) {
     try {
-      // Clean previous exam records for this student in this session
-      await s3Storage.purgeStudentExamRecords(sessionCode, studentId);
-
       // Upload all files concurrently
       const s3UploadPromises = uploadFiles.map((file) => {
         return s3Storage.uploadStudentFile(
@@ -375,7 +376,9 @@ export async function uploadSessionLogs(c: any) {
         ),
       );
 
-      await Promise.all(s3UploadPromises);
+      const synced = await Promise.all(s3UploadPromises);
+      if (synced.some((ok) => ok !== true)) throw new Error("Incomplete S3 synchronization.");
+      s3Synced = true;
       console.log(
         `[S3 Storage] High-throughput parallel synced ${savedCount} log file(s) for student ${studentId} in session ${sessionCode} to S3`,
       );
@@ -393,5 +396,7 @@ export async function uploadSessionLogs(c: any) {
     sessionCode,
     studentId,
     savedCount,
+    s3Synced,
+  });
   });
 }

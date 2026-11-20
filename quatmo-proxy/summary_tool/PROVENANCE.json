@@ -1,21 +1,24 @@
 {
   "source": "PhaseSUMMARY/summary_tool",
   "capturedOn": "2026-11-17",
+  "updatedOn": "2026-11-20",
   "adjustments": [
     "Remove embedded credential defaults; credentials come from environment.",
     "Verify HTTPS certificates with the platform trust store.",
     "Replace development-only default output/archive paths; proxy supplies private job paths.",
-    "CLI validates actual outer/nested ZIP content and student identities before the unchanged research pipeline; Linux worker memory is bounded.",
+    "CLI validates actual outer/nested ZIP content and student identities before the packaged pipeline; Linux worker memory is bounded.",
     "LLM transport rejects redirects to prevent Authorization forwarding.",
-    "CLI optionally emits only report-completion counters to stderr; research pipeline, prompts and final JSON remain unchanged.",
+    "CLI optionally emits only report-completion counters to stderr.",
     "CLI failure JSON adds processing phase and exception type for allowlisted diagnostics; raw errors remain private to the worker adapter.",
-    "Summary archive byte/file budgets use independent SUMMARY_MAX_ARCHIVE_* settings, with defaults 512 MiB and 50000 entries for whole-session processing."
+    "Summary archive byte/file budgets use independent SUMMARY_MAX_ARCHIVE_* settings, with defaults 512 MiB and 50000 entries for whole-session processing.",
+    "2026-11-20: packaged ingestion applies verified signin through normalized createdAt/startTime plus declared duration, with zero analysis grace; missing or conflicting evidence fails closed. Activity-cluster selection and trailing-noise trimming are no longer applied. Conflicting request IDs are excluded from primary processing. Original PhaseSUMMARY sources and collected archives are unchanged.",
+    "2026-11-20: successful single/batch CLI JSON declares analysisRuleVersion scheduled-signin-v1; proxy rejects legacy engines without that contract. This changes the analysis population and requires disclosure/regeneration of derived reports, not silent replacement of prior research results."
   ],
   "files": [
     {
       "file": "generate_cli.py",
       "sourceSha256": "ad862934d7f9faa269ef89c1f8860f5fad6ba9d2be4649b3f7e60154dffa0029",
-      "packagedSha256": "614fc0b9a3a67ab0c8534b96b9e2dbeec28d9e37797d3d40bc81e8ef34f16443",
+      "packagedSha256": "6b0c8bae9a995c63061711bfac21b8ac82b7e136f75f4f682d8de9f23fa3d82f",
       "identical": false
     },
     {
@@ -39,8 +42,8 @@
     {
       "file": "engine/ingestion.py",
       "sourceSha256": "d49031a60238bed114946df40983860f344ba6fb6283d740cd3d2cdc1b0c5b61",
-      "packagedSha256": "d49031a60238bed114946df40983860f344ba6fb6283d740cd3d2cdc1b0c5b61",
-      "identical": true
+      "packagedSha256": "d64cd3cb677487da1f0c742a7fde467f7c32943e1755ed06ace8f2efeb47fc27",
+      "identical": false
     },
     {
       "file": "engine/interpretation.py",
@@ -80,6 +83,11 @@
     }
   ],
   "additionalFiles": [
+    {
+      "file": "engine/session_window.py",
+      "purpose": "Verified scheduled-signin-v1 analysis window and request-conflict exclusion",
+      "sha256": "4232ebfd0593169f8c4776a55a8fc9cf642f27bc6fb683c7c7f0093e95965ef8"
+    },
     {
       "file": "engine/archive_security.py",
       "purpose": "Untrusted ZIP validation and Linux memory bound",

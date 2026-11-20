@@ -332,6 +332,7 @@ export class S3StorageService {
     sessionCode: string,
     studentId: string,
     relativePath: string,
+    throwOnError = false,
   ): Promise<string | Buffer | null> {
     if (!this.isAvailable() || !this.client) return null;
 
@@ -362,6 +363,7 @@ export class S3StorageService {
         return null;
       }
       console.error(`[S3 Storage] Failed to get student file ${key}:`, err);
+      if (throwOnError) throw err;
       return null;
     }
   }

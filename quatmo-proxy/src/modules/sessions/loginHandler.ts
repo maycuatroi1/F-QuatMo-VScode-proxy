@@ -1,4 +1,5 @@
 import { sign, verify } from "hono/jwt";
+import { sessionEndMs, toMs } from "../../shared/sessionTime";
 import { redis } from "../../services/redis";
 import { getJwtSecret } from "../../services/jwtKey";
 import { studentAccounts, sessions, sessionStates, getStudentAccount, getStudentGroup, verifyPasswordSafely } from "../../services/sessionStore";
@@ -241,10 +242,7 @@ export async function loginSession(c: any) {
   await recordSuccessfulLogin(ip, studentId);
 
   const now = Math.floor(Date.now() / 1000);
-  const sessionEndTime =
-    session.durationMinutes === -1
-      ? session.startTime + 24 * 60 * 60
-      : session.startTime + session.durationMinutes * 60;
+  const sessionEndTime = Math.floor((sessionEndMs(session) ?? 0) / 1000);
   const remainingSeconds = sessionEndTime - now;
 
   if (remainingSeconds <= 0) {
@@ -304,7 +302,7 @@ export async function loginSession(c: any) {
       await redis.hset(redisKey, {
         budget: String(session.defaultTokenBudget),
         consumed: String(state.tokensConsumed),
-        loginTime: String(state.loginTimestamp),
+        loginTime: String((toMs(state.loginTimestamp) ?? 0) / 1000),
       });
       await redis.expire(redisKey, remainingSeconds);
     } catch (err) {
@@ -330,7 +328,7 @@ export async function loginSession(c: any) {
     aiOption: session.aiOption,
     promptMode: session.promptMode || "scaffolded_code",
     aiValidityMinutes: session.aiValidityMinutes,
-    loginTime: state.loginTimestamp,
+    loginTime: (toMs(state.loginTimestamp) ?? 0) / 1000,
     sessionEndTime,
     exp: sessionEndTime,
     // cgv = client-gate-verified: this token was issued to a client that passed

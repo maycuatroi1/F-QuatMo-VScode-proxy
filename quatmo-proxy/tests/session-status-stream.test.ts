@@ -56,13 +56,13 @@ for (const [index, prefix] of ["/session", "/v1/session"].entries()) {
     } finally { sessions.delete(code); }
   });
 
-  test(`${prefix}: unlimited status retains -1 durations and zero-clamped remaining budget`, async () => {
+  test(`${prefix}: legacy -1 status uses the same 24-hour deadline and zero-clamped remaining budget`, async () => {
     const code = `SESSION_STATUS_UNLIMITED_${index}`;
     const now = seed(code, -1, -1);
     const state = sessionStates.get(`${code}:SESTATUS`)!;
     sessionStates.set(`${code}:SESTATUS`, { ...state, tokensConsumed: 1200 });
     try {
-      expect(await (await status(await token(code, now))).json()).toMatchObject({ tokensConsumed: 1200, tokensRemaining: 0, sessionRemainingMinutes: -1, aiRemainingMinutes: -1 });
+      expect(await (await status(await token(code, now))).json()).toMatchObject({ tokensConsumed: 1200, tokensRemaining: 0, sessionRemainingMinutes: 1440, aiRemainingMinutes: 1440 });
     } finally { sessions.delete(code); }
   });
 

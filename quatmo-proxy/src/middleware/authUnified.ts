@@ -1,6 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import { verify } from "hono/jwt";
 import { redis } from "../services/redis";
+import { sessionEndMs, toMs } from "../shared/sessionTime";
 import { getJwtSecret } from "../services/jwtKey";
 import {
   authMiddleware as normalAuthMiddleware,
@@ -54,7 +55,10 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
         return await next();
       }
 
-      if (payload.sessionEndTime && now > payload.sessionEndTime) {
+      const { sessions: currentSessions } = await import("../services/sessionStore");
+      const storedEnd = sessionEndMs(currentSessions.get(payload.sessionCode));
+      if (!storedEnd || Date.now() >= storedEnd ||
+          (payload.sessionEndTime && Date.now() >= (toMs(payload.sessionEndTime) ?? 0))) {
         return c.json(
           { error: "Session has ended. AI access is locked." },
           403,
@@ -62,9 +66,10 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
       }
 
       // isTokenAIHasTime
+      const loginTime = (toMs(payload.loginTime) ?? 0) / 1000;
       const aiExpirationTime = payload.aiValidityMinutes === -1
-        ? payload.loginTime + 24 * 60 * 60
-        : payload.loginTime + payload.aiValidityMinutes * 60;
+        ? loginTime + 24 * 60 * 60
+        : loginTime + payload.aiValidityMinutes * 60;
       if (now > aiExpirationTime) {
         return c.json(
           {
@@ -108,7 +113,7 @@ export const unifiedAuthMiddleware = (): MiddlewareHandler => {
             consumed = state.tokensConsumed;
 
             try {
-              const remainingSec = Math.max(60, (payload.sessionEndTime || (now + 3600)) - now);
+              const remainingSec = Math.max(1, Math.floor(storedEnd / 1000) - now);
               await redis.hset(sessionKey, {
                 studentId: payload.studentId,
                 sessionCode: payload.sessionCode,

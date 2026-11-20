@@ -1,20 +1,20 @@
 import AdmZip from "adm-zip";
 import path from "path";
 import fs from "fs";
-import { redis } from "../../services/redis";
-import { sessions, sessionStates } from "../../services/sessionStore";
 import { s3Storage } from "../../services/s3Storage";
 import { readZipTextEntriesSafely } from "../../services/security";
 import { appendJsonLines, hasNonEmptyLine } from "../telemetry/jsonl";
 import { sanitizeFilename } from "../telemetry/logFiles";
-import { toMs, sliceRecordsByTimeRange } from "./time";
+import { toMs, deduplicateRecords, inSessionWindow } from "../../shared/sessionTime";
+import { getStudentSessionWindow } from "./sessionWindow";
 import { loadEventLogFromS3 } from "./s3EventLog";
 
 export async function getVisualizeStudentEventLog(c: any) {
+    const includeSnapshots = !c.get?.("visualizeCountsOnly");
     const sessionCode = sanitizeFilename(
       c.req.param("sessionCode"),
     ).toUpperCase();
-    const studentId = sanitizeFilename(c.req.param("studentId"));
+    const studentId = sanitizeFilename(c.req.param("studentId")).toUpperCase();
     let studentDir = path.resolve(
       process.cwd(),
       "logs",
@@ -60,6 +60,7 @@ export async function getVisualizeStudentEventLog(c: any) {
         sessionCode,
         studentId,
         c.req.query("recordId"),
+        includeSnapshots,
       );
       if (s3Result) {
         availableRecords = s3Result.availableRecords || [];
@@ -86,15 +87,25 @@ export async function getVisualizeStudentEventLog(c: any) {
     } else {
       try {
         const examRecordsDir = path.join(studentDir, "exam_records");
-        if (fs.existsSync(examRecordsDir)) {
-          const recEntries = await fs.promises.readdir(examRecordsDir, {
+        if (fs.existsSync(examRecordsDir) || s3Storage.isAvailable()) {
+          const recEntries = fs.existsSync(examRecordsDir) ? await fs.promises.readdir(examRecordsDir, {
             withFileTypes: true,
-          });
+          }) : [];
           for (const r of recEntries) {
             if (r.isDirectory()) {
               availableRecords.push(r.name);
             }
           }
+          if (s3Storage.isAvailable()) {
+            for (const record of await s3Storage.listStudentExamRecords(sessionCode, studentId)) {
+              if (!availableRecords.includes(record)) availableRecords.push(record);
+            }
+          }
+          const artifact = async (record: string, name: string) => {
+            const local = path.join(examRecordsDir, record, name);
+            if (fs.existsSync(local)) return fs.promises.readFile(local);
+            return s3Storage.isAvailable() ? s3Storage.getExamRecordArtifact(sessionCode, studentId, record, name) : null;
+          };
           if (availableRecords.length > 0) {
             const reqRecordId = c.req.query("recordId");
             if (availableRecords.length > 1 && (!reqRecordId || reqRecordId === "all_merged")) {
@@ -105,59 +116,21 @@ export async function getVisualizeStudentEventLog(c: any) {
 
               for (const rId of availableRecords) {
                 const rDir = path.join(examRecordsDir, rId);
-                const evPath = path.join(rDir, "events.jsonl");
-                const aiPath = path.join(rDir, "ai_interactions.jsonl");
-                const metaPath = path.join(rDir, "metadata.json");
-                const snapPath = path.join(rDir, "snapshot_start.zip");
 
-                if (fs.existsSync(metaPath) && !mergedMetadata) {
-                  try {
-                    mergedMetadata = JSON.parse(await fs.promises.readFile(metaPath, "utf-8"));
-                  } catch {}
+                const [ev, ai, meta, snap] = await Promise.all([
+                  artifact(rId, "events.jsonl"), artifact(rId, "ai_interactions.jsonl"),
+                  artifact(rId, "metadata.json"), includeSnapshots ? artifact(rId, "snapshot_start.zip") : null,
+                ]);
+                if (meta && !mergedMetadata) { try { mergedMetadata = JSON.parse(meta.toString()); } catch {} }
+                if (snap && Object.keys(mergedInitialFiles).length === 0) {
+                  try { Object.assign(mergedInitialFiles, readZipTextEntriesSafely(new AdmZip(Buffer.from(snap)))); } catch {}
                 }
-                if (fs.existsSync(snapPath) && Object.keys(mergedInitialFiles).length === 0) {
-                  try {
-                    const zip = new AdmZip(snapPath);
-                    Object.assign(mergedInitialFiles, readZipTextEntriesSafely(zip));
-                  } catch {}
-                }
-                if (fs.existsSync(evPath)) {
-                  try {
-                    const content = await fs.promises.readFile(evPath, "utf-8");
-                    appendJsonLines(content, allCore);
-                  } catch {}
-                }
-                if (fs.existsSync(aiPath)) {
-                  try {
-                    const content = await fs.promises.readFile(aiPath, "utf-8");
-                    appendJsonLines(content, allAi);
-                  } catch {}
-                }
+                if (ev) appendJsonLines(ev.toString(), allCore);
+                if (ai) appendJsonLines(ai.toString(), allAi);
               }
 
-              const seenCore = new Set<string>();
-              coreRecords = allCore
-                .filter((e) => {
-                  const k = String(e.timestamp) + "_" + String(e.type);
-                  if (seenCore.has(k)) return false;
-                  seenCore.add(k);
-                  return true;
-                })
-                .sort(
-                  (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0),
-                );
-
-              const seenAi = new Set<string>();
-              aiRecords = allAi
-                .filter((e) => {
-                  const k = String(e.timestamp) + "_" + String(e.type);
-                  if (seenAi.has(k)) return false;
-                  seenAi.add(k);
-                  return true;
-                })
-                .sort(
-                  (a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0),
-                );
+              coreRecords = allCore;
+              aiRecords = allAi;
 
               initialFiles = mergedInitialFiles;
               metadata = mergedMetadata || { examSessionId: "all_merged" };
@@ -186,45 +159,27 @@ export async function getVisualizeStudentEventLog(c: any) {
               }
               activeRecordDir = path.join(examRecordsDir, targetRecordId);
 
-              const eventsPath = path.join(activeRecordDir, "events.jsonl");
-              const aiPath = path.join(activeRecordDir, "ai_interactions.jsonl");
-              const metadataPath = path.join(activeRecordDir, "metadata.json");
-              const snapshotZipPath = path.join(
-                activeRecordDir,
-                "snapshot_start.zip",
-              );
 
-              if (fs.existsSync(metadataPath)) {
-                try {
-                  const raw = await fs.promises.readFile(metadataPath, "utf-8");
-                  metadata = JSON.parse(raw);
-                } catch {}
-              }
+              const [ev, ai, meta, snap] = await Promise.all([
+                artifact(targetRecordId, "events.jsonl"), artifact(targetRecordId, "ai_interactions.jsonl"),
+                artifact(targetRecordId, "metadata.json"), includeSnapshots ? artifact(targetRecordId, "snapshot_start.zip") : null,
+              ]);
+              if (meta) { try { metadata = JSON.parse(meta.toString()); } catch {} }
+              if (ev) appendJsonLines(ev.toString(), coreRecords);
+              if (ai) appendJsonLines(ai.toString(), aiRecords);
+              if (snap) { try { Object.assign(initialFiles, readZipTextEntriesSafely(new AdmZip(Buffer.from(snap)))); } catch {} }
 
-              if (fs.existsSync(eventsPath)) {
-                try {
-                  const content = await fs.promises.readFile(eventsPath, "utf-8");
-                  appendJsonLines(content, coreRecords);
-                } catch {}
-              }
-
-              if (fs.existsSync(aiPath)) {
-                try {
-                  const content = await fs.promises.readFile(aiPath, "utf-8");
-                  appendJsonLines(content, aiRecords);
-                } catch {}
-              }
-
-              if (fs.existsSync(snapshotZipPath)) {
-                try {
-                  const zip = new AdmZip(snapshotZipPath);
-                  Object.assign(initialFiles, readZipTextEntriesSafely(zip));
-                } catch {}
-              }
             }
           }
         }
 
+        if (!availableRecords.length) {
+          for (const [file, target] of [["events.jsonl", coreRecords], ["ai_interactions.jsonl", aiRecords]] as const) {
+            const legacyPath = path.join(studentDir, file);
+            if (fs.existsSync(legacyPath)) appendJsonLines(await fs.promises.readFile(legacyPath, "utf8"), target);
+          }
+          if (coreRecords.length || aiRecords.length) availableRecords = ["legacy"];
+        }
         const uploadInfoPath = path.join(studentDir, "upload_info.json");
         if (fs.existsSync(uploadInfoPath)) {
           try {
@@ -250,6 +205,7 @@ export async function getVisualizeStudentEventLog(c: any) {
             sessionCode,
             studentId,
             c.req.query("recordId"),
+            includeSnapshots,
           );
           if (s3Result) {
             availableRecords = s3Result.availableRecords || [];
@@ -275,299 +231,30 @@ export async function getVisualizeStudentEventLog(c: any) {
       }
     }
 
-    try {
-      const session = sessions.get(sessionCode);
-      const stateKey = `${sessionCode}:${studentId}`;
-      const state = sessionStates.get(stateKey);
-
-      let manifest: any = null;
-      const manifestPath = path.resolve(
-        process.cwd(),
-        "logs",
-        "sessions",
-        sessionCode,
-        "session_manifest.json",
-      );
-      if (fs.existsSync(manifestPath)) {
-        try {
-          manifest = JSON.parse(
-            await fs.promises.readFile(manifestPath, "utf-8"),
-          );
-        } catch {}
-      }
-
-      // 1. Resolve Authoritative Session Boundaries [T_signin, T_expire + grace]
-      let sessionBeginTime: number | null =
-        toMs(validityWindow?.signinTimestamp) || null;
-
-      if (
-        !sessionBeginTime &&
-        state?.loginTimestamp &&
-        state.loginTimestamp > 0
-      ) {
-        sessionBeginTime = toMs(state.loginTimestamp);
-      }
-      if (!sessionBeginTime && redis && redis.status === "ready") {
-        try {
-          const rTime = await redis.hget(
-            `session:user:${sessionCode}:${studentId}`,
-            "loginTime",
-          );
-          if (rTime) {
-            const parsed = parseInt(rTime, 10);
-            if (!isNaN(parsed) && parsed > 0) sessionBeginTime = toMs(parsed);
-          }
-        } catch {}
-      }
-      if (!sessionBeginTime && manifest) {
-        if (Array.isArray(manifest.students)) {
-          const st = manifest.students.find(
-            (s: any) => s.studentId?.toUpperCase() === studentId.toUpperCase(),
-          );
-          if (st?.loginTimestamp && st.loginTimestamp > 0) {
-            sessionBeginTime = toMs(st.loginTimestamp);
-          }
-        }
-      }
-      if (
-        !sessionBeginTime &&
-        (session?.startTime ||
-          session?.createdAt ||
-          manifest?.createdAt ||
-          manifest?.startTime)
-      ) {
-        sessionBeginTime =
-          toMs(session?.startTime) ||
-          toMs(session?.createdAt) ||
-          toMs(manifest?.createdAt) ||
-          toMs(manifest?.startTime);
-      }
-
-      if (!sessionBeginTime) {
-        try {
-          const studentJsonPath = path.resolve(
-            process.cwd(),
-            "logs",
-            "sessions",
-            sessionCode,
-            `${studentId}.json`,
-          );
-          if (fs.existsSync(studentJsonPath)) {
-            const pTurns = JSON.parse(
-              await fs.promises.readFile(studentJsonPath, "utf-8"),
-            );
-            if (
-              Array.isArray(pTurns) &&
-              pTurns.length > 0 &&
-              pTurns[0].timestamp
-            ) {
-              const firstTurnMs = new Date(pTurns[0].timestamp).getTime();
-              if (!isNaN(firstTurnMs) && firstTurnMs > 0) {
-                sessionBeginTime = firstTurnMs - 10 * 60 * 1000;
-              }
-            }
-          }
-        } catch {}
-      }
-
-      const durationMin =
-        session?.durationMinutes ||
-        manifest?.durationMinutes ||
-        validityWindow?.durationMinutes ||
-        90;
-      const sessionCreationMs =
-        toMs(session?.createdAt) ||
-        toMs(session?.startTime) ||
-        toMs(manifest?.createdAt) ||
-        toMs(manifest?.startTime) ||
-        null;
-      const scheduledSessionEnd = sessionCreationMs
-        ? sessionCreationMs +
-          (durationMin === -1 ? 24 * 60 : durationMin) * 60 * 1000
-        : null;
-
-      if (!sessionBeginTime && uploadTimestamp) {
-        sessionBeginTime = uploadTimestamp - durationMin * 60 * 1000;
-      } else if (!sessionBeginTime) {
-        const metaStart = toMs(metadata?.examStartAt);
-        if (metaStart) sessionBeginTime = metaStart;
-      }
-
-      // 2. The scheduled session window, never the log-upload time, sets expiry.
-      let sessionEndTime: number | null =
-        scheduledSessionEnd || toMs(validityWindow?.expireTimestamp) || null;
-
-      if (!sessionEndTime && metadata?.examEndAt) {
-        const metaEnd = toMs(metadata.examEndAt);
-        if (metaEnd && sessionBeginTime && metaEnd >= sessionBeginTime) {
-          sessionEndTime = metaEnd;
-        }
-      }
-
-      const graceMs = 60 * 1000; // 60s network/flush tolerance buffer
-      const effectiveUpperBound = sessionEndTime
-        ? sessionEndTime + graceMs
-        : null;
-
-      // 3. Session Calendar Date Isolation
-      const allowedDates = new Set<string>();
-      if (sessionBeginTime) {
-        allowedDates.add(new Date(sessionBeginTime).toISOString().slice(0, 10));
-        if (sessionEndTime) {
-          allowedDates.add(new Date(sessionEndTime).toISOString().slice(0, 10));
-        }
-      } else if (sessionCreationMs) {
-        allowedDates.add(
-          new Date(sessionCreationMs).toISOString().slice(0, 10),
-        );
-        allowedDates.add(
-          new Date(sessionCreationMs + durationMin * 60 * 1000)
-            .toISOString()
-            .slice(0, 10),
-        );
-      } else if (uploadTimeISO) {
-        allowedDates.add(uploadTimeISO.slice(0, 10));
-      }
-
-      const unclamped =
-        c.req.query("unclamped") === "true" ||
-        c.req.query("mode") === "full_raw";
-
-      let clampedCoreRecords = coreRecords;
-      let clampedAiRecords = aiRecords;
-      let coreStats = {
-        totalRaw: coreRecords.length,
-        preCount: 0,
-        postCount: 0,
-        outsideDateCount: 0,
-      };
-      let aiStats = {
-        totalRaw: aiRecords.length,
-        preCount: 0,
-        postCount: 0,
-        outsideDateCount: 0,
-      };
-
-      // 4. O(log N) High-Performance Binary Search Slicing
-      if (
-        !unclamped &&
-        (sessionBeginTime !== null ||
-          effectiveUpperBound !== null ||
-          allowedDates.size > 0)
-      ) {
-        const coreRes = sliceRecordsByTimeRange(
-          coreRecords,
-          sessionBeginTime,
-          effectiveUpperBound,
-          allowedDates,
-        );
-        clampedCoreRecords = coreRes.sliced;
-        coreStats = coreRes;
-
-        const aiRes = sliceRecordsByTimeRange(
-          aiRecords,
-          sessionBeginTime,
-          effectiveUpperBound,
-          allowedDates,
-        );
-        clampedAiRecords = aiRes.sliced;
-        aiStats = aiRes;
-
-        // Fail-safe: If clamping dropped 100% of events because student worked in anonymous session before sign-in:
-        if (clampedCoreRecords.length === 0 && coreRecords.length > 0) {
-          const sessionDayEvents = coreRecords.filter((e) => {
-            const t = toMs(e.timestamp);
-            if (!t) return false;
-            if (allowedDates.size > 0) {
-              const dStr = new Date(t).toISOString().slice(0, 10);
-              if (allowedDates.has(dStr)) return true;
-            }
-            if (
-              sessionBeginTime &&
-              Math.abs(t - sessionBeginTime) <= 4 * 3600 * 1000
-            ) {
-              return true;
-            }
-            return false;
-          });
-          if (sessionDayEvents.length > 0) {
-            clampedCoreRecords = sessionDayEvents;
-            coreStats.totalRaw = coreRecords.length;
-          }
-        }
-
-        if (clampedAiRecords.length === 0 && aiRecords.length > 0) {
-          const sessionDayAi = aiRecords.filter((e) => {
-            const t = toMs(e.timestamp);
-            if (!t) return false;
-            if (allowedDates.size > 0) {
-              const dStr = new Date(t).toISOString().slice(0, 10);
-              if (allowedDates.has(dStr)) return true;
-            }
-            if (
-              sessionBeginTime &&
-              Math.abs(t - sessionBeginTime) <= 4 * 3600 * 1000
-            ) {
-              return true;
-            }
-            return false;
-          });
-          if (sessionDayAi.length > 0) {
-            clampedAiRecords = sessionDayAi;
-            aiStats.totalRaw = aiRecords.length;
-          }
-        }
-      }
-
-      return c.json({
-        sessionCode,
-        studentId,
-        activeRecordDir: path.basename(activeRecordDir),
-        availableRecords,
-        validityWindow: {
-          signinTimestamp: sessionBeginTime,
-          expireTimestamp: sessionEndTime,
-          signinISO: sessionBeginTime
-            ? new Date(sessionBeginTime).toISOString()
-            : null,
-          expireISO: sessionEndTime
-            ? new Date(sessionEndTime).toISOString()
-            : null,
-          durationMinutes: durationMin,
-          graceSeconds: 60,
-        },
-        rangeApplied: {
-          from: sessionBeginTime,
-          to: effectiveUpperBound,
-          mode: unclamped ? "full_raw" : "session_validity",
-        },
-        stats: {
-          totalRawEvents: coreRecords.length,
-          inWindowEvents: clampedCoreRecords.length,
-          preSessionEvents: coreStats.preCount,
-          postSessionEvents: coreStats.postCount,
-          outsideDateEvents: coreStats.outsideDateCount,
-        },
-        uploadTimestamp: sessionEndTime,
-        metadata: {
-          ...(metadata || {}),
-          examSessionId: metadata?.examSessionId || path.basename(activeRecordDir),
-          examStartAt: sessionBeginTime || clampedCoreRecords[0]?.timestamp || Date.now(),
-          examEndAt: sessionEndTime || clampedCoreRecords[clampedCoreRecords.length - 1]?.timestamp || Date.now(),
-        },
-        coreRecords: clampedCoreRecords,
-        aiRecords: clampedAiRecords,
-        initialFiles,
-        loginTimestamp: sessionBeginTime,
-        sessionEndTime,
-        totalRawEvents: coreRecords.length,
-        clampedEventsCount: clampedCoreRecords.length,
-        isClamped:
-          !unclamped &&
-          (coreRecords.length !== clampedCoreRecords.length ||
-            aiRecords.length !== clampedAiRecords.length),
-      });
-    } catch (err: any) {
-      return c.json({ error: `Failed to load event log` }, 500);
-    }
-  }
+    const window = await getStudentSessionWindow(sessionCode, studentId, validityWindow ?? undefined);
+    const unclamped = c.req.query("unclamped") === "true" || c.req.query("mode") === "full_raw";
+    const uniqueCore = deduplicateRecords(coreRecords);
+    const uniqueAi = deduplicateRecords(aiRecords);
+    const filteredCore = uniqueCore.filter((e) => inSessionWindow(e?.timestamp, window));
+    const filteredAi = uniqueAi.filter((e) => inSessionWindow(e?.timestamp, window));
+    const stats = {
+      totalRawEvents: coreRecords.length,
+      inWindowEvents: filteredCore.length,
+      duplicateEvents: coreRecords.length - uniqueCore.length,
+      preSessionEvents: uniqueCore.filter((e) => window.signinTimestamp && (toMs(e?.timestamp) ?? Infinity) < window.signinTimestamp).length,
+      postSessionEvents: uniqueCore.filter((e) => window.expireTimestamp && (toMs(e?.timestamp) ?? 0) > window.expireTimestamp).length,
+      unresolvedEvents: window.status === "unresolved" ? uniqueCore.length : uniqueCore.filter((e) => !toMs(e?.timestamp)).length,
+    };
+    const chronological = (records: any[]) => [...records].sort((a, b) => (toMs(a?.timestamp) ?? 0) - (toMs(b?.timestamp) ?? 0));
+    return c.json({
+      sessionCode, studentId, activeRecordDir: path.basename(activeRecordDir), availableRecords,
+      validityWindow: window,
+      rangeApplied: { from: window.signinTimestamp, to: window.expireTimestamp, mode: unclamped ? "full_raw" : "session_validity" },
+      stats, uploadTimestamp, uploadTimeISO, metadata, initialFiles,
+      coreRecords: chronological(unclamped ? coreRecords : filteredCore),
+      aiRecords: chronological(unclamped ? aiRecords : filteredAi),
+      loginTimestamp: window.signinTimestamp, sessionEndTime: window.expireTimestamp,
+      totalRawEvents: coreRecords.length, clampedEventsCount: filteredCore.length,
+      isClamped: !unclamped && (coreRecords.length !== filteredCore.length || aiRecords.length !== filteredAi.length),
+    });
+}

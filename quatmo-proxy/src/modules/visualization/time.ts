@@ -1,8 +1,5 @@
-export function toMs(ts: any): number | null {
-  const n = Number(ts);
-  if (!n || isNaN(n)) return null;
-  return n < 1e11 ? n * 1000 : n;
-}
+import { toMs } from "../../shared/sessionTime";
+export { toMs };
 
 export function sliceRecordsByTimeRange<T extends { timestamp?: any }>(
   records: T[],

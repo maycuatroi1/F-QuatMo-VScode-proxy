@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { sessionEndMs } from "../shared/sessionTime";
 import path from "path";
 import fs from "fs";
 
@@ -686,7 +687,7 @@ try {
       promptMode: (r.prompt_mode as SessionPromptMode) || "scaffolded_code",
       examQuestions: parsedQuestions,
       runtimeConfig: parsedRuntimeConfig,
-      createdAt: r.created_at || Date.now(),
+      createdAt: r.created_at || 0,
       createdBy: r.created_by || "admin",
       updatedAt: r.updated_at || r.created_at || 0,
       updatedBy: r.updated_by || "admin",
@@ -756,9 +757,7 @@ export async function syncAllDataToRedis() {
 
   try {
     for (const session of sessions.values()) {
-      const startSec = session.startTime || Math.floor((session.createdAt || Date.now()) / 1000);
-      const durationSec = session.durationMinutes === -1 ? 86400 * 30 : (session.durationMinutes || 60) * 60;
-      const endSec = startSec + durationSec;
+      const endSec = Math.floor((sessionEndMs(session) ?? 0) / 1000);
 
       if (nowSec >= endSec) continue;
 

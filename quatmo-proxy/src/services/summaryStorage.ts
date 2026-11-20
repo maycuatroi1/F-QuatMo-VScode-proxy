@@ -159,6 +159,9 @@ export class SummaryStorageService {
       // The existing CLI writes progress before its final one-line JSON payload.
       const result = JSON.parse(stdout.trim().split(/\r?\n/).at(-1)!);
       if (!result.ok) throw new Error(result.error || "Summary engine failed.");
+      if (result.analysisRuleVersion !== "scheduled-signin-v1") {
+        throw new Error("Summary engine must implement scheduled-signin-v1; update the configured engine.");
+      }
       if (studentId && (result.student_id !== studentId || typeof result.markdown !== "string" || !result.markdown)) {
         throw new Error("Summary engine returned an invalid student result.");
       }
@@ -176,6 +179,7 @@ export class SummaryStorageService {
           const metadataPath = path.join(generatedRoot, "stages", id, "check_report.json");
           reports[id] = {
             student_id: id,
+            analysisRuleVersion: result.analysisRuleVersion,
             markdown: await fs.promises.readFile(markdownPath, "utf8"),
             check_report: fs.existsSync(metadataPath) ? JSON.parse(await fs.promises.readFile(metadataPath, "utf8")) : undefined,
           };
@@ -191,7 +195,7 @@ export class SummaryStorageService {
   public async generateStudentSummary(sessionCode: string, studentId: string, customZipPath?: string, persist = true, onProgress?: SummaryProgressCallback): Promise<any> {
     const result = await this.runEngine(sessionCode, studentId, customZipPath, onProgress);
     onProgress?.({ stage: "saving", completed: 1, total: 1 });
-    if (persist) await this.saveStudentSummary(sessionCode, studentId, result.markdown, { check_report: result.check_report, metrics: result.metrics });
+    if (persist) await this.saveStudentSummary(sessionCode, studentId, result.markdown, { check_report: result.check_report, metrics: result.metrics, analysisRuleVersion: result.analysisRuleVersion });
     return result;
   }
 
@@ -201,7 +205,7 @@ export class SummaryStorageService {
     onProgress?.({ stage: "saving", completed: total, total });
     if (persist) {
       for (const [studentId, report] of Object.entries<any>(result.reports)) {
-        await this.saveStudentSummary(sessionCode, studentId, report.markdown, { check_report: report.check_report, metrics: report.metrics });
+        await this.saveStudentSummary(sessionCode, studentId, report.markdown, { check_report: report.check_report, metrics: report.metrics, analysisRuleVersion: result.analysisRuleVersion });
       }
       await this.saveSessionManifest(sessionCode, result.manifest_content);
     }

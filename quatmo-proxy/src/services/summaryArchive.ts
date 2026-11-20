@@ -4,6 +4,8 @@ import AdmZip from "adm-zip";
 import { SUMMARY_MAX_ARCHIVE_BYTES, SUMMARY_MAX_ARCHIVE_FILES } from "../config/summaryLimits";
 import { normalizeUploadRelPath } from "./security";
 import { s3Storage } from "./s3Storage";
+import { sessions, sessionStates } from "./sessionStore";
+import { readSessionDefinition } from "../modules/visualization/sessionWindow";
 
 const artifacts = new Set(["events.jsonl", "ai_interactions.jsonl", "metadata.json", "upload_info.json", "snapshot_start.zip"]);
 
@@ -59,6 +61,10 @@ export async function createSummaryArchive(sessionCode: string, tempDir: string)
       (segments.length > 1 && artifacts.has(segments.at(-1)!));
   }
   const root = path.resolve("logs", "sessions", sessionCode);
+  let manifest: any = null;
+  const manifestPath = path.join(root, "session_manifest.json");
+  if (fs.existsSync(manifestPath)) manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf8"));
+  else if (s3Storage.isAvailable()) manifest = await s3Storage.getSessionManifest(sessionCode);
   async function walk(dir: string, prefix: string) {
     for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
       const name = prefix + entry.name;
@@ -91,7 +97,17 @@ export async function createSummaryArchive(sessionCode: string, tempDir: string)
     }
     throw new Error(`No telemetry available for session ${sessionCode}.`);
   }
-  add("session_manifest.json", JSON.stringify({ sessionCode }));
+  const session = sessions.get(sessionCode);
+  if (!manifest && session) manifest = {
+    sessionCode, createdAt: session.createdAt, startTime: session.startTime, durationMinutes: session.durationMinutes,
+    students: [...session.allowedStudentIds].map((studentId) => ({ studentId, loginTimestamp: sessionStates.get(`${sessionCode}:${studentId}`)?.loginTimestamp })),
+  };
+  if (!manifest) throw new Error("Session schedule is required for summary analysis.");
+  // This ZIP is a derived job input; collected manifests on disk/S3 are unchanged.
+  manifest = { ...manifest, ...await readSessionDefinition(sessionCode),
+    students: [...(manifest.students ?? []), ...[...(session?.allowedStudentIds ?? [])]
+      .map((studentId) => ({ studentId, loginTimestamp: sessionStates.get(`${sessionCode}:${studentId}`)?.loginTimestamp }))] };
+  add("session_manifest.json", JSON.stringify(manifest));
   const buffer = zip.toBuffer();
   validateSummaryZip(buffer);
   const target = path.join(tempDir, `${sessionCode}.zip`);

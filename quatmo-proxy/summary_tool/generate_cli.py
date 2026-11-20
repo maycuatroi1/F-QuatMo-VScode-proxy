@@ -90,6 +90,7 @@ def main():
             res = pipeline.run_student(args.student)
             payload = {
                 "ok": True,
+                "analysisRuleVersion": "scheduled-signin-v1",
                 "student_id": res["student_id"],
                 "session_code": res["session_code"],
                 "markdown": res["markdown"],
@@ -116,6 +117,7 @@ def main():
 
             payload = {
                 "ok": True,
+                "analysisRuleVersion": "scheduled-signin-v1",
                 "session_code": pipeline.session_code,
                 "student_count": len(results),
                 "output_dir": pipeline.output_dir,

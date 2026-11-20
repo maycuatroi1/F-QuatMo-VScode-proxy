@@ -1,6 +1,5 @@
 import fs from "fs";
 import path from "path";
-import crypto from "crypto";
 import { decryptLogFile } from "./secureLogger";
 
 const LOG_ENCRYPT_KEY = (process.env.LOG_ENCRYPT_KEY || "").trim();
@@ -40,16 +39,14 @@ export async function withFileLock<T>(
   const next = new Promise<void>((res) => {
     release = res;
   });
-  fileLocks.set(
-    key,
-    current.then(() => next),
-  );
+  const queued = current.then(() => next);
+  fileLocks.set(key, queued);
   await current;
   try {
     return await fn();
   } finally {
     release!();
-    if (fileLocks.get(key) === next) {
+    if (fileLocks.get(key) === queued) {
       fileLocks.delete(key);
     }
   }
@@ -92,515 +89,47 @@ export async function reconcileStudentPromptTurns(
   sessionCode: string,
   studentId: string,
   sessionDir: string,
-): Promise<{
-  turns: PromptTurnRecord[];
-  wasRepaired: boolean;
-  source: string;
-}> {
-  const safeStudentId = studentId.toUpperCase();
-  let jsonPath = path.join(sessionDir, `${safeStudentId}.json`);
-  let logPath = path.join(sessionDir, `${safeStudentId}.log`);
-  let studentDir = path.join(sessionDir, safeStudentId);
-
-  if (fs.existsSync(sessionDir)) {
-    try {
-      const entries = await fs.promises.readdir(sessionDir);
-      for (const e of entries) {
-        const lower = e.toLowerCase();
-        if (
-          lower === `${safeStudentId.toLowerCase()}.json` &&
-          !fs.existsSync(jsonPath)
-        ) {
-          jsonPath = path.join(sessionDir, e);
-        } else if (
-          lower === `${safeStudentId.toLowerCase()}.log` &&
-          !fs.existsSync(logPath)
-        ) {
-          logPath = path.join(sessionDir, e);
-        } else if (
-          lower === safeStudentId.toLowerCase() &&
-          !fs.existsSync(studentDir)
-        ) {
-          studentDir = path.join(sessionDir, e);
-        }
-      }
-    } catch {}
-  }
-
-
-  let existingTurns: PromptTurnRecord[] = [];
-  let hadExistingGhostTurns = false;
+): Promise<{ turns: PromptTurnRecord[]; wasRepaired: boolean; source: string }> {
+  const { reconcilePromptTurns } = await import("../shared/promptTurns");
+  const id = studentId.toUpperCase();
+  const entries = fs.existsSync(sessionDir) ? await fs.promises.readdir(sessionDir) : [];
+  const find = (name: string) => path.join(sessionDir, entries.find((e) => e.toUpperCase() === name.toUpperCase()) || name);
+  let rawTurns: any[] = [];
+  const jsonPath = find(id + ".json");
   if (fs.existsSync(jsonPath)) {
-    try {
-      const raw = await fs.promises.readFile(jsonPath, "utf-8");
-      const parsed = safeParseJson(raw);
-      if (Array.isArray(parsed)) {
-        const initialCount = parsed.length;
-        existingTurns = parsed.filter((t) => !isGhostPromptTurn(t));
-        hadExistingGhostTurns = existingTurns.length < initialCount;
-      }
-    } catch {}
+    const parsed = safeParseJson(await fs.promises.readFile(jsonPath, "utf8"));
+    if (Array.isArray(parsed)) rawTurns = parsed.filter((t) => !isGhostPromptTurn(t));
   }
-
-  let logTurns: PromptTurnRecord[] = [];
-  if (fs.existsSync(logPath)) {
-    try {
-      const candidateKeys = [
-        LOG_ENCRYPT_KEY,
-        (process.env.CUSTOM_API_KEY || "").trim(),
-        "1234",
-        "secret",
-      ].filter(Boolean);
-
-      for (const key of candidateKeys) {
-        try {
-          const decrypted = decryptLogFile(logPath, key) as any[];
-          const valid = decrypted.filter(
-            (t) =>
-              t &&
-              !t._error &&
-              (t.prompt || t.tokensConsumedTotal) &&
-              !isGhostPromptTurn(t),
-          );
-          if (valid.length > 0) {
-            logTurns = valid;
-            break;
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  let aiInteractions: any[] = [];
-  const examRecordsDir = path.join(studentDir, "exam_records");
-  if (fs.existsSync(examRecordsDir)) {
-    try {
-      const subEntries = await fs.promises.readdir(examRecordsDir, {
-        withFileTypes: true,
-      });
-      for (const sub of subEntries) {
-        if (sub.isDirectory()) {
-          const aiPath = path.join(
-            examRecordsDir,
-            sub.name,
-            "ai_interactions.jsonl",
-          );
-          if (fs.existsSync(aiPath)) {
-            const raw = await fs.promises.readFile(aiPath, "utf-8");
-            for (const line of raw.split("\n")) {
-              const trimmed = line.trim();
-              if (trimmed) {
-                try {
-                  aiInteractions.push(JSON.parse(trimmed));
-                } catch {}
-              }
-            }
-          }
-        }
-      }
-    } catch {}
-  }
-
-  const clientRequests = aiInteractions.filter(
-    (e) => e.type === "chat_request",
-  );
-  const clientResponses = aiInteractions.filter(
-    (e) => e.type === "chat_response_complete",
-  );
-
-  const clientRespsByReqId = new Map<string, any>();
-  for (const resp of clientResponses) {
-    const reqId = resp.payload?.requestId;
-    if (reqId) {
-      clientRespsByReqId.set(reqId, resp);
-    }
-  }
-
-  let sessionDateStr: string | null = null;
-  const uploadInfoPath = path.join(studentDir, "upload_info.json");
-  if (fs.existsSync(uploadInfoPath)) {
-    try {
-      const uInfo = JSON.parse(
-        await fs.promises.readFile(uploadInfoPath, "utf-8"),
-      );
-      if (uInfo.uploadTimeISO) {
-        sessionDateStr = uInfo.uploadTimeISO.split("T")[0];
-      }
-    } catch {}
-  }
-
-  const relevantClientRequests: any[] = [];
-  for (let i = 0; i < clientRequests.length; i++) {
-    const req = clientRequests[i];
-    if (sessionDateStr && req.timestamp) {
-      const dt = new Date(req.timestamp);
-      const reqDateStr = dt.toISOString().split("T")[0];
-      if (reqDateStr === sessionDateStr) {
-        relevantClientRequests.push(req);
-      }
-    } else {
-      relevantClientRequests.push(req);
-    }
-  }
-
-  const maxAvailableTurns = Math.max(
-    existingTurns.length,
-    logTurns.length,
-    relevantClientRequests.length,
-  );
-
-  if (existingTurns.length >= maxAvailableTurns && existingTurns.length > 0) {
-    let modified = hadExistingGhostTurns;
-    for (let i = 0; i < existingTurns.length; i++) {
-      const turn = existingTurns[i];
-      if (
-        !turn.createdAt ||
-        !turn.completedAt ||
-        typeof turn.responseDurationMs !== "number"
-      ) {
-        const matchingReq =
-          relevantClientRequests.find(
-            (r) =>
-              r.payload?.prompt === turn.prompt ||
-              (turn.prompt &&
-                r.payload?.messages?.some(
-                  (m: any) => m.role === "user" && m.content === turn.prompt,
-                )),
-          ) || relevantClientRequests[i];
-
-        const reqId = matchingReq?.payload?.requestId;
-        const matchingResp = reqId ? clientRespsByReqId.get(reqId) : null;
-
-        let createdMs = matchingReq?.timestamp;
-        if (reqId && reqId.startsWith("chat-")) {
-          const parsed = parseInt(reqId.split("-")[1], 10);
-          if (!isNaN(parsed) && parsed > 1000000000000) {
-            createdMs = parsed;
-          }
-        }
-        if (!createdMs && turn.timestamp) {
-          createdMs = new Date(turn.timestamp).getTime();
-        }
-
-        const completedMs =
-          matchingResp?.timestamp ||
-          (turn.lastUpdated
-            ? new Date(turn.lastUpdated).getTime()
-            : turn.timestamp
-              ? new Date(turn.timestamp).getTime()
-              : createdMs
-                ? createdMs + 5000
-                : Date.now());
-        const durationMs =
-          createdMs && completedMs ? Math.max(0, completedMs - createdMs) : 0;
-
-        if (!turn.createdAt && createdMs)
-          turn.createdAt = new Date(createdMs).toISOString();
-        if (!turn.completedAt && completedMs)
-          turn.completedAt = new Date(completedMs).toISOString();
-        if (typeof turn.responseDurationMs !== "number")
-          turn.responseDurationMs = durationMs;
-        modified = true;
-      }
-    }
-
-    const totalTokens = existingTurns.reduce(
-      (acc, t) => acc + (t.tokensConsumedTotal || 0),
-      0,
-    );
-
-    if (modified) {
+  if (!rawTurns.length && fs.existsSync(find(id + ".log"))) {
+    for (const key of [LOG_ENCRYPT_KEY, (process.env.CUSTOM_API_KEY || "").trim(), "1234", "secret"].filter(Boolean)) {
       try {
-        await withFileLock(jsonPath, async () => {
-          if (fs.existsSync(jsonPath)) {
-            try {
-              const latestRaw = await fs.promises.readFile(jsonPath, "utf-8");
-              const latestParsed = safeParseJson(latestRaw);
-              if (
-                Array.isArray(latestParsed) &&
-                !hadExistingGhostTurns &&
-                latestParsed.length > existingTurns.length
-              ) {
-                return;
-              }
-            } catch {}
-          }
-          if (hadExistingGhostTurns && fs.existsSync(jsonPath)) {
-            const bakPath = `${jsonPath}.bak.${Date.now()}`;
-            try {
-              await fs.promises.copyFile(jsonPath, bakPath);
-            } catch {}
-          }
-          await atomicWriteJson(jsonPath, existingTurns);
-        });
-
-        // Synchronize tokens consumed in session_manifest.json
-        const manifestPath = path.join(sessionDir, "session_manifest.json");
-        if (fs.existsSync(manifestPath)) {
-          try {
-            const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
-            const mJson = safeParseJson(mRaw);
-            if (mJson && Array.isArray(mJson.students)) {
-              const sItem = mJson.students.find(
-                (s: any) =>
-                  s.studentId &&
-                  s.studentId.toUpperCase() === safeStudentId,
-              );
-              if (sItem) {
-                sItem.tokensConsumed = totalTokens;
-                sItem.promptTurns = existingTurns.length;
-                await atomicWriteJson(manifestPath, mJson);
-              }
-            }
-          } catch {}
-        }
+        const parsed = decryptLogFile(find(id + ".log"), key) as any[];
+        rawTurns = parsed.filter((t) => t && !t._error && !isGhostPromptTurn(t));
+        if (rawTurns.length) break;
       } catch {}
     }
-
-    // Always synchronize SQLite table session_states and Redis if tokens differ
-    try {
-      const { sessionStates } = await import("./sessionStore");
-      const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
-      const st = sessionStates.get(stateKey);
-      if (st && (st.tokensConsumed !== totalTokens || modified)) {
-        st.tokensConsumed = totalTokens;
-        st.promptCount = existingTurns.length;
-        sessionStates.set(stateKey, st); // Persist to SQLite
-        const { redis } = await import("./redis");
-        if (redis && redis.status === "ready") {
-          await redis.hset(
-            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
-            "consumed",
-            String(totalTokens),
-          );
-        }
-      }
-    } catch {}
-
-    return {
-      turns: existingTurns,
-      wasRepaired: modified,
-      source: hadExistingGhostTurns ? "sanitized_ghost_turns" : "json",
-    };
   }
-
-  let synthesizedTurns: PromptTurnRecord[] = [];
-
-  if (relevantClientRequests.length > 0) {
-    for (let i = 0; i < relevantClientRequests.length; i++) {
-      const req = relevantClientRequests[i];
-      const reqPayload = req.payload || {};
-      const reqId = reqPayload.requestId;
-      const resp =
-        (reqId ? clientRespsByReqId.get(reqId) : null) ||
-        clientResponses[i] ||
-        {};
-      const respPayload = resp.payload || {};
-
-      let promptText = reqPayload.prompt || reqPayload.message || "";
-      if (
-        !promptText &&
-        Array.isArray(reqPayload.messages) &&
-        reqPayload.messages.length > 0
-      ) {
-        const userMsgs = reqPayload.messages.filter(
-          (m: any) => m.role === "user",
-        );
-        promptText =
-          userMsgs.length > 0
-            ? userMsgs[userMsgs.length - 1].content || ""
-            : reqPayload.messages[reqPayload.messages.length - 1].content || "";
-      }
-
-      const totalTokens =
-        respPayload.tokenUsage?.totalTokens ||
-        (respPayload.tokenUsage?.promptTokens || 0) +
-          (respPayload.tokenUsage?.completionTokens || 0) ||
-        0;
-
-      const matchedTurn =
-        existingTurns.find(
-          (et) =>
-            et.prompt === promptText ||
-            (promptText &&
-              et.prompt &&
-              (et.prompt.startsWith(promptText.slice(0, 30)) ||
-                promptText.startsWith(et.prompt.slice(0, 30)))),
-        ) ||
-        logTurns.find(
-          (lt) =>
-            lt.prompt === promptText ||
-            (promptText &&
-              lt.prompt &&
-              (lt.prompt.startsWith(promptText.slice(0, 30)) ||
-                promptText.startsWith(lt.prompt.slice(0, 30)))),
-        ) ||
-        existingTurns[i] ||
-        logTurns[i];
-
-      let createdMs =
-        typeof req.timestamp === "number" ? req.timestamp : Date.now();
-      if (reqId && reqId.startsWith("chat-")) {
-        const parsed = parseInt(reqId.split("-")[1], 10);
-        if (!isNaN(parsed) && parsed > 1000000000000) {
-          createdMs = parsed;
-        }
-      }
-      const completedMs =
-        typeof resp.timestamp === "number"
-          ? resp.timestamp
-          : matchedTurn?.lastUpdated
-            ? new Date(matchedTurn.lastUpdated).getTime()
-            : createdMs + 5000;
-      const responseDurationMs = Math.max(0, completedMs - createdMs);
-      const createdAt = new Date(createdMs).toISOString();
-      const completedAt = new Date(completedMs).toISOString();
-
-      const turnObj: PromptTurnRecord = {
-        timestamp: completedAt,
-        createdAt,
-        completedAt,
-        responseDurationMs,
-        conversationId:
-          reqPayload.conversationId || matchedTurn?.conversationId,
-        prompt: promptText,
-        output:
-          respPayload.text || respPayload.content || matchedTurn?.output || "",
-        classification: matchedTurn?.classification || {
-          label: "mixed",
-          currentLabel: "mixed",
-          confidence: 0.85,
-        },
-        aiOption: matchedTurn?.aiOption || "mixed",
-        tokensConsumedTotal:
-          totalTokens || matchedTurn?.tokensConsumedTotal || 0,
-        tokenLimit: matchedTurn?.tokenLimit,
-        agentLoops: matchedTurn?.agentLoops || [],
-        history: matchedTurn?.history || reqPayload.messages || [],
-        codeSnapshot: matchedTurn?.codeSnapshot,
-        activeFilePath:
-          reqPayload.activeDocumentUri || matchedTurn?.activeFilePath,
-        activeFileLanguageId: matchedTurn?.activeFileLanguageId,
-        codeSnapshots: matchedTurn?.codeSnapshots,
-        terminalOutput: matchedTurn?.terminalOutput,
-        lastTerminalCommand: matchedTurn?.lastTerminalCommand,
-        ...(matchedTurn?.commandType
-          ? { commandType: matchedTurn.commandType }
-          : {}),
-        ...(matchedTurn?.featureVector
-          ? { featureVector: matchedTurn.featureVector }
-          : {}),
-      };
-
-      synthesizedTurns.push(turnObj);
-    }
-  } else if (logTurns.length > existingTurns.length) {
-    synthesizedTurns = logTurns;
-  } else {
-    synthesizedTurns = existingTurns;
-  }
-
-  for (const turn of synthesizedTurns) {
-    if (!turn.createdAt && turn.timestamp) turn.createdAt = turn.timestamp;
-    if (!turn.completedAt)
-      turn.completedAt = turn.lastUpdated || turn.timestamp;
-    if (
-      typeof turn.responseDurationMs !== "number" &&
-      turn.createdAt &&
-      turn.completedAt
-    ) {
-      const s = new Date(turn.createdAt).getTime();
-      const e = new Date(turn.completedAt).getTime();
-      turn.responseDurationMs = !isNaN(s) && !isNaN(e) ? Math.max(0, e - s) : 0;
+  const interactions: any[] = [];
+  const legacyFile = path.join(find(id), "ai_interactions.jsonl");
+  if (fs.existsSync(legacyFile)) {
+    for (const line of (await fs.promises.readFile(legacyFile, "utf8")).split("\n")) {
+      const parsed = safeParseJson(line);
+      if (parsed) interactions.push(parsed);
     }
   }
-
-  if (synthesizedTurns.length > existingTurns.length) {
-    try {
-      let wroteSynthesized = false;
-      await withFileLock(jsonPath, async () => {
-        if (fs.existsSync(jsonPath)) {
-          try {
-            const latestRaw = await fs.promises.readFile(jsonPath, "utf-8");
-            const latestParsed = safeParseJson(latestRaw);
-            if (
-              Array.isArray(latestParsed) &&
-              latestParsed.length >= synthesizedTurns.length
-            ) {
-              synthesizedTurns = latestParsed;
-              return;
-            }
-          } catch {}
-        }
-        await atomicWriteJson(jsonPath, synthesizedTurns);
-        wroteSynthesized = true;
-      });
-      if (!wroteSynthesized) {
-        return {
-          turns: synthesizedTurns,
-          wasRepaired: false,
-          source: "disk_newer",
-        };
+  const recordsDir = path.join(find(id), "exam_records");
+  if (fs.existsSync(recordsDir)) {
+    for (const record of await fs.promises.readdir(recordsDir, { withFileTypes: true })) {
+      if (!record.isDirectory()) continue;
+      const file = path.join(recordsDir, record.name, "ai_interactions.jsonl");
+      if (!fs.existsSync(file)) continue;
+      for (const line of (await fs.promises.readFile(file, "utf8")).split("\n")) {
+        if (!line.trim()) continue;
+        const parsed = safeParseJson(line);
+        if (parsed) interactions.push(parsed);
       }
-      const totalTokens = synthesizedTurns.reduce(
-        (acc, t) => acc + (t.tokensConsumedTotal || 0),
-        0,
-      );
-      const manifestPath = path.join(sessionDir, "session_manifest.json");
-      if (fs.existsSync(manifestPath)) {
-        try {
-          const mRaw = await fs.promises.readFile(manifestPath, "utf-8");
-          const mJson = safeParseJson(mRaw);
-          if (mJson && Array.isArray(mJson.students)) {
-            const sItem = mJson.students.find(
-              (s: any) =>
-                s.studentId &&
-                s.studentId.toUpperCase() === safeStudentId,
-            );
-            if (sItem) {
-              sItem.tokensConsumed = totalTokens;
-              sItem.promptTurns = synthesizedTurns.length;
-              await atomicWriteJson(manifestPath, mJson);
-            }
-          }
-        } catch {}
-      }
-
-      // Synchronize in SQLite memory & table and Redis
-      try {
-        const { sessionStates } = await import("./sessionStore");
-        const stateKey = `${sessionCode.toUpperCase()}:${safeStudentId}`;
-        const st = sessionStates.get(stateKey);
-        if (st) {
-          st.tokensConsumed = totalTokens;
-          st.promptCount = synthesizedTurns.length;
-          sessionStates.set(stateKey, st); // Persist to SQLite
-        }
-        const { redis } = await import("./redis");
-        if (redis && redis.status === "ready") {
-          await redis.hset(
-            `session:user:${sessionCode.toUpperCase()}:${safeStudentId}`,
-            "consumed",
-            String(totalTokens),
-          );
-        }
-      } catch {}
-      return {
-        turns: synthesizedTurns,
-        wasRepaired: true,
-        source: "reconciled",
-      };
-    } catch (err) {
-      console.error(
-        `[PromptLogService] Failed to write repaired JSON to ${jsonPath}:`,
-        err,
-      );
     }
   }
-
-  return {
-    turns: synthesizedTurns.length > 0 ? synthesizedTurns : existingTurns,
-    wasRepaired: false,
-    source: "fallback",
-  };
+  return { turns: reconcilePromptTurns(rawTurns, interactions), wasRepaired: false,
+    source: fs.existsSync(jsonPath) || fs.existsSync(find(id + ".log")) ? "local_proxy_log" : "client_read_only" };
 }

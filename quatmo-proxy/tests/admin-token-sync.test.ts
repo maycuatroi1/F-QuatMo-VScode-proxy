@@ -136,11 +136,10 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       expect(await response.json()).toEqual({ success: true, sessionCode: code, updatedCount: 1, students: [{ studentId: "SESYNC", oldTokens: 99, newTokens: 85 }] });
       expect(data.state()).toMatchObject({ tokensConsumed: 85, promptCount: 2, loginTimestamp: 123 });
       expect(data.persisted()).toEqual({ tokens_consumed: 85 });
-      expect(JSON.parse(fs.readFileSync(path.join(data.directory, "SESYNC.json"), "utf8"))).toHaveLength(2);
-      expect(JSON.parse(fs.readFileSync(path.join(data.directory, "session_manifest.json"), "utf8")).students[0]).toMatchObject({ tokensConsumed: 85, promptTurns: 2 });
+      expect(fs.readFileSync(path.join(data.directory, "SESYNC.json"), "utf8")).toBe(original);
+      expect(JSON.parse(fs.readFileSync(path.join(data.directory, "session_manifest.json"), "utf8")).students[0]).toMatchObject({ tokensConsumed: 999 });
       const backups = fs.readdirSync(data.directory).filter((file) => file.startsWith("SESYNC.json.bak."));
-      expect(backups).toHaveLength(1);
-      expect(fs.readFileSync(path.join(data.directory, backups[0]), "utf8")).toBe(original);
+      expect(backups).toHaveLength(0);
       expect((await (await sync(code)).json()).updatedCount).toBe(0);
     } finally { data.cleanup(); }
   });
