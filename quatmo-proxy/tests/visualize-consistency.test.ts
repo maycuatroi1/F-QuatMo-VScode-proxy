@@ -44,19 +44,22 @@ test("a valid future JWT cannot extend a scheduled deadline; legacy milliseconds
     }finally{f.cleanup();}
   }
 });
-test("strict prompt window uses request creation, preserves source bytes and flags conflicting request IDs",async()=>{
+test("Prompt Log uses the same monitor records, window and duplicate handling",async()=>{
   const created=1700000000000,code="WINDOW_PROMPTS",f=fixture(code,created);
   const raw=[{timestamp:created+1,prompt:"valid",tokensConsumedTotal:3},{timestamp:created+3600001,prompt:"late"},{timestamp:created-1,prompt:"prior"}];
   f.write("S1.json",JSON.stringify(raw));
   f.write("S1/exam_records/R/ai_interactions.jsonl",[
+    {timestamp:created+2,type:"chat_request",payload:{requestId:`chat-${created+2}-valid`,prompt:"valid"}},
+    {timestamp:created+3600001,type:"chat_request",payload:{requestId:`chat-${created+3}-late`,prompt:"late-client"}},
     {timestamp:created+3,type:"chat_request",payload:{requestId:"conflict",prompt:"one"}},
     {timestamp:created+4,type:"chat_request",payload:{requestId:"conflict",prompt:"two"}},
   ].map(r=>JSON.stringify(r)).join("\n"));
   try{
     const body=await(await app.request(`/admin/visualize/sessions/${code}/accounts/S1/prompt-log`,{headers:admin})).json();
-    expect(body.turns.map((t:any)=>t.prompt)).toEqual(["valid"]);
+    expect(body.turns.map((t:any)=>t.prompt)).toEqual(["valid","one","two"]);
     const full=await(await app.request(`/admin/visualize/sessions/${code}/accounts/S1/prompt-log?unclamped=true`,{headers:admin})).json();
     expect(full.turns.filter((t:any)=>t.associationStatus==="DUPLICATE_CONFLICT")).toHaveLength(2);
+    expect(full.turns.map((t:any)=>t.prompt)).toContain("late-client");
     expect(fs.readFileSync(path.join(f.root,"S1.json"),"utf8")).toBe(JSON.stringify(raw));
     expect(sessionStates.get(`${code}:S1`)!.tokensConsumed).toBe(0);
   }finally{f.cleanup();}

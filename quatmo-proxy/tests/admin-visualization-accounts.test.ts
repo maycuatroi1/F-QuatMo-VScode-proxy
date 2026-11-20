@@ -37,12 +37,13 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
     data.write("SELOCAL.json", JSON.stringify([{timestamp:time+1,prompt:"first"},{timestamp:time+2,prompt:"second",error:"fixture"}]));
     data.write("SELOCAL/upload_info.json", JSON.stringify({metrics:{inWindowEvents:7}}));
     data.write("SELOCAL/events.jsonl", JSON.stringify({timestamp:time+1,type:"save"}));
+    data.write("SELOCAL/ai_interactions.jsonl", ["first", "second"].map((prompt, i) => JSON.stringify({timestamp:time+i+1,type:"chat_request",payload:{requestId:`chat-${time+i+1}-${prompt}`,prompt}})).join("\n"));
     data.write("SEEVENTS/exam_records/R/events.jsonl", [time-1,time+1,time+3600001].map(timestamp=>JSON.stringify({timestamp})).join("\n")+"\ncorrupt\n");
     try {
       expect((await app.request(`${prefix}/visualize/sessions/${code}/accounts`)).status).toBe(401);
       const body=await (await app.request(`${prefix}/visualize/sessions/${code}/accounts`,{headers})).json();
       expect(body.accounts).toHaveLength(3);
-      expect(body.accounts.find((x:any)=>x.studentId==="SELOCAL")).toMatchObject({hasPromptLog:true,hasEventLog:true,promptTurnsCount:2,eventCount:1,hasErrors:true});
+      expect(body.accounts.find((x:any)=>x.studentId==="SELOCAL")).toMatchObject({hasPromptLog:true,hasEventLog:true,promptTurnsCount:2,eventCount:1,hasErrors:false});
       expect(body.accounts.find((x:any)=>x.studentId==="SEEVENTS")).toMatchObject({eventCount:1});
       expect(body.accounts.find((x:any)=>x.studentId==="SEMEMORY")).toMatchObject({eventCount:0,promptTurnsCount:0,validityWindow:{status:"unresolved"}});
     } finally { data.cleanup(); }
@@ -74,18 +75,21 @@ for (const [index, prefix] of ["/admin", "/v1/admin"].entries()) {
       expect(detail.coreRecords).toHaveLength(1);
     }finally{spies.forEach(s=>s.mockRestore());data.cleanup();}
   });
-  test(`${prefix}: reading prompts preserves source bytes, tokens and missing classification`,async()=>{
+  test(`${prefix}: Prompt Log uses monitor chat requests without changing proxy evidence`,async()=>{
     const code=`VIS_PROMPTS_${index}`,data=fixture(code);
     const original=JSON.stringify([{timestamp:time+1,createdAt:time+1,prompt:"existing",tokensConsumedTotal:10,classification:{features:{retained:1}}},
       {timestamp:time+2,prompt:"missing",tokensConsumedTotal:6}]);
     data.write("SELOCAL.json",original);
+    data.write("SELOCAL/ai_interactions.jsonl",[
+      {timestamp:time+1,type:"chat_request",payload:{requestId:`chat-${time+1}-existing`,prompt:"monitor prompt"}},
+      {timestamp:time+2,type:"chat_response_complete",payload:{requestId:`chat-${time+1}-existing`,text:"monitor response",tokenUsage:{totalTokens:12}}},
+    ].map(record=>JSON.stringify(record)).join("\n"));
     const cached=spyOn(redisStore,"getTurns").mockResolvedValue([{prompt:"missing",featureVector:{added:1}}] as any);
     try{
       const body=await(await app.request(`${prefix}/visualize/sessions/${code}/accounts/SELOCAL/prompt-log`,{headers})).json();
-      expect(body.turns).toHaveLength(2);
-      expect(body.turns[0].classification).toEqual({features:{retained:1}});
-      expect(body.turns[1].classification).toBeUndefined();
-      expect(body.turns[1].responseDurationMs).toBeUndefined();
+      expect(body.turns).toHaveLength(1);
+      expect(body.turns[0]).toMatchObject({prompt:"monitor prompt",output:"monitor response",tokensConsumedTotal:12,source:"client_reconstructed"});
+      expect(body.turns[0].classification).toBeUndefined();
       expect(sessionStates.get(`${code}:SELOCAL`)!.tokensConsumed).toBe(99);
       expect(fs.readFileSync(path.join(data.directory,"SELOCAL.json"),"utf8")).toBe(original);
       expect(cached).not.toHaveBeenCalled();
