@@ -26,7 +26,7 @@ import zipfile
 import difflib
 import datetime
 from typing import Dict, List, Any, Optional, Set, Tuple
-from .constants import DEFAULT_PARAMS, EXCLUDED_ACCOUNTS, TASK_DIRS
+from .constants import DEFAULT_PARAMS, TASK_DIRS
 from .session_window import resolve_window, select_records, request_time, exclude_request_conflicts
 
 
@@ -400,9 +400,6 @@ class ZipSessionIngester:
                     self._student_file_map[s_id]['snapshot_end'].append(norm_name)
                 elif norm_name.endswith(f"{s_id}.json"):
                     self._student_file_map[s_id]['prompt_json'] = norm_name
-
-            for s_id in EXCLUDED_ACCOUNTS:
-                self._student_file_map.pop(s_id, None)
 
             # Load shared starter files and task description from the first available snapshot_start.zip
             # A21: chỉ snapshot_start chụp lúc mở buổi này, và chỉ khi một sinh viên khác có code khởi đầu giống

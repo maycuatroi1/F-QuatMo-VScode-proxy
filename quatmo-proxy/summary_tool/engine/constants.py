@@ -9,8 +9,6 @@ from typing import List
 
 from .config import config
 
-# Tài khoản giảng viên thử tool, không phải sinh viên: không tóm tắt, không tính vào baseline của lớp.
-EXCLUDED_ACCOUNTS = {"DATTT67"}
 TASK_DIRS = ("Q1", "Q2")  # fvscode.read.task_dirs: thư mục con của bài, mỗi thư mục là một project riêng
 
 

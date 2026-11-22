@@ -26,6 +26,18 @@ class SessionWindowTest(unittest.TestCase):
         self.assertEqual(len(select_records(records, T, T)),2)
         self.assertEqual(select_records([{"timestamp":T+1}],T,T),[])
 
+    def test_production_includes_instructor_logs_in_normal_enumeration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp)/"TEST.zip"
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(self.archive())) as source, zipfile.ZipFile(buffer, "w") as target:
+                for entry in source.infolist():
+                    target.writestr(entry.filename.replace("SE1", "DATTT67"), source.read(entry).replace(b"SE1", b"DATTT67"))
+            file.write_bytes(buffer.getvalue())
+            ingester = ZipSessionIngester(str(file))
+            self.assertIn("DATTT67", ingester.get_students())
+            self.assertEqual(ingester.load_student("DATTT67").student_id, "DATTT67")
+
     def test_conflicting_signin_is_unresolved(self):
         with zipfile.ZipFile(io.BytesIO(self.archive(signin=0,upload_signin=T))) as z:
             with self.assertRaisesRegex(ValueError,"sign-in"):

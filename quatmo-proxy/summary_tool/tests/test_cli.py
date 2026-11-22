@@ -86,6 +86,22 @@ class PackagedSummaryTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse(output.exists())
 
+    def test_explicit_instructor_report_succeeds_through_cli(self):
+        archive = self.work / "INSTRUCTOR.zip"
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("session_manifest.json", json.dumps({"sessionCode": "INSTRUCTOR", "createdAt": 1700000000000, "durationMinutes": 60, "students": [{"studentId": "DATTT67", "loginTimestamp": 1700000000000}]}))
+            output.writestr("DATTT67/exam_records/R/events.jsonl", json.dumps({"timestamp": 1700000060000, "type": "save"}))
+        result, payload = self.run_cli("--zip", archive, "--student", "DATTT67", "--output-dir", self.work / "out", "--json", "--progress")
+        self.assertEqual(result.returncode, 0, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["student_id"], "DATTT67")
+        self.assertTrue(payload["markdown"])
+        result, batch = self.run_cli("--zip", archive, "--output-dir", self.work / "batch", "--json", "--progress")
+        self.assertEqual(result.returncode, 0, batch)
+        self.assertEqual(batch["students"], ["DATTT67"])
+        baseline = json.loads((self.work / "batch" / archive.stem / "baseline.json").read_text(encoding="utf-8"))
+        self.assertEqual(baseline["n_valid_sessions"], 1)
+
     def test_invalid_zip_returns_structured_failure_phase_and_type(self):
         archive = self.work / "invalid.zip"
         archive.write_bytes(b"synthetic invalid zip")

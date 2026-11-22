@@ -5,6 +5,7 @@
   "summaryRuleVersion": "phase-summary-3.1-2026-11-18",
   "analysisRuleVersion": "scheduled-signin-v1",
   "adjustments": [
+    "Remove upstream hardcoded research-account exclusions from production; all discovered accounts participate in single/batch reports and baselines. Research dataset preparation owns exclusions.",
     "Preserve production CLI archive validation, memory bound, private job paths, ENV precedence and progress protocol.",
     "Retain verified scheduled-signin-v1 selection; do not apply activity clusters, trailing-tail trimming or login fallback from upstream.",
     "Retain TLS verification and reject redirects. Runtime config never returns credential values.",
@@ -28,7 +29,7 @@
     {
       "file": "engine/constants.py",
       "sourceSha256": "d447d2e659e305d2d45c1d9dedbd553e3a9a1aca0d3a90cc024cdbbf59774024",
-      "packagedSha256": "d447d2e659e305d2d45c1d9dedbd553e3a9a1aca0d3a90cc024cdbbf59774024",
+      "packagedSha256": "cb508c4fdf4a484fef162541b00d66c8c723e8a530a821f0059a5f60dfd541f5",
       "identical": true
     },
     {
@@ -40,7 +41,7 @@
     {
       "file": "engine/ingestion.py",
       "sourceSha256": "8d8d081c7e0e4035e0f906291897787b9913ccd885659f21b343428de0e990e9",
-      "packagedSha256": "26e03a79d4778e9895774406da333c3bca4bec0c4bfda118beee3b927d6631c8",
+      "packagedSha256": "cd7ad844ca5e1ae44af0843e00cd5340c318024602ca38e46b4e15df77297cd0",
       "identical": false
     },
     {
