@@ -10,6 +10,7 @@
 !src/**
 !summary_tool/
 !summary_tool/generate_cli.py
+!summary_tool/forbidden.txt
 !summary_tool/engine/
 !summary_tool/engine/*.py
 **/.env

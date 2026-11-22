@@ -91,6 +91,7 @@ def main():
             payload = {
                 "ok": True,
                 "analysisRuleVersion": "scheduled-signin-v1",
+                "summaryRuleVersion": "phase-summary-3.1-2026-11-18",
                 "student_id": res["student_id"],
                 "session_code": res["session_code"],
                 "markdown": res["markdown"],
@@ -109,6 +110,8 @@ def main():
     else:
         try:
             results = pipeline.run_all()
+            if any(not result.get("ok") for result in results.values()):
+                raise RuntimeError("One or more student summaries failed.")
             manifest_path = os.path.join(pipeline.output_dir, "session_manifest_summary.md")
             manifest_content = ""
             if os.path.exists(manifest_path):
@@ -118,6 +121,7 @@ def main():
             payload = {
                 "ok": True,
                 "analysisRuleVersion": "scheduled-signin-v1",
+                "summaryRuleVersion": "phase-summary-3.1-2026-11-18",
                 "session_code": pipeline.session_code,
                 "student_count": len(results),
                 "output_dir": pipeline.output_dir,

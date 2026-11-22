@@ -49,3 +49,22 @@ class SessionWindowTest(unittest.TestCase):
             self.assertEqual(data.end_ts,T+180*60000)
             self.assertTrue(all(T<=e["timestamp"]<=T+180*60000 for e in data.events))
             self.assertEqual(file.read_bytes(),original)
+
+    def test_updated_clock_rules_preserve_raw_clock_and_verified_bounds(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as z:
+            z.writestr("session_manifest.json", json.dumps({"sessionCode": "TEST", "createdAt": T, "durationMinutes": 180, "students": [{"studentId": "SE1", "loginTimestamp": T}]}))
+            z.writestr("SE1/exam_records/R/events.jsonl", json.dumps({"timestamp": T+10000, "type": "terminal_command", "payload": {"command": "python main.py", "durationMs": 3000}}))
+            z.writestr("SE1/exam_records/R/ai_interactions.jsonl", json.dumps({"timestamp": T+20000, "type": "chat_request", "payload": {"requestId": f"chat-{T+15000}-x", "messages": [{"role": "user", "content": "Explain sorting"}]}}))
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp)/"TEST.zip"
+            file.write_bytes(buffer.getvalue())
+            data = ZipSessionIngester(str(file)).load_student("SE1")
+            self.assertEqual((data.start_ts, data.end_ts), (T, T+180*60000))
+            command = next(e for e in data.events if e.get("type") == "terminal_command")
+            request = next(e for e in data.ai_interactions if e.get("type") == "chat_request")
+            self.assertEqual(command["timestamp"], T+7000)
+            self.assertEqual(command["payload"]["_logged_ts"], T+10000)
+            self.assertEqual(request["timestamp"], T+15000)
+            self.assertEqual(request["payload"]["_logged_ts"], T+20000)
+            self.assertEqual(file.read_bytes(), buffer.getvalue())

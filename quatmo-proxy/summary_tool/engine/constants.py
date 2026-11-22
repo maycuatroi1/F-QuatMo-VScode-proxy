@@ -1,25 +1,59 @@
 # -*- coding: utf-8 -*-
 """
 Constants and default parameters for the PhaseSUMMARY Engine.
-Grounded in 'Method summary (bản rút gọn).docx' and developer spec files 00-08.
+Grounded in 'Phương pháp tóm tắt tiến trình làm bài (bản rút gọn, nhiều khía cạnh).md'
+and developer specification files 00-08 (Version 3.0, 30/10/2026).
 """
+import os
+from typing import List
+
 from .config import config
 
-# Default parameters (from tệp 08 Tham số & PP Phụ lục B)
+# Tài khoản giảng viên thử tool, không phải sinh viên: không tóm tắt, không tính vào baseline của lớp.
+EXCLUDED_ACCOUNTS = {"DATTT67"}
+TASK_DIRS = ("Q1", "Q2")  # fvscode.read.task_dirs: thư mục con của bài, mỗi thư mục là một project riêng
+
+
+def minute_label(t_ms) -> int:
+    """Phút thứ mấy của buổi: 0:00–0:59 là phút 1, 5:18 là phút 6 (Bảng 7)."""
+    return int(t_ms // 60000) + 1
+
+
+def minute_start_ms(minute: int) -> int:
+    """Mốc mili giây đầu của phút thứ `minute` (phút 1 bắt đầu ở 0)."""
+    return max(int(minute) - 1, 0) * 60000
+
+
+# Default parameters (from tệp 08 Bảng tham số, Version 3.0 & PP Phụ lục B)
 DEFAULT_PARAMS = {
     # TH1: Pauses and session estimation
-    "pause.tiers_ms": [2000, 15000, 180000, 600000],  # vi mô, ngắn, vừa, dài
+    "pause.tiers_ms": [2000, 15000, 180000, 600000],  # vi mô, ngắn, vừa, dài (Shrestha et al.)
     "pause.session_break_ms": 300000,                  # 5 phút (Hart et al., Tabarsi et al.)
     "pause.step_ms": 120000,                           # 2 phút (Lohr et al.)
     "pause.segment_ms": 180000,                        # 3 phút (U13)
-    "pause.include_views": False,
+    "pause.include_page_loads": True,                  # U11: lần tải trang mà log thấy là hoạt động
+    "dq.unlogged_warn_share": 0.10,                   # DQ1: trên tỷ lệ này là cảnh báo
+    "dq.unlogged_fail_share": 0.30,                   # DQ1: trên tỷ lệ này là không đạt
+    "dq.unlogged_mention_lines": 10,                  # A5: nêu ở ý chính khi log IDE thiếu từ chừng này dòng (bảng luôn ghi)
+
+    # F-VSCode Terminal & Run parameters (Spec 03)
+    "fvscode.run.server_scripts": ["app.py"],
+    "fvscode.run.server_min_ms": 60000,
+    "fvscode.term.page_noise": ["/favicon.ico", "/.well-known/", "__debugger__="],
+    "fvscode.term.snapshot_slack_ms": 1000,
+    "fvscode.term.max_lag_ms": 3600000,
+
+    # M0: Linking & Run output
+    "link.time_tolerance_ms": 2000,                    # 2s dung sai nối theo thời gian (U24)
+    "run.output_tail_chars": 4000,                     # 4000 ký tự cuối stdout/stderr
 
     # M2: AI segment closing
     "ai.segment_idle_close_ms": 300000,                # 5 phút (Birillo et al.)
-    "ai.debug_persistence": 3,                         # >= 3 yêu cầu nhóm D liên tiếp (Ma et al.)
-    "ai.fix_loop_min": 2,                              # >= 2 vòng (U14)
+    "ai.chain_min_cycles": 2,                          # >= 2 vòng (U14)
+    "chains.request_error_min": 3,                     # >= 3 yêu cầu liên tiếp có flag_error (Ma et al., U31)
 
     # TH2 & TH3: Errors and terminal runs
+    "errors.signature_mode": "default",                # default | keep_quoted | type_only (U3)
     "errors.repeat_runs": 3,                           # >= 3 lần chạy lặp cùng lỗi (Arakawa et al., U4)
     "runs.no_edit_repeat": 2,                          # > 2 lần chạy lại không sửa (Tabarsi et al.)
     "runs.minor_change_lines": 2,                      # 1-2 dòng (U5)
@@ -31,12 +65,12 @@ DEFAULT_PARAMS = {
     "match.partial_containment": 0.50,                 # 0.50 <= c < 0.90 (U2)
     "match.max_pair_product": 400000000,               # 4e8 limit for quadratic matching
 
-    # TH5 & TH11: Provenance & AI Code Spans
+    # TH5 & TH11: Provenance & Code Spans
     "provenance.min_span_chars": 40,                   # >= 40 ký tự theo dõi (Davalos & Zhang)
     "provenance.repaste_window_ms": 300000,            # 5 phút dán lại (U29)
-    "undo.max_lookback": 50,                           # 50 records lookback for undo/redo
-    "undo.restore_min_share": 0.90,                    # 90% overlap to restore provenance (U28)
-    "undo.cancel_window_ms": 30000,                    # 30s cancellation window (U28)
+    "undo.max_lookback": 50,                           # 50 bản ghi lookback cho undo/redo
+    "undo.restore_min_share": 0.90,                    # 90% overlap khôi phục nguồn gốc (U28)
+    "undo.cancel_window_ms": 30000,                    # 30s cửa sổ cặp bị hủy (U28)
 
     # TH11 & M4: Retained AI Code
     "aicode.retained_min_chars": 40,                   # còn >= 40 ký tự ở cuối buổi (U25)
@@ -46,107 +80,79 @@ DEFAULT_PARAMS = {
     # TH10: Bursts
     "burst.own_percentile": 95,                        # P95 (Davalos & Zhang)
     "burst.abs_min_chars": 100,                        # 100 ký tự (U10)
-    "burst.baseline_min_events": 20,
+    "burst.typed_gap_ms": 2000,                        # 2000 ms gom đợt tự gõ (Davalos & Zhang)
+    "burst.baseline_min_events": 20,                   # >= 20 lần gõ mới tính P95 (U10)
 
-    # TH7: Prompt taxonomy flags
+    # TH7 & TH8: Prompt taxonomy flags
     "prompt.task_containment": 0.80,                   # c >= 0.80 (U7)
+    "prompt.task_paragraph_min_chars": 50,             # 50 ký tự (U7)
     "prompt.own_code_lines": 3,                        # >= 3 dòng code hiện tại (U7)
-    "prompt.context_typed_chars": 20,                  # base dung sai 20 ký tự (U6)
+    "prompt.context_typed_chars": 20,                  # dung sai 20 ký tự (U6)
 
-    # M3: Ask candidates (DH1 - DH6)
-    "asks.max_items": 3,                               # tối đa 3 điều đáng hỏi + DH0 (U15)
-    "asks.dh1_min_lines": 5,                           # >= 5 dòng (U14)
-    "asks.priority_order": ["DH1", "DH3", "DH2", "DH4", "DH5"],  # Mục 7.3 quy tắc chung (U15)
-    "asks.dh5_unrun_lines": 5,                         # >= 5 dòng sau lần chạy cuối (U14)
+    # M3: Class Baseline & Largest events LN1 - LN5 (Spec 04 & Spec 08, Version 3.0)
+    "baseline.min_class_sessions": 20,                 # >= 20 buổi mới nêu so sánh lớp (U17)
+    "baseline.tail_pct": 10,                           # nhóm 10% hai đầu (U17)
+    "largest.ln1_min_lines": 5,                        # >= 5 dòng (U14)
+    "largest.ln3_min_ms": 600000,                      # 10 phút (U14)
+    "largest.keypoint_order": ["LN1", "LN2", "LN4", "LN3", "LN5"],  # U14, U19
 
-    # M4: Content selection (B1-B4, Đ1-Đ5)
-    "select.ai_insert_lines": 5,                       # Đ1: >= 5 dòng
-    "select.debug_failed_runs": 2,                     # Đ2: >= 2 lần chạy lỗi
-    "select.long_pause_ms": 600000,                    # Đ5: >= 10 phút
-    "select.max_timeline_items": 10,                   # tối đa 10 mục dòng thời gian (ngân sách Mục 8.2, U18)
+    # M4: Content selection
+    "select.ai_insert_lines": 5,                       # Đ1: >= 5 dòng (U18)
+    "select.chain_failed_runs": 2,                     # Đ2: >= 2 lần chạy lỗi (U18)
+    "select.long_pause_ms": 600000,                    # Đ5: >= 10 phút (Shrestha et al.)
+    "select.max_timeline_items": 12,                   # tối đa 12 mục dòng thời gian (U18)
 
-    # M5: LLM settings (Gemma-4-26B Realizer from quatmo-proxy ModelConfig)
+    # M5 & M6: LLM & Validation settings
     "llm.enabled": config.model.enabled,
     "llm.model": config.model.model_name,
-    "llm.aliases": config.model.aliases or "qwen3-coder",
     "llm.base_url": config.model.base_url,
     "llm.api_key": config.model.api_key,
     "llm.temperature": config.model.temperature,
+    "llm.max_retries": config.model.max_retries,        # thử lại khi lỗi mạng hay hết giờ chờ, không phải sinh lại
     "llm.timeout_s": config.model.timeout_s,
-    "llm.max_retries": config.model.max_retries,
-    "llm.prompt_version": "2.0_rut_gon",
-    "llm.input_variant": "sentences",                  # sentences | key_value
-
-    # Classifier (TH7)
-    "classifier.enabled": True,
-    "classifier.kappa_min": 0.70,
-    "classifier.calibration_frac": 0.10,
-    "classifier.calibration_min_n": 150,
-
-    # Baseline & Norms (M3)
-    "baseline.min_class_sessions": 20,                 # tối thiểu 20 buổi để so sánh lớp
-    "baseline.tail_pct": 10,                           # 10% đuôi trên/dưới
-
-    # System & Execution Limits
-    "errors.signature_mode": "default",                # default | keep_quoted | type_only
-    "run.output_tail_chars": 1000,
-    "link.time_tolerance_ms": 5000,
-    "provenance.cancel_window_ms": 10000,              # 10s cancellation window for M0 (U28)
+    "llm.input_variant": "sentences",                  # sentences | key_value (PP 6.5)
+    "llm.prompt_version": "summary-3.1",               # 3.1: bảng lần thêm code, khoảng chờ ghi rõ, từ cấm từ forbidden.txt
+    "llm.max_regenerations": 2,                        # sinh lại tối đa 2 lần khi K1–K5 báo lỗi (PP 6.6)
+    "llm.max_tokens": 4096,                            # trần token đầu ra của một lần gọi
+    "check.moment_tolerance_ms": 60000,                # 60s dung sai ranh giới (U21)
+    "render.replay_url_template": "",
+    "render.insert_table_min": 3,                      # từ 3 lần thêm code trong một mục AI thì kể bằng bảng
 }
 
-# Forbidden words for K4 check (NT2, NT5, PP 10, Tệp 07 + Anti-AI-tell)
-FORBIDDEN_WORDS = [
-    # Mức hiểu
-    "không hiểu", "chưa hiểu", "hiểu rõ", "hiểu sai", "nắm vững", "mất gốc",
-    # Sự trung thực
-    "gian lận", "đạo văn", "chép bài", "quay cóp", "thiếu trung thực", "vi phạm",
-    "không tự làm", "đáng ngờ", "nghi ngờ", "đáng lo",
-    # Nỗ lực, năng lực
-    "lười", "chăm chỉ", "cố gắng", "giỏi", "kém", "yếu kém", "học yếu",
-    "thông minh", "non tay", "thành thạo",
-    # Cảm xúc
-    "bối rối", "bực", "căng thẳng", "lo lắng", "tự tin", "chán", "hoảng",
-    # Ý định
-    "cố tình", "cố ý", "muốn", "định làm", "dự định", "có ý định", "nhằm", "để đối phó",
-    # Phụ thuộc
-    "phụ thuộc vào ai", "lạm dụng", "dựa dẫm",
-    # Quy kết nguyên nhân
-    "vì sinh viên", "do sinh viên", "bởi vì em",
-    # Chuẩn đầu ra
-    "đạt lo", "đạt chuẩn", "đã đạt", "chưa đạt", "không đạt", "nắm được", "làm chủ",
-    # Văn phong AI sáo rỗng (Anti-AI-tell clichés)
-    "nhìn chung", "tóm lại", "đáng chú ý là", "có thể thấy rằng", "có thể thấy",
-    "bản tóm tắt này", "dưới đây là", "hy vọng", "chúc bạn", "tổng kết lại",
-    "thể hiện rõ", "chứng tỏ rằng", "đáng ghi nhận", "đáng khen ngợi", "nhanh chóng", "tích cực"
-]
+# Forbidden words for K4 check (NT2, NT5, PP 6.6, Spec 07 Mục 2 & 4): đọc từ forbidden.txt, dùng chung với B1
+FORBIDDEN_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "forbidden.txt")
 
-# K3 Event Type Mapping Rules (Tệp 07 Mục 2)
-# Mỗi quy tắc: (regex_pattern, [các loại sự kiện hợp lệ trong mục nguồn])
+
+def load_forbidden_words(path: str = FORBIDDEN_PATH) -> List[str]:
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+FORBIDDEN_WORDS = load_forbidden_words()
+
+# Event keyword mapping for K3 check (Spec 07 Mục 2 - K3, Version 3.0)
 K3_EVENT_RULES = [
-    (r"\b(chạy|chạy lại)\b", ["run"]),
-    (r"\b(lỗi\s+[A-Za-z_]\w*(?:Error|Exception)|\w+Error|\w+Exception)\b", ["error_run"]),
-    (r"\b(test|qua|trượt)\b", ["test"]),
-    (r"\b(hỏi AI|yêu cầu|gửi\b.*\bcho AI)\b", ["ai_request"]),
-    (r"\b(chèn|nhận code)\b", ["ai_insert", "insertion"]),
-    (r"\b(dán)\b", ["paste"]),
-    (r"\b(xóa)\b", ["delete"]),
-    (r"\b(ngừng|dừng)\b", ["pause"]),
-    (r"\b(trùng nguyên văn)\b", ["verbatim"]),
-    (r"\b(gần như trùng)\b", ["close"]),
-    (r"\b(trùng một phần)\b", ["partial"]),
+    {"phrases": ["chạy", "chạy lại"], "required_event": "run"},
+    {"phrases": ["có lỗi", "trang trả mã 500"], "required_event": "run_error"},
+    {"phrases": ["test", "qua", "trượt"], "required_event": "test"},
+    {"phrases": ["server đã lên", "lần tải trang"], "required_event": "server_started"},
+    {"phrases": ["không thấy lỗi", "không có thông báo lỗi"], "required_event": "no_error_seen"},
+    {"phrases": ["không cho thấy kết quả", "không rõ kết quả"], "required_event": "unknown_outcome"},
+    {"phrases": ["hỏi ai", "yêu cầu", "gửi … cho ai", "gửi yêu cầu cho ai"], "required_event": "ai_request"},
+    {"phrases": ["câu trả lời ai", "từ câu trả lời", "áp"], "required_event": "ai_insert"},
+    {"phrases": ["dán"], "required_event": "paste"},
+    {"phrases": ["không qua gõ phím", "không ghi nguồn", "không rõ nguồn"], "required_event": "unknown_source"},
+    {"phrases": ["xóa"], "required_event": "delete"},
+    {"phrases": ["không có thao tác"], "required_event": "pause"},
+    {"phrases": ["trùng nguyên văn"], "required_event": "match_verbatim"},
+    {"phrases": ["gần như trùng"], "required_event": "match_close"},
+    {"phrases": ["khớp một phần"], "required_event": "match_partial"},
 ]
 
-# Mapping category codes from Ma et al. (TH7)
-REQUEST_CATEGORY_NAMES = {
-    "CQ": "hỏi khái niệm",
-    "PU": "hiểu đề",
-    "ER": "xin ví dụ",
-    "IQ": "hỏi cách cài đặt",
-    "CG": "xin sinh code",
-    "EI": "giải thích lỗi",
-    "CC": "sửa code",
-    "CV": "kiểm tra code",
-    "CE": "giải thích code",
-    "CO": "tối ưu code",
-    "OT": "khác"
+# F-VSCode Conversation Labels (TH7, Spec 02 Mục 7)
+FVSCODE_LABELS = {
+    "I": "kiến tạo (Instruction/Implementation)",
+    "M": "hỗn hợp (Mixed)",
+    "E": "ủy thác (Exploration/Explanation)",
+    "unknown": "chưa phân loại"
 }

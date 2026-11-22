@@ -1,0 +1,125 @@
+# Từ cấm cho phép kiểm K4 (NT2, NT5, PP 6.6, Spec 07 Mục 2 & 4).
+# Mỗi dòng một cụm, dòng bắt đầu bằng # là chú thích. Dùng chung cho hệ thống (G2) và bản đối chứng B1 (G3).
+
+# Về mức hiểu
+không hiểu
+chưa hiểu
+hiểu rõ
+hiểu sai
+nắm vững
+mất gốc
+# Về sự trung thực
+gian lận
+đạo văn
+chép bài
+quay cóp
+thiếu trung thực
+vi phạm
+không tự làm
+đáng ngờ
+nghi ngờ
+đáng lo
+# Về nỗ lực, năng lực
+lười
+chăm chỉ
+cố gắng
+giỏi
+kém
+yếu kém
+học yếu
+thông minh
+non tay
+thành thạo
+# Về cảm xúc
+bối rối
+bực
+căng thẳng
+lo lắng
+tự tin
+chán
+hoảng
+# Về ý định
+cố tình
+cố ý
+muốn
+định làm
+dự định
+có ý định
+nhằm
+để đối phó
+nhờ ai
+nhờ sửa
+xin code
+chép
+copy
+vội
+kiểm tra lại
+đã kiểm
+chưa kiểm
+không kiểm
+đọc kỹ
+không đọc
+# Về trạng thái gán cho sinh viên
+kẹt
+bế tắc
+loay hoay
+sửa mò
+thử mò
+mò mẫm
+bỏ dở
+bỏ cuộc
+nghỉ
+suy nghĩ
+xao nhãng
+tự lực
+tự làm hết
+# Về kết quả chạy vượt điều log thấy
+chạy được
+chạy thành công
+chạy ổn
+chạy đúng
+sửa được
+gỡ được
+đã sửa xong
+hết lỗi
+# Nối nhân quả mà log không ghi
+nhờ vậy
+nhờ đó
+vì thế
+vì vậy
+do đó
+dẫn đến
+khiến cho
+# Về phụ thuộc
+phụ thuộc vào ai
+lạm dụng
+dựa dẫm
+# Quy kết nguyên nhân
+vì sinh viên
+do sinh viên
+bởi vì em
+# Về chuẩn đầu ra
+đạt lo
+đạt chuẩn
+đã đạt
+chưa đạt
+không đạt
+nắm được
+làm chủ
+# Văn phong AI sáo rỗng (Anti-AI-tell clichés)
+nhìn chung
+tóm lại
+đáng chú ý là
+có thể thấy rằng
+có thể thấy
+bản tóm tắt này
+dưới đây là
+hy vọng
+chúc bạn
+tổng kết lại
+thể hiện rõ
+chứng tỏ rằng
+đáng ghi nhận
+đáng khen ngợi
+nhanh chóng
+tích cực

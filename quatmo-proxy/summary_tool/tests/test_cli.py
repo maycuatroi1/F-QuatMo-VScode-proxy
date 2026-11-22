@@ -58,6 +58,12 @@ class PackagedSummaryTest(unittest.TestCase):
         self.assertEqual(single["student_id"], "SE1")
         self.assertEqual(single["analysisRuleVersion"], "scheduled-signin-v1")
         self.assertTrue(single["markdown"])
+        self.assertEqual(single["summaryRuleVersion"], "phase-summary-3.1-2026-11-18")
+        self.assertEqual(single["check_report"]["prompt_version"], "summary-3.1")
+        self.assertIn("**Đoạn code AI trong bản cuối.**", single["markdown"])
+        self.assertNotIn("**Điều đáng hỏi", single["markdown"])
+        headings = ["**Ý chính.**", "**Dòng thời gian.**", "**Số liệu tham chiếu.**", "**Đoạn code AI trong bản cuối.**"]
+        self.assertEqual(sorted(single["markdown"].index(h) for h in headings), [single["markdown"].index(h) for h in headings])
         self.assertFalse(single["check_report"]["llm_used"])
         single_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
         self.assertEqual(single_progress, [{"completed": 0, "total": 1}, {"completed": 1, "total": 1}])
@@ -70,7 +76,7 @@ class PackagedSummaryTest(unittest.TestCase):
         batch_progress = [json.loads(line.removeprefix("SUMMARY_PROGRESS ")) for line in result.stderr.splitlines() if line.startswith("SUMMARY_PROGRESS ")]
         self.assertEqual(batch_progress, [{"completed": value, "total": 2} for value in range(3)])
         for student in batch["students"]:
-            self.assertTrue((output_dir / archive.stem / "students" / f"{student}_summary.md").read_text(encoding="utf-8"))
+            self.assertTrue((output_dir / archive.stem / f"{student}_summary.md").read_text(encoding="utf-8"))
         self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), original_hash)
 
     def test_missing_archive_returns_error_without_output(self):
@@ -102,7 +108,7 @@ class PackagedSummaryTest(unittest.TestCase):
         self.addCleanup(lambda: sys.path.remove(str(ROOT)))
         with patch.dict(os.environ, self.env, clear=True):
             from engine.llm_client import GemmaSummarizer
-            client = GemmaSummarizer(model="gemma-4-26b", base_url="https://fixture.invalid/v1", api_key="synthetic-key", aliases="none")
+            client = GemmaSummarizer(model="gemma-4-26b", base_url="https://fixture.invalid/v1", api_key="synthetic-key")
         response = io.BytesIO(json.dumps({"choices": [{"message": {"content": '{"key_points":["synthetic"],"timeline":[]}'}}]}).encode())
         response.headers = {"Content-Type": "application/json"}
 

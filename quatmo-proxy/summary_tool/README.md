@@ -1,5 +1,14 @@
 # Summary runtime shipped with the proxy
 
+Current engine source: `PhaseSUMMARY_2026-11-18.zip`, active `summary_tool/engine`.
+Rule `phase-summary-3.1-2026-11-18` produces four report sections with no oral-exam
+suggestions. `PROVENANCE.json` binds source/package hashes and deployment adaptations.
+`forbidden.txt` is a required runtime asset copied into the image. Production keeps
+the verified `scheduled-signin-v1` population rather than upstream activity-cluster
+heuristics. See `../docs/summary-integration.md` for rollout, limitations and rollback.
+The original Nov17 description below is historical and its byte-identity statement
+no longer applies to the updated scientific engine.
+
 This directory makes the existing PhaseSUMMARY CLI available in the proxy's
 GitHub/Dokploy build context. The Dockerfile installs Python and system CA
 certificates, copies only the CLI/engine into `/opt/summary-tool`, and checks CLI

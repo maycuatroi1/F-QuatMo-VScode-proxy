@@ -1,682 +1,877 @@
 # -*- coding: utf-8 -*-
 """
 Interpretation module (M3) for PhaseSUMMARY Engine.
-Strictly implements Specification 04 (04 Diễn giải và điều đáng hỏi.md):
-- Segment-level and session-level factual metrics (Fact objects)
-- Trajectory pattern according to Ma et al.
-- Class baseline percentile ranking (higher_than_most / lower_than_most)
-- Rules DH1 - DH5 candidate evaluation, deduplication, and selection
-- Rule DH0 fixed pedagogical suggestion
+Implements Spec 04 (Diễn giải: sự việc, mốc so sánh và sự việc lớn nhất - Version 3.0, 30/10/2026):
+1. Per-segment facts and session-level facts (Section 1)
+2. Class baseline percentile comparisons (Section 2: top/bottom 10% when N >= 20)
+3. Five Largest Events LN1 - LN5 and not_chosen tracking (Section 3, QĐ25)
 """
 
-from typing import Dict, List, Any, Optional, Tuple, Set
-from .constants import DEFAULT_PARAMS, REQUEST_CATEGORY_NAMES
+import math
+from typing import Dict, List, Any, Optional, Tuple
+from .constants import DEFAULT_PARAMS, minute_label
 
 
-class Fact:
-    def __init__(self, key: str, value: Any, unit: Optional[str] = None,
-                 sources: Optional[List[str]] = None, segment_id: Optional[str] = None):
-        self.key = key
-        self.value = value
-        self.unit = unit
-        self.sources = sources or []
-        self.segment_id = segment_id
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "key": self.key,
-            "value": self.value,
-            "unit": self.unit,
-            "sources": self.sources,
-            "segment_id": self.segment_id
-        }
-
-
-class AskItem:
-    def __init__(self, ask_id: str, rule: str, title: str, fact_text: str, question: str,
-                 alternatives: List[str], priority: int, magnitude: float,
-                 segment_ids: Optional[List[str]] = None, sources: Optional[List[str]] = None):
-        self.id = ask_id
-        self.rule = rule  # 'DH1', 'DH2', 'DH3', 'DH4', 'DH5'
-        self.title = title
-        self.fact_text = fact_text
-        self.question = question
-        self.alternatives = alternatives
-        self.priority = priority
+class LargestEvent:
+    def __init__(
+        self,
+        event_id: str,
+        magnitude: float,
+        t_start: int,
+        t_end: int,
+        segment_ids: List[str],
+        sources: List[str],
+        facts: Dict[str, Any],
+    ):
+        self.id = event_id
         self.magnitude = magnitude
-        self.segment_ids = segment_ids or []
-        self.sources = sources or []
-
-    @property
-    def segment_id(self) -> str:
-        return self.segment_ids[0] if self.segment_ids else "D01"
-
-    def to_rendered(self, index: int) -> str:
-        # Spec 04 Section 3.8:
-        # {n}. **{title}.** Sự việc: {fact_text} [{segment_ids}]. Có thể hỏi: {question}. Cách hiểu khác: {alts}
-        seg_ref = f" [{', '.join(self.segment_ids)}]" if self.segment_ids else ""
-        alt_sentences = []
-        for a in self.alternatives:
-            s = a.strip()
-            if s:
-                # Capitalize first char
-                s = s[0].upper() + s[1:]
-                if not s.endswith("."):
-                    s += "."
-                alt_sentences.append(s)
-        alt_str = " ".join(alt_sentences)
-        return (f"{index}. **{self.title}.** Sự việc: {self.fact_text}{seg_ref}. "
-                f"Có thể hỏi: {self.question}. "
-                f"Cách hiểu khác: {alt_str}")
+        self.t_start = t_start
+        self.t_end = t_end
+        self.segment_ids = segment_ids
+        self.sources = sources
+        self.facts = facts
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "rule": self.rule,
-            "title": self.title,
-            "fact_text": self.fact_text,
-            "question": self.question,
-            "alternatives": self.alternatives,
-            "priority": self.priority,
             "magnitude": self.magnitude,
+            "t_start": self.t_start,
+            "t_end": self.t_end,
             "segment_ids": self.segment_ids,
-            "sources": self.sources
+            "sources": self.sources,
+            "facts": self.facts,
         }
 
 
 class InterpretationEngine:
-    def __init__(self, session_data, signals: Dict[str, Any], segments: List[Any],
-                 threads: Optional[List[Dict[str, Any]]] = None,
-                 baseline: Optional[Dict[str, Any]] = None,
-                 params: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        session_data,
+        signals: Dict[str, Any],
+        segments: List[Any],
+        params: Optional[Dict[str, Any]] = None,
+        baseline: Optional[Dict[str, Any]] = None,
+    ):
         self.data = session_data
         self.signals = signals
         self.segments = segments
-        self.threads = threads or []
-        self.baseline = baseline
         self.params = dict(DEFAULT_PARAMS)
         if params:
             self.params.update(params)
+        self.baseline = baseline or {}
+        self.not_chosen: List[Dict[str, Any]] = []
 
-    def to_min(self, t: Any) -> int:
-        if t is None:
-            return 0
-        try:
-            val = int(t)
-            if val > 100_000_000:
-                return max(int((val - getattr(self.data, "start_ts", 0)) / 60000), 0)
-            return max(int(val / 60000), 0)
-        except Exception:
-            return 0
-
-    def interpret(self) -> Tuple[Dict[str, Any], List[AskItem], str, Dict[str, Any]]:
+    def interpret(self) -> Tuple[Dict[str, Any], List[LargestEvent], List[Dict[str, Any]]]:
         """
-        Compiles session facts, attaches facts to segments, evaluates DH1-DH5, and computes baseline percentiles.
-        Returns (facts, asks, dh0, asks_report).
+        Compiles segment & session facts, compares with class baseline,
+        and selects the five largest events LN1 - LN5 (Spec 04).
         """
-        facts = self._compile_facts()
-        self._attach_segment_facts(facts)
-        asks, dh0, asks_report = self._evaluate_asks(facts)
-        return facts, asks, dh0, asks_report
+        self._populate_segment_facts()
+        facts = self._compile_session_facts()
+        largest_events, not_chosen = self._evaluate_largest(facts)
+        self.not_chosen = not_chosen
+        return facts, largest_events, not_chosen
 
-    def _compile_facts(self) -> Dict[str, Any]:
-        """Compiles facts at session level per Spec 04 Section 1.2."""
-        chunks = self.signals.get("ai_chunks", [])
-        retained_chunks = sorted([c for c in chunks if c.get("retained")], key=lambda c: c.get("lines_end", c.get("lines", 0)), reverse=True)
-        discarded_chunks = self.signals.get("ai_chunks_discarded", [])
-        runs = self.signals.get("runs", [])
+    def _find_segment_ids_for_span(self, t_start: int, t_end: int) -> List[str]:
+        seg_ids = []
+        for s in self.segments:
+            if max(s.t_start, t_start) <= min(s.t_end, t_end):
+                seg_ids.append(s.id)
+        if not seg_ids:
+            for s in self.segments:
+                if s.t_start <= t_start <= s.t_end:
+                    return [s.id]
+        return seg_ids if seg_ids else [self.segments[0].id if self.segments else "D01"]
+
+    def _find_segment_id_for_time(self, t: int) -> str:
+        for s in self.segments:
+            if s.t_start <= t <= s.t_end:
+                return s.id
+        return self.segments[0].id if self.segments else "D01"
+
+    # =========================================================================
+    # 1. Segment-level and Session-level Facts (Spec 04 Section 1)
+    # =========================================================================
+    def _populate_segment_facts(self):
+        """Populates segment facts strictly per Spec 04 Section 1.1."""
         requests = self.signals.get("requests", [])
-        sig_threads = self.signals.get("threads", [])
-        work_sessions = self.signals.get("work_sessions", [])
+        runs = self.signals.get("runs", [])
         pauses = self.signals.get("pauses", [])
-
-        # Count traces on retained chunks
-        trace_counts = {"D1": 0, "D3": 0, "D4": 0, "D5": 0}
-        no_trace_chunks = []
-        for c in retained_chunks:
-            has_trace = False
-            if c.get("D1"):
-                trace_counts["D1"] += 1
-                has_trace = True
-            d3 = c.get("D3")
-            if d3 and isinstance(d3, dict) and d3.get("until_end", 0) > 0:
-                trace_counts["D3"] += 1
-                has_trace = True
-            elif isinstance(d3, int) and d3 > 0:
-                trace_counts["D3"] += 1
-                has_trace = True
-            if c.get("D4"):
-                trace_counts["D4"] += 1
-                has_trace = True
-            if c.get("D5"):
-                trace_counts["D5"] += 1
-                has_trace = True
-
-            if not has_trace:
-                no_trace_chunks.append(c)
-
-        # Count requests by category group
-        group_counts = {"C": 0, "I": 0, "D": 0, "R": 0, "X": 0}
-        for q in requests:
-            g = q.get("group", "X")
-            if g in group_counts:
-                group_counts[g] += 1
-            else:
-                group_counts["X"] += 1
-
-        # Trajectory pattern (Ma et al., Spec 04 Section 1.3)
-        seq = [q.get("group") for q in requests if q.get("group") != "X"]
-        debug_persistence_len = self.params.get("ai.debug_persistence", 3)
-        if len(seq) == 0:
-            trajectory = "none"
-        elif len(seq) == 1:
-            trajectory = "one_shot"
-        elif any(seq[i:i + debug_persistence_len] == ["D"] * debug_persistence_len for i in range(len(seq) - debug_persistence_len + 1)):
-            trajectory = "debug_persistence"
-        elif seq and seq[0] == "C":
-            trajectory = "conceptual_framing"
-        elif set(seq).issubset({"I", "D"}):
-            trajectory = "performance_oriented"
-        else:
-            trajectory = "mode_shifting"
-
-        trajectory_display = {
-            "one_shot": "một lượt",
-            "debug_persistence": "gỡ lỗi kéo dài",
-            "conceptual_framing": "bắt đầu bằng hỏi khái niệm",
-            "performance_oriented": "chỉ hỏi cài đặt và gỡ lỗi",
-            "mode_shifting": "chuyển qua lại giữa các kiểu hỏi",
-            "none": "không dùng AI"
-        }.get(trajectory, trajectory)
-
-        # Last run
-        last_run = runs[-1] if runs else None
-        last_run_minute = self.to_min(last_run["t"]) if last_run else 0
-
-        # AI fates
-        intact_count = sum(1 for c in retained_chunks if c.get("fate") == "intact")
-        partial_count = sum(1 for c in retained_chunks if c.get("fate") == "partial")
-        discarded_count = len(discarded_chunks)
-
-        total_ai_lines = sum(c.get("lines_end", c.get("lines", 0)) for c in retained_chunks)
-        duration_min = max(int(self.signals.get("duration_ms", 0) / 60000), 1)
-        t_task_min = max(int(self.signals.get("T_task_ms", 0) / 60000), 1)
-
-        pauses_ge_3min = [p for p in pauses if p.get("length", 0) >= 180000]
-
-        # Repeated threads & unresolved
-        repeated_threads = [th for th in sig_threads if th.get("repeated")]
-        unresolved_threads = [th for th in repeated_threads if not th.get("resolved_at")]
-
-        # Class baseline comparison (Spec 04 Section 2)
-        comparisons: Dict[str, Optional[str]] = {}
-        if self.baseline and isinstance(self.baseline, dict):
-            min_class_sessions = self.params.get("baseline.min_class_sessions", 20)
-            tail_pct = self.params.get("baseline.tail_pct", 10)
-
-            metric_values = {
-                "n_runs_total": len(runs),
-                "n_requests_total": len(requests),
-                "T_task_min": t_task_min,
-                "n_pauses_ge_3min": len(pauses_ge_3min),
-                "n_threads_repeated": len(repeated_threads)
-            }
-
-            for m_key, v in metric_values.items():
-                class_vals = self.baseline.get(m_key, [])
-                n = len(class_vals)
-                if n >= min_class_sessions:
-                    count_less = sum(1 for cv in class_vals if cv < v)
-                    count_equal = sum(1 for cv in class_vals if cv == v)
-                    rank = 100.0 * (count_less + 0.5 * count_equal) / n
-                    if rank >= 100 - tail_pct:
-                        comparisons[m_key] = "higher_than_most"
-                    elif rank <= tail_pct:
-                        comparisons[m_key] = "lower_than_most"
-                    else:
-                        comparisons[m_key] = None
-                else:
-                    comparisons[m_key] = None
-
-        facts: Dict[str, Any] = {
-            "duration_min": duration_min,
-            "T_task_min": t_task_min,
-            "n_work_sessions": max(len(work_sessions), 1),
-            "total_runs": len(runs),
-            "runs_ok": sum(1 for r in runs if r.get("outcome") == "ok"),
-            "runs_error": sum(1 for r in runs if r.get("outcome") in ["error", "test_fail"]),
-            "last_run": last_run,
-            "last_run_minute": last_run_minute,
-            "requests_count": len(requests),
-            "group_counts": group_counts,
-            "trajectory": trajectory_display,
-            "retained_chunks": retained_chunks,
-            "total_ai_lines": total_ai_lines,
-            "no_trace_chunks": no_trace_chunks,
-            "trace_counts": trace_counts,
-            "ai_fates": {
-                "intact": intact_count,
-                "partial": partial_count,
-                "discarded": discarded_count
-            },
-            "intact_count": intact_count,
-            "partial_count": partial_count,
-            "discarded_chunks": discarded_chunks,
-            "repeated_threads": repeated_threads,
-            "unresolved_threads": unresolved_threads,
-            "bursts": self.signals.get("bursts", []),
-            "pauses_ge_3min": len(pauses_ge_3min),
-            "ai_char_share_final": self.signals.get("ai_char_share_final", 0.0),
-            "n_cancelled_pairs": getattr(self.data, "dq_report", {}).get("n_cancelled_pairs", 0),
-            "n_repaste_families": getattr(self.data, "dq_report", {}).get("n_repaste_families", 0),
-            "comparisons": comparisons
-        }
-        return facts
-
-    def _attach_segment_facts(self, session_facts: Dict[str, Any]):
-        """Attaches detailed facts to each Segment per Spec 04 Section 1.1."""
-        requests = self.signals.get("requests", [])
-        runs = self.signals.get("runs", [])
-        chunks = self.signals.get("ai_chunks", [])
+        chains = self.signals.get("chains", self.signals.get("threads", []))
+        insert_chains = self.signals.get("insert_error_ask_chains", [])
         bursts = self.signals.get("bursts", [])
-        pauses = self.signals.get("pauses", [])
+        # resync (A5) không phải thao tác của sinh viên: không vào sự việc của đoạn
+        edits = [e for e in getattr(self.data, "edits", []) if not e.get("cancelled") and e.get("origin") != "resync"]
+        chunks = self.signals.get("ai_chunks", [])
+
+        req_by_id = {q["request_id"]: q for q in requests}
+        chunk_by_id = {c["lineage"]: c for c in chunks}
 
         for seg in self.segments:
-            seg_facts: Dict[str, Any] = {
+            s_start, s_end = seg.t_start, seg.t_end
+            seg_runs = [r for r in runs if r.get("segment_id") == seg.id or (r.get("segment_id") is None and s_start <= r["t"] <= s_end)]
+            seg_edits = [e for e in edits if e.get("segment_id") == seg.id or (e.get("segment_id") is None and s_start <= e["t"] <= s_end)]
+            seg_reqs = [q for q in requests if q.get("segment_id") == seg.id or (q.get("segment_id") is None and s_start <= q["t"] <= s_end)]
+
+            seg.facts = {
                 "minute_start": seg.minute_start,
                 "minute_end": seg.minute_end,
-                "duration_s": max(int((seg.t_end - seg.t_start) / 1000), 1)
+                "duration_s": max(0, int((s_end - s_start) // 1000)),
             }
 
             if seg.type == "ai":
-                s_reqs = [q for q in requests if seg.t_start <= q.get("t", 0) <= seg.t_end]
-                s_chunks = [c for c in chunks if seg.t_start <= c.get("t_insert", 0) <= seg.t_end]
-                s_runs = [r for r in runs if seg.t_start <= r.get("t", 0) <= seg.t_end]
+                flag_err = [bool(q.get("flag_error")) for q in seg_reqs]
+                flag_tsk = [bool(q.get("flag_task")) for q in seg_reqs]
+                flag_own = [bool(q.get("flag_own_code")) for q in seg_reqs]
+                prompt_sigs = [q.get("prompt_error_signature") for q in seg_reqs if q.get("prompt_error_signature")]
+                matches_run = [q.get("matches_run") for q in seg_reqs if q.get("matches_run")]
+                contexts = [q.get("context", "after_own_code") for q in seg_reqs]
+                after_err = any(q.get("after_error") for q in seg_reqs)
+                resp_has_code = [bool(q.get("response_has_code")) for q in seg_reqs]
+                resp_lines = [q.get("response_code_lines", 0) for q in seg_reqs]
+                resp_rejected = [bool(q.get("response_rejected")) for q in seg_reqs]
 
-                seg_facts["n_requests"] = len(s_reqs)
-                seg_facts["request_codes"] = [q.get("code") for q in s_reqs if q.get("code")]
-                seg_facts["request_groups"] = [q.get("group") for q in s_reqs if q.get("group")]
-                seg_facts["flag_error"] = [bool(q.get("flag_error")) for q in s_reqs]
-                seg_facts["flag_task"] = [bool(q.get("flag_task")) for q in s_reqs]
-                seg_facts["flag_own_code"] = [bool(q.get("flag_own_code")) for q in s_reqs]
-                seg_facts["context"] = s_reqs[0].get("context") if s_reqs else None
-                seg_facts["after_error"] = s_reqs[0].get("after_error", False) if s_reqs else False
+                insertions = []
+                for e in seg_edits:
+                    # Đợt do chương trình (A4) là một lần thêm: chỉ kể ở chunk đầu đợt, số dòng lấy theo cả đợt.
+                    # Chunk khác của đợt và chunk chỉ xoá kế thừa nhãn khớp của chunk đầu, không phải lần thêm riêng.
+                    if e.get("burst_head") not in (None, e["id"]) or e.get("whitespace_only"):
+                        continue
+                    ins_txt = e.get("burst_text") or e.get("inserted") or ""
+                    if not ins_txt.strip():
+                        continue
+                    src = e.get("src", "typed")
+                    m_info = e.get("match") or {}
+                    m_level = m_info.get("level", "none")
+                    if src in ("ai_insert", "ai_agent", "paste_chat") or m_level in ("verbatim", "close", "partial"):
+                        lines = e.get("burst_lines") or len(ins_txt.splitlines()) or 1
+                        req_id = m_info.get("request_id") or e.get("ai_request_id")
+                        rq = req_by_id.get(req_id) if req_id else (seg_reqs[-1] if seg_reqs else None)
+                        wait_s = None
+                        if rq and rq.get("t_end") is not None and e["t"] >= rq["t_end"]:
+                            wait_s = max(0, int((e["t"] - rq["t_end"]) // 1000))
+                        c_obj = chunk_by_id.get(e["id"])
+                        insertions.append({
+                            "edit_id": e["id"],
+                            "t": e["t"],
+                            "file": e.get("file"),
+                            "minute": minute_label(e["t"]),
+                            "lines": lines,
+                            "chars": e.get("burst_chars") or len(e.get("inserted", "")),
+                            "src": src,
+                            "group": e.get("group", "ai"),
+                            "match_level": m_level if m_level != "none" else ("verbatim" if src in ("ai_insert", "ai_agent") else "none"),
+                            "match_score": m_info.get("score"),
+                            "response_minute": minute_label(rq.get("t_end", rq["t"])) if rq else minute_label(e["t"]),
+                            "wait_s": wait_s,
+                            "before_response_end": bool(rq and rq.get("t_end") is not None and e["t"] < rq["t_end"]),
+                            "modified_before_run": bool(c_obj.get("D1")) if c_obj else False,
+                        })
 
-                seg_facts["response_has_code"] = any(q.get("response", {}).get("has_code") for q in s_reqs) if s_reqs else False
-                seg_facts["response_code_lines"] = sum(q.get("response", {}).get("code_lines", 0) for q in s_reqs) if s_reqs else 0
+                wait_before_insert_s = insertions[0]["wait_s"] if insertions else None
+                modified_before_run = any(ins.get("modified_before_run") for ins in insertions)
+                first_run = seg_runs[0] if seg_runs else None
+                time_to_run_s = None
+                if first_run and seg_reqs:
+                    r_end = seg_reqs[-1].get("t_end") or seg_reqs[-1]["t"]
+                    if first_run["t"] >= r_end:
+                        time_to_run_s = max(0, int((first_run["t"] - r_end) // 1000))
 
-                seg_facts["insertions"] = [
-                    {
-                        "t": c.get("t_insert", 0),
-                        "lines": c.get("lines_end", c.get("lines", 0)),
-                        "match_level": c.get("match_level", "verbatim"),
-                        "src": c.get("src", "ai_insert")
-                    }
-                    for c in s_chunks
-                ]
+                next_action = None
+                for r in seg_runs:
+                    if r.get("next_action"):
+                        next_action = r["next_action"]
+                        break
 
-                # Wait before insert
-                if s_reqs and s_chunks:
-                    r_end = s_reqs[0].get("response", {}).get("t_end", s_reqs[0].get("t", 0))
-                    seg_facts["wait_before_insert_s"] = max(int((s_chunks[0].get("t_insert", 0) - r_end) / 1000), 0)
-                else:
-                    seg_facts["wait_before_insert_s"] = None
+                in_insert_chain = any(c["start_t"] <= s_start <= c["end_t"] for c in insert_chains)
 
-                seg_facts["modified_before_run"] = s_chunks[0].get("D1", False) if s_chunks else False
-                seg_facts["run_outcome"] = s_runs[0].get("outcome") if s_runs else None
+                seg.facts.update({
+                    "n_requests": len(seg_reqs),
+                    "request_minutes": [minute_label(q["t"]) for q in seg_reqs],
+                    "flag_error": flag_err,
+                    "flag_task": flag_tsk,
+                    "flag_own_code": flag_own,
+                    "prompt_error_signature": prompt_sigs,
+                    "matches_run": matches_run,
+                    "context": contexts,
+                    "after_error": after_err,
+                    "response_has_code": resp_has_code,
+                    "response_code_lines": resp_lines,
+                    "response_rejected": resp_rejected,
+                    "insertions": insertions,
+                    "wait_before_insert_s": wait_before_insert_s,
+                    "modified_before_run": modified_before_run,
+                    "time_to_run_s": time_to_run_s,
+                    "run_outcome": first_run.get("outcome") if first_run else None,
+                    "next_action": next_action,
+                    "in_insert_error_ask_chain": in_insert_chain,
+                })
 
-            elif seg.type == "debug":
-                s_runs = [r for r in runs if seg.t_start <= r.get("t", 0) <= seg.t_end]
-                seg_facts["n_runs"] = len(s_runs)
-                if s_runs:
-                    seg_facts["signature"] = s_runs[0].get("signature") or s_runs[0].get("error_type", "lỗi")
-                    seg_facts["error_type"] = s_runs[0].get("error_type", "Error")
-                else:
-                    seg_facts["signature"] = "Error"
-                    seg_facts["error_type"] = "Error"
+            elif seg.type == "error_chain":
+                m_th = next((th for th in chains if th.get("id") == seg.raw_thread_id or th.get("m_id") == seg.thread_id), None)
+                script = m_th.get("script", "main.py") if m_th else "main.py"
+                sig = m_th.get("signature", "") if m_th else (seg_runs[0].get("signature", "") if seg_runs else "")
+                err_type = m_th.get("error_type", "") if m_th else (seg_runs[0].get("error_type", "") if seg_runs else "")
+                loc = m_th.get("location") if m_th else (seg_runs[0].get("location") if seg_runs else None)
+                loc_line = loc.get("line") if loc else None
+                unknown_between = m_th.get("unknown_between", 0) if m_th else 0
+                b_labels = m_th.get("between_labels", []) if m_th else []
+                del_err_line = m_th.get("deleted_error_line", False) if m_th else False
+                n_reqs_in_th = len(m_th.get("requests_in_span", [])) if m_th else 0
+                ended_min = minute_label(m_th["ended_at_t"]) if m_th and m_th.get("ended_at_t") is not None else None
+                ended_by = m_th.get("ended_by_outcome") if m_th else None
+
+                seg.facts.update({
+                    "script": script,
+                    "signature": sig,
+                    "error_type": err_type,
+                    "location_line": loc_line,
+                    "n_runs": len(seg_runs),
+                    # Mạch lỗi bị đoạn hỏi AI cắt thành nhiều đoạn: câu kể dùng số lần chạy và khoảng phút của cả mạch
+                    "n_runs_thread": len(m_th.get("runs", [])) if m_th else len(seg_runs),
+                    "thread_minute_start": minute_label(m_th["runs"][0]["t"]) if m_th and m_th.get("runs") else seg.minute_start,
+                    "thread_minute_end": minute_label(m_th["runs"][-1]["t"]) if m_th and m_th.get("runs") else seg.minute_end,
+                    "unknown_between": unknown_between,
+                    "between_labels": b_labels,
+                    "deleted_error_line": del_err_line,
+                    "n_requests_in_thread": n_reqs_in_th,
+                    "ended_minute": ended_min,
+                    "ended_by_outcome": ended_by,
+                })
 
             elif seg.type == "write":
-                s_runs = [r for r in runs if seg.t_start <= r.get("t", 0) <= seg.t_end]
-                s_bursts = [b for b in bursts if seg.t_start <= b.get("t", 0) <= seg.t_end]
-                seg_facts["n_runs"] = len(s_runs)
-                seg_facts["run_outcomes"] = [r.get("outcome") for r in s_runs]
-                seg_facts["bursts"] = s_bursts
-                seg_facts["net_lines"] = max(int(len(seg.events) / 8), 5)
+                typed_chars = sum(len(e.get("inserted", "")) for e in seg_edits if e.get("origin") == "typed")
+                pasted_chars = sum(len(e.get("inserted", "")) for e in seg_edits if e.get("src", "").startswith("paste_") or e.get("origin") == "paste")
+                ai_chars = sum(len(e.get("inserted", "")) for e in seg_edits if e.get("group") == "ai")
+                unknown_chars = sum(len(e.get("inserted", "")) for e in seg_edits if e.get("group") == "unknown")
+                del_chars = sum(e.get("deleted_len", 0) for e in seg_edits)
+
+                # Pasted lines: line count of the inserted text (including blank lines, trimmed of trailing newline)
+                pasted_lines = 0
+                for e in seg_edits:
+                    if e.get("src", "").startswith("paste_") or e.get("origin") == "paste":
+                        ins_txt = e.get("inserted", "")
+                        if ins_txt:
+                            pasted_lines += len(ins_txt.splitlines())
+
+                # Typed lines: number of distinct lines, in the code state at the END of the segment,
+                # that contain at least one character whose provenance origin is typed AND whose edit happened inside the segment
+                typed_lines = 0
+                state_end = self.data.state_at(s_end)
+                spans_end = self.data.spans_at(s_end)
+                for f_rel, content in state_end.items():
+                    sps = spans_end.get(f_rel, [])
+                    if not content or not sps:
+                        continue
+                    char_info = []
+                    for sp in sps:
+                        char_info.extend([(sp.origin, sp.t_insert)] * sp.length)
+                    cur_off = 0
+                    for line_str in content.splitlines(keepends=True):
+                        l_len = len(line_str)
+                        line_chars = char_info[cur_off : cur_off + l_len]
+                        cur_off += l_len
+                        if any(orig == "typed" and s_start <= t_ins <= s_end for orig, t_ins in line_chars):
+                            typed_lines += 1
+
+                net_lines = typed_lines
+                run_outcomes: Dict[str, int] = {}
+                for r in seg_runs:
+                    oc = r.get("outcome", "unknown")
+                    run_outcomes[oc] = run_outcomes.get(oc, 0) + 1
+
+                seg_bursts = [b for b in bursts if s_start <= b["t"] <= s_end]
+                reruns = [rn for rn in self.signals.get("rerun_no_change", []) if s_start <= rn["start_t"] <= s_end]
+
+                seg.facts.update({
+                    "typed_chars": typed_chars,
+                    "pasted_chars": pasted_chars,
+                    "ai_chars": ai_chars,
+                    "unknown_chars": unknown_chars,
+                    "del_chars": del_chars,
+                    "typed_lines": typed_lines,
+                    "pasted_lines": pasted_lines,
+                    "net_lines": net_lines,
+                    "n_runs": len(seg_runs),
+                    "run_outcomes": run_outcomes,
+                    "n_capture_runs": sum(1 for r in seg_runs if r.get("t_source") == "capture"),
+                    "capture_upper_minute": max([minute_label(r["t"]) for r in seg_runs if r.get("t_source") == "capture"], default=None),
+                    "bursts": seg_bursts,
+                    "rerun_no_change": reruns[0] if reruns else None,
+                })
 
             elif seg.type == "pause":
-                matching_pauses = [p for p in pauses if p.get("start") <= seg.t_start and p.get("end") >= seg.t_end]
-                if matching_pauses:
-                    p = matching_pauses[0]
-                    seg_facts["tier"] = p.get("tier", "vua")
-                    seg_facts["opener"] = p.get("opener", "typing")
-                    seg_facts["deleted_lines"] = p.get("deleted_lines", 0)
-                    seg_facts["follower"] = p.get("follower", "typing")
+                matched_p = next((p for p in pauses if abs(p["start"] - s_start) <= 2000), None)
+                tier = matched_p.get("tier", "vua") if matched_p else "vua"
+                opener = matched_p.get("opener", "none") if matched_p else "none"
+                del_lines = matched_p.get("deleted_lines", 0) if matched_p else 0
+                follower = matched_p.get("follower", "none") if matched_p else "none"
 
-            seg.facts = seg_facts
+                seg.facts.update({
+                    "tier": tier,
+                    "opener": opener,
+                    "deleted_lines": del_lines,
+                    "follower": follower,
+                })
 
-    def _evaluate_asks(self, facts: Dict[str, Any]) -> Tuple[List[AskItem], str, Dict[str, Any]]:
-        """
-        Evaluates Ask rules DH1 - DH5 strictly per Spec 04 Section 3.
-        Filters and selects candidates based on priority_order and max_items (3).
-        """
-        candidates: List[AskItem] = []
-        not_chosen: List[Dict[str, Any]] = []
+    def _last_page_minute(self, run: Dict[str, Any]) -> Optional[int]:
+        """Phút của lần tải trang cuối: mốc dòng truy cập, không có thì lần chụp terminal."""
+        ts = (run.get("observed") or {}).get("observed_until") or run.get("observed_at_ts")
+        return minute_label(max(int(ts) - self.data.start_ts, 0)) if ts and run.get("page_loads") else None
 
-        retained_chunks = facts.get("retained_chunks", [])
-        bursts = facts.get("bursts", [])
-        requests = self.signals.get("requests", [])
-        sig_threads = self.signals.get("threads", [])
-        fix_loops = self.signals.get("fix_loops", [])
-        last_run = facts.get("last_run")
+    def _compile_session_facts(self) -> Dict[str, Any]:
+        """Compiles session-level facts strictly per Spec 04 Section 1.2."""
+        sigs = self.signals
+        runs = sigs.get("runs", [])
+        pauses = sigs.get("pauses", [])
+        requests = sigs.get("requests", [])
+        chains = sigs.get("chains", sigs.get("threads", []))
+        chunks = sigs.get("ai_chunks", [])
+        chunks_disc = sigs.get("ai_chunks_discarded", [])
+        all_edits = getattr(self.data, "edits", [])
+        edits = [e for e in all_edits if e.get("origin") != "resync"]
+        resync_edits = [e for e in all_edits if e.get("origin") == "resync"]
+        tot_dur_ms = sigs.get("duration_ms", 0)
+        t_task_ms = sigs.get("T_task_ms", 0)
 
-        dh1_min_lines = self.params.get("asks.dh1_min_lines", 5)
+        duration_min = max(int(round(tot_dur_ms / 60000.0)), 1)
+        t_task_min = max(int(round(t_task_ms / 60000.0)), 1)
+        work_sessions = sigs.get("work_sessions", [])
 
-        # 3.1 DH1: Retained AI code without verification traces besides run
-        for c in retained_chunks:
-            lines = c.get("lines_end", c.get("lines", 0))
-            d1 = c.get("D1", False)
-            d4 = bool(c.get("D4"))
-            d5 = bool(c.get("D5"))
-            d3 = c.get("D3")
-            d3_active = False
-            if d3 and isinstance(d3, dict) and d3.get("until_end", 0) > 0:
-                d3_active = True
-            elif isinstance(d3, int) and d3 > 0:
-                d3_active = True
-
-            if lines >= dh1_min_lines and not d1 and not d4 and not d5 and not d3_active:
-                m_ins = self.to_min(c.get("t_insert", 0))
-                m_resp = m_ins  # response time
-                seg = self._find_segment_for_time(c.get("t_insert", 0))
-                seg_id = seg.id if seg else "D01"
-
-                # Check if funcs has exactly one function
-                funcs = c.get("funcs", [])
-                func_name = funcs[0] if (funcs and len(funcs) == 1) else None
-                func_str = f" (hàm `{func_name}`)" if func_name else ""
-                target_name = f"hàm `{func_name}`" if func_name else "đoạn code này"
-
-                match_level = c.get("match_level", "verbatim")
-                src = c.get("src", "ai_insert")
-
-                # Match wording
-                if match_level == "verbatim":
-                    match_wording = f"trùng nguyên văn câu trả lời AI ở phút {m_resp}"
-                elif match_level == "close":
-                    match_wording = f"gần như trùng câu trả lời AI ở phút {m_resp}"
-                else:
-                    match_wording = f"chèn từ câu trả lời AI ở phút {m_resp}"
-
-                # Run after insert check
-                d2 = c.get("D2")
-                if d2:
-                    run_wording = "không sửa trước khi chạy"
-                else:
-                    run_wording = "không có lần chạy nào sau khi chèn"
-
-                fact_str = (f"đoạn {lines} dòng{func_str} chèn ở phút {m_ins}, {match_wording}, "
-                            f"{run_wording}, không có lần sửa hay câu hỏi AI nào về nó về sau, còn nguyên ở cuối buổi")
-                question_str = f"nhờ em lần theo một đầu vào cụ thể qua {target_name}, và em sẽ sửa gì nếu yêu cầu đổi một chút"
-                alts = [
-                    "em có thể đã đọc kỹ câu trả lời trước khi chèn",
-                    "em có thể đã biết mình định viết gì và dùng AI để viết nhanh hơn",
-                    "đoạn code có thể đúng ngay nên không cần sửa"
-                ]
-
-                candidates.append(AskItem(
-                    ask_id="H1", rule="DH1",
-                    title="Đoạn code AI được giữ lại mà ngoài việc chạy không có dấu vết kiểm",
-                    fact_text=fact_str, question=question_str, alternatives=alts,
-                    priority=1, magnitude=float(lines), segment_ids=[seg_id],
-                    sources=[c.get("lineage", f"c_{m_ins}")]
-                ))
-
-        # DH1 for external paste bursts
-        for b in bursts:
-            if b.get("src") in ["paste_external", "paste_unknown"] and b.get("match_level") not in ["verbatim", "close"]:
-                b_lines = b.get("lines", 0)
-                if b_lines >= dh1_min_lines and not b.get("modified_before_first_run", False):
-                    m_b = self.to_min(b.get("t", 0))
-                    seg = self._find_segment_for_time(b.get("t", 0))
-                    seg_id = seg.id if seg else "D01"
-                    fact_str = f"đoạn {b_lines} dòng dán vào ở phút {m_b}, không sửa trước khi chạy, còn nguyên ở cuối buổi"
-                    question_str = "nhờ em lần theo một đầu vào cụ thể qua đoạn code này, và em sẽ sửa gì nếu yêu cầu đổi một chút"
-                    alts = [
-                        "đoạn code có thể là code em tự viết từ trước",
-                        "đoạn code có thể đúng ngay nên không cần sửa"
-                    ]
-                    candidates.append(AskItem(
-                        ask_id="H1", rule="DH1",
-                        title="Đoạn code dán từ ngoài được giữ nguyên",
-                        fact_text=fact_str, question=question_str, alternatives=alts,
-                        priority=1, magnitude=float(b_lines), segment_ids=[seg_id],
-                        sources=[b.get("event_id", f"b_{m_b}")]
-                    ))
-
-        # 3.2 DH2: Stuck on repeated error in AI code or AI related
-        ai_insert_ts = [c.get("t_insert", 0) for c in retained_chunks]
-        ai_req_ts = [q.get("t", 0) for q in requests]
-
-        def is_ai_related(t_start: int, t_end: int) -> bool:
-            return any(t_start <= t <= t_end for t in (ai_insert_ts + ai_req_ts))
-
-        for th in sig_threads:
-            if th.get("repeated"):
-                th_runs = th.get("runs", [])
-                if len(th_runs) >= 2:
-                    t_first = th_runs[0].get("t", 0)
-                    t_last = th_runs[-1].get("t", 0)
-                    if is_ai_related(t_first - 60000, t_last + 60000):
-                        m_a = self.to_min(t_first)
-                        m_b = max(self.to_min(t_last), m_a)
-                        time_span = f"phút {m_a}" if m_a == m_b else f"phút {m_a}–{m_b}"
-                        n_runs = len(th_runs)
-                        err_type = th.get("signature") or th_runs[0].get("error_type", "lỗi")
-
-                        resolved_at = th.get("resolved_at")
-                        if resolved_at:
-                            m_res = max(self.to_min(resolved_at), m_b)
-                            res_str = f", gỡ được ở phút {m_res}"
-                        else:
-                            res_str = ", chưa gỡ ở cuối buổi"
-
-                        has_ai_during = any(t_first <= qt <= t_last for qt in ai_req_ts)
-                        ai_str = ", có hỏi AI" if has_ai_during else ""
-
-                        fact_str = f"{time_span}, {n_runs} lần chạy liên tiếp cùng lỗi `{err_type}`{res_str}{ai_str}"
-
-                        if resolved_at:
-                            question_str = "lỗi đó nghĩa là gì, em đã thử những gì, và em gỡ được bằng cách nào"
-                        else:
-                            question_str = "lỗi đó nghĩa là gì, em đã thử những gì, và em nghĩ vì sao chưa gỡ được"
-
-                        alts = [
-                            "em có thể đang thử từng giả thuyết một",
-                            "em có thể chạy lại để xem chương trình chạy thế nào"
-                        ]
-                        if all(b == "major" for b in th.get("between_labels", [])):
-                            alts[1] = "mỗi lần chạy em sửa một chỗ khác nhau"
-
-                        seg = self._find_segment_for_time(t_first)
-                        seg_id = seg.id if seg else "D02"
-
-                        candidates.append(AskItem(
-                            ask_id="H2", rule="DH2",
-                            title="Kẹt ở một lỗi trong phần code AI",
-                            fact_text=fact_str, question=question_str, alternatives=alts,
-                            priority=2, magnitude=float(n_runs), segment_ids=[seg_id],
-                            sources=[r.get("id", f"r_{i}") for i, r in enumerate(th_runs)]
-                        ))
-
-        # 3.3 DH3: AI Fix Loops
-        for loop in fix_loops:
-            m_s = self.to_min(loop.get("start_t", 0))
-            m_e = max(self.to_min(loop.get("end_t", 0)), m_s)
-            time_span = f"phút {m_s}" if m_s == m_e else f"phút {m_s}–{m_e}"
-            cycles = loop.get("cycles", 2)
-            seg = self._find_segment_for_time(loop.get("start_t", 0))
-            seg_id = seg.id if seg else "D03"
-
-            fact_str = f"{time_span}, {cycles} yêu cầu gỡ lỗi liên tiếp, lỗi vẫn còn sau mỗi lần chạy"
-            question_str = "em đang định làm gì với đoạn code đó, và em hiểu nguyên nhân của lỗi là gì"
-            alts = [
-                "các câu trả lời có thể đang giúp em thu hẹp chỗ lỗi",
-                "quy trình chép, chạy, gặp lỗi rồi sửa có thể phù hợp với quy định của môn"
-            ]
-
-            candidates.append(AskItem(
-                ask_id="H3", rule="DH3",
-                title="Vòng nhờ AI sửa",
-                fact_text=fact_str, question=question_str, alternatives=alts,
-                priority=3, magnitude=float(cycles), segment_ids=[seg_id]
-            ))
-
-        # Consecutive D requests >= debug_persistence (3)
-        if self.params.get("classifier.enabled", True):
-            consec_d = 0
-            d_start_idx = 0
-            for idx, q in enumerate(requests):
-                if q.get("group") == "D":
-                    if consec_d == 0:
-                        d_start_idx = idx
-                    consec_d += 1
-                else:
-                    if consec_d >= self.params.get("ai.debug_persistence", 3):
-                        q_s = requests[d_start_idx]
-                        q_e = requests[idx - 1]
-                        m_s = self.to_min(q_s.get("t", 0))
-                        m_e = max(self.to_min(q_e.get("t", 0)), m_s)
-                        time_span = f"phút {m_s}" if m_s == m_e else f"phút {m_s}–{m_e}"
-                        seg = self._find_segment_for_time(q_s.get("t", 0))
-                        seg_id = seg.id if seg else "D03"
-
-                        candidates.append(AskItem(
-                            ask_id="H3", rule="DH3",
-                            title="Vòng nhờ AI sửa",
-                            fact_text=f"{time_span}, {consec_d} yêu cầu gỡ lỗi liên tiếp",
-                            question="em đang định làm gì với đoạn code đó, và em hiểu nguyên nhân của lỗi là gì",
-                            alternatives=[
-                                "các câu trả lời có thể đang giúp em thu hẹp chỗ lỗi",
-                                "quy trình chép, chạy, gặp lỗi rồi sửa có thể phù hợp với quy định của môn"
-                            ],
-                            priority=3, magnitude=float(consec_d), segment_ids=[seg_id]
-                        ))
-                    consec_d = 0
-
-        # 3.4 DH4: Starting exam with task prompt sent to AI
-        if requests:
-            q1 = requests[0]
-            if q1.get("context") == "start" and q1.get("flag_task"):
-                m1 = self.to_min(q1.get("t", 0))
-                # Check for matching burst or insert in same ai segment
-                matching_chunks = [c for c in retained_chunks if c.get("request_id") == q1.get("request_id") or c.get("t_insert", 0) <= q1.get("t", 0) + 300000]
-                if matching_chunks:
-                    c0 = matching_chunks[0]
-                    m2 = max(self.to_min(c0.get("t_insert", 0)), m1)
-                    c_lines = c0.get("lines_end", c0.get("lines", 0))
-                    seg = self._find_segment_for_time(q1.get("t", 0))
-                    seg_id = seg.id if seg else "D01"
-
-                    fact_str = (f"phút {m1}, yêu cầu đầu tiên gửi AI chứa đề bài, trước khi tự viết dòng code nào, "
-                                f"và câu trả lời được chèn thành đoạn {c_lines} dòng ở phút {m2}")
-                    question_str = "nếu không có AI, em sẽ bắt đầu bài này thế nào"
-                    alts = [
-                        "đây là cách bắt đầu phổ biến và có thể phù hợp với quy định của môn",
-                        "em có thể đã lên kế hoạch trước khi hỏi"
-                    ]
-                    candidates.append(AskItem(
-                        ask_id="H4", rule="DH4",
-                        title="Bắt đầu bài bằng đề bài gửi AI",
-                        fact_text=fact_str, question=question_str, alternatives=alts,
-                        priority=4, magnitude=float(c_lines), segment_ids=[seg_id]
-                    ))
-
-        # 3.5 DH5: AI code inserted/modified after last run
-        if last_run:
-            lr_t = last_run.get("t_end", last_run.get("t", 0))
-            unrun_lines = 0
-            unrun_m2 = 0
-            for c in retained_chunks:
-                t_ins = c.get("t_insert", 0)
-                if t_ins > lr_t:
-                    unrun_lines += c.get("lines_end", c.get("lines", 0))
-                    unrun_m2 = self.to_min(t_ins)
-
-            dh5_min = self.params.get("asks.dh5_unrun_lines", 5)
-            if unrun_lines >= dh5_min:
-                m_lr = self.to_min(last_run.get("t", 0))
-                seg = self._find_segment_for_time(last_run.get("t", 0))
-                seg_id = seg.id if seg else "D09"
-                fact_str = f"sau lần chạy cuối ở phút {m_lr}, có {unrun_lines} dòng code từ AI được chèn hoặc sửa mà không chạy lại, chèn ở phút {unrun_m2}"
-                question_str = "em đã kiểm đoạn này bằng cách nào"
-                alts = [
-                    "em có thể đã hết giờ",
-                    "em có thể đã đọc kỹ đoạn code trước khi chèn"
-                ]
-                candidates.append(AskItem(
-                    ask_id="H5", rule="DH5",
-                    title="Code AI chèn sau lần chạy cuối",
-                    fact_text=fact_str, question=question_str, alternatives=alts,
-                    priority=5, magnitude=float(unrun_lines), segment_ids=[seg_id]
-                ))
-
-        # 3.6 Selection and sorting per Spec 04 Section 3.6
-        priority_order = self.params.get("asks.priority_order", ["DH1", "DH3", "DH2", "DH4", "DH5"])
-
-        def get_rank(item: AskItem) -> int:
-            try:
-                return priority_order.index(item.rule)
-            except ValueError:
-                return 99
-
-        # Sort: rank ascending, magnitude descending
-        candidates.sort(key=lambda c: (get_rank(c), -c.magnitude))
-
-        max_items = self.params.get("asks.max_items", 3)
-        chosen: List[AskItem] = []
-        chosen_segment_ids: Set[str] = set()
-
-        for cand in candidates:
-            if len(chosen) >= max_items:
-                not_chosen.append({"ask": cand.to_dict(), "reason": "cap_reached"})
-                continue
-
-            # Check duplicate segment_ids with higher rank candidate
-            overlap = False
-            for s_id in cand.segment_ids:
-                if s_id in chosen_segment_ids:
-                    overlap = True
-                    break
-
-            if overlap:
-                not_chosen.append({"ask": cand.to_dict(), "reason": "duplicate_segment"})
-                continue
-
-            chosen.append(cand)
-            for s_id in cand.segment_ids:
-                chosen_segment_ids.add(s_id)
-
-        # Assign final IDs H1, H2, H3
-        for idx, item in enumerate(chosen, 1):
-            item.id = f"H{idx}"
-
-        # 3.7 DH0: Fixed pedagogical suggestion
-        dh0 = ("Gợi ý: hỏi em tự kể đã dùng AI vào những việc gì và đã kiểm phần code AI giữ lại bằng cách nào, "
-               "rồi cùng xem lại phần code AI và dòng thời gian.")
-        if not requests and not retained_chunks:
-            dh0 = ("Gợi ý: log của IDE không cho thấy việc dùng AI. "
-                   "Có thể hỏi em có dùng AI ở ngoài IDE không, và dùng vào việc gì.")
-
-        asks_report = {
-            "chosen": [a.to_dict() for a in chosen],
-            "not_chosen": not_chosen,
-            "dh0": dh0
+        # Runs by outcome
+        runs_by_outcome = sigs.get("runs_by_outcome") or {
+            k: sum(1 for r in runs if r.get("outcome") == k)
+            for k in ("error", "test_fail", "server_started", "no_error_seen", "unknown")
         }
 
-        return chosen, dh0, asks_report
+        # Last run and last observed run
+        last_run = None
+        if runs:
+            lr = runs[-1]
+            last_run = {
+                "minute": minute_label(lr["t"]),
+                "script": lr.get("script", "main.py"),
+                "outcome": lr["outcome"],
+                "error_type": lr.get("error_type"),
+                "last_page_code": lr.get("last_page_code"),
+                "page_loads": lr.get("page_loads"),
+                "last_page_minute": self._last_page_minute(lr),
+                "observed_until_minute": minute_label(lr["t_end"]),
+                "tests": lr.get("tests"),
+                "t_source": lr.get("t_source", "log"),
+                "capture_minute": minute_label(max(int(lr["observed_at_ts"]) - self.data.start_ts, 0)) if lr.get("observed_at_ts") else None,
+            }
 
-    def _find_segment_for_time(self, t: int):
-        for s in self.segments:
-            if s.t_start <= t <= s.t_end:
-                return s
-        return self.segments[0] if self.segments else None
+        observed_runs = [r for r in runs if r["outcome"] != "unknown"]
+        last_observed_run = None
+        if observed_runs:
+            lor = observed_runs[-1]
+            last_observed_run = {
+                "minute": minute_label(lor["t"]),
+                "script": lor.get("script", "main.py"),
+                "outcome": lor["outcome"],
+                "error_type": lor.get("error_type"),
+                "last_page_code": lor.get("last_page_code"),
+                "page_loads": lor.get("page_loads"),
+                "last_page_minute": self._last_page_minute(lor),
+                "observed_until_minute": minute_label(lor["t_end"]),
+                "tests": lor.get("tests"),
+            }
+
+        # Errors at last observed run for each script
+        errors_at_last_observed = []
+        scripts = sorted(list({r.get("script") for r in runs if r.get("script")}))
+        for sc in scripts:
+            sc_obs = [r for r in runs if r.get("script") == sc and r["outcome"] != "unknown"]
+            if sc_obs and sc_obs[-1]["outcome"] == "error":
+                err_t = sc_obs[-1].get("error_type") or "RuntimeError"
+                if err_t not in errors_at_last_observed:
+                    errors_at_last_observed.append(err_t)
+
+        test_runs = [r for r in runs if r.get("kind") == "test" and r.get("tests") is not None]
+        failing_tests_last = []
+        if test_runs:
+            failing_tests_last = test_runs[-1]["tests"].get("failed", [])
+
+        # Session typed lines: lines of final code containing typed chars
+        session_typed_lines = 0
+        for f_rel, content in getattr(self.data, "final_files", {}).items():
+            sps = getattr(self.data, "final_spans", {}).get(f_rel, [])
+            if not content or not sps:
+                continue
+            char_origins = []
+            for sp in sps:
+                char_origins.extend([sp.origin] * sp.length)
+            cur_off = 0
+            for line_str in content.splitlines(keepends=True):
+                l_len = len(line_str)
+                line_origs = char_origins[cur_off : cur_off + l_len]
+                cur_off += l_len
+                if any(orig == "typed" for orig in line_origs):
+                    session_typed_lines += 1
+
+        # Chars and lines by group (typed, paste_other, ai, unknown)
+        chars_by_group = {"typed": 0, "paste_other": 0, "ai": 0, "unknown": 0}
+        lines_by_group = {"typed": session_typed_lines, "paste_other": 0, "ai": 0, "unknown": 0}
+
+        by_id = {e["id"]: e for e in edits}
+        for e in edits:
+            if e.get("cancelled") or e.get("whitespace_only"):
+                continue
+            b_head = e.get("burst_head")
+            if b_head and by_id.get(b_head, {}).get("whitespace_only"):
+                continue
+            txt = e.get("inserted", "")
+            if not txt:
+                continue
+            c_len = len(txt)
+            l_cnt = len(txt.splitlines()) if txt else 0
+            if not l_cnt and txt:
+                l_cnt = 1
+            # Đợt do chương trình: số dòng tính một lần theo cả đợt ở chunk đầu, chunk khác chỉ cộng ký tự
+            if b_head:
+                l_cnt = (e.get("burst_lines") or l_cnt) if b_head == e["id"] else 0
+            src = e.get("src", "typed")
+            grp = e.get("group", "other")
+
+            if src == "typed":
+                chars_by_group["typed"] += c_len
+                # lines_by_group["typed"] is session_typed_lines (lines of final code containing typed chars)
+            elif grp == "ai":
+                chars_by_group["ai"] += c_len
+                lines_by_group["ai"] += l_cnt
+            elif grp == "unknown":
+                chars_by_group["unknown"] += c_len
+                lines_by_group["unknown"] += l_cnt
+            else:
+                chars_by_group["paste_other"] += c_len
+                lines_by_group["paste_other"] += l_cnt
+
+        # Code do resync đưa vào (log IDE không ghi thay đổi): nhóm riêng, không gộp vào không rõ nguồn
+        chars_by_group["unlogged"] = sum(e.get("new_chars", 0) for e in resync_edits)
+        lines_by_group["unlogged"] = sum(e.get("new_lines", 0) for e in resync_edits)
+        unlogged_minutes = sorted({minute_label(e["t"]) for e in resync_edits if e.get("new_lines", 0) > 0})
+
+        # Final chars by group (share of final files, excluding starter)
+        final_chars_by_grp = {"typed": 0, "paste_other": 0, "ai": 0, "unknown": 0}
+        for f_rel, spans in getattr(self.data, "final_spans", {}).items():
+            for sp in spans:
+                if sp.origin != "starter" and sp.lineage != "starter":
+                    grp = getattr(sp, "group", None)
+                    if grp is None:
+                        if sp.origin in ("ai_insert", "ai_agent", "ai_autocomplete", "paste_chat"):
+                            grp = "ai"
+                        elif sp.origin == "typed":
+                            grp = "typed"
+                        elif sp.origin in ("unknown_source", "resync", "unknown", "programmatic"):
+                            grp = "unknown"
+                        else:
+                            grp = "paste_other"
+                    if grp in final_chars_by_grp:
+                        final_chars_by_grp[grp] += sp.length
+
+        # AI flags
+        n_req_error = sum(1 for q in requests if q.get("flag_error"))
+        n_req_task = sum(1 for q in requests if q.get("flag_task"))
+        n_req_own = sum(1 for q in requests if q.get("flag_own_code"))
+        n_resp_no_code = sum(1 for q in requests if not q.get("response_has_code") and not q.get("response_rejected"))
+        n_requests_rejected = sum(1 for q in requests if q.get("response_rejected"))
+
+        # AI fates
+        ai_fates = {"intact": 0, "partial": 0, "discarded": 0}
+        for c in chunks:
+            ft = c.get("fate", "intact")
+            if ft in ai_fates:
+                ai_fates[ft] += 1
+
+        # Class comparisons (Spec 04 Section 2)
+        comparisons = self._compute_comparisons(len(runs), len(requests), t_task_min,
+                                                sum(1 for p in pauses if p.get("length", 0) >= 180000),
+                                                sum(1 for c in chains if c.get("repeated")))
+
+        session_facts = {
+            "duration_min": duration_min,
+            "T_task_min": t_task_min,
+            "n_work_sessions": len(work_sessions),
+            "n_pauses_ge_3min": sum(1 for p in pauses if p.get("length", 0) >= 180000),
+            "n_pauses_ge_10min": sum(1 for p in pauses if p.get("length", 0) >= 600000),
+            "runs_by_outcome": runs_by_outcome,
+            "last_run": last_run,
+            "last_observed_run": last_observed_run,
+            "errors_at_last_observed": errors_at_last_observed,
+            "n_chains_repeated": sum(1 for c in chains if c.get("repeated")),
+            "failing_tests_last_test_run": failing_tests_last,
+            "chars_by_group": chars_by_group,
+            "lines_by_group": lines_by_group,
+            "unlogged_minutes": unlogged_minutes,
+            "chars_final_by_group": final_chars_by_grp,
+            "n_requests": len(requests),
+            "n_requests_by_flag": {
+                "error": n_req_error,
+                "task": n_req_task,
+                "own_code": n_req_own,
+            },
+            "n_responses_no_code": n_resp_no_code,
+            "n_requests_rejected": n_requests_rejected,
+            "conversations_by_label": sigs.get("conversations_by_label", {"I": 0, "M": 0, "E": 0, "unknown": 0}),
+            "n_request_error_chains": len(sigs.get("request_error_chains", [])),
+            "n_insert_error_ask_chains": len(sigs.get("insert_error_ask_chains", [])),
+            "ai_fates": ai_fates,
+            "ai_chunks_retained": [c for c in chunks if c.get("retained")],
+            "ai_chunks_discarded": chunks_disc,
+            "n_cancelled_pairs": getattr(self.data, "dq_report", {}).get("undo", {}).get("cancelled_pairs", 0),
+            "n_repaste_families": len(getattr(self.data, "provenance", {}).get("repaste_families", [])),
+            "reconstruction": self.data.dq_report.get("reconstruction"),
+            "share_runs_observed": round(len(observed_runs) / len(runs), 3) if runs else 1.0,
+            "runs_from_capture": sum(1 for r in runs if r.get("t_source") == "capture"),
+            "terminal_source": "log terminal của F-VSCode",
+            "comparisons": comparisons,
+        }
+        return session_facts
+
+    def _compute_comparisons(self, n_runs: int, n_reqs: int, t_task: int, n_pauses_3m: int, n_chains: int) -> Dict[str, Optional[str]]:
+        """Spec 04 Section 2: Baseline percentile comparisons (top/bottom 10% when N >= 20)."""
+        metrics = {
+            "n_runs_total": n_runs,
+            "n_requests_total": n_reqs,
+            "T_task_min": t_task,
+            "n_pauses_ge_3min": n_pauses_3m,
+            "n_chains_repeated": n_chains,
+        }
+        comparisons = {}
+        min_class = self.params.get("baseline.min_class_sessions", 20)
+        tail_pct = self.params.get("baseline.tail_pct", 10)
+        base_metrics = self.baseline.get("metrics", {}) if isinstance(self.baseline, dict) else {}
+
+        for m_name, cur_val in metrics.items():
+            vals = base_metrics.get(m_name, [])
+            if len(vals) >= min_class:
+                rank = 100.0 * (sum(1 for v in vals if v < cur_val) + 0.5 * sum(1 for v in vals if v == cur_val)) / len(vals)
+                if rank >= 100 - tail_pct:
+                    comparisons[m_name] = "higher_than_most"
+                elif rank <= tail_pct:
+                    comparisons[m_name] = "lower_than_most"
+                else:
+                    comparisons[m_name] = None
+            else:
+                comparisons[m_name] = None
+        return comparisons
+
+    # =========================================================================
+    # 2. Five Largest Events LN1 - LN5 (Spec 04 Section 3, QĐ25)
+    # =========================================================================
+    def _evaluate_largest(self, facts: Dict[str, Any]) -> Tuple[List[LargestEvent], List[Dict[str, Any]]]:
+        """
+        Extracts up to 5 largest events: LN1, LN2, LN3, LN4, LN5.
+        Tracks all unselected candidates in not_chosen with reasons.
+        """
+        sigs = self.signals
+        insertions = sigs.get("insertions", [])
+        chains = sigs.get("chains", sigs.get("threads", []))
+        test_streaks = sigs.get("test_streaks", [])
+        pauses = sigs.get("pauses", [])
+        insert_chains = sigs.get("insert_error_ask_chains", [])
+        req_chains = sigs.get("request_error_chains", [])
+        requests = sigs.get("requests", [])
+        bursts = sigs.get("bursts", [])
+        burst_ids = {b["edit_id"] for b in bursts}
+        chunk_by_id = {c["lineage"]: c for c in sigs.get("ai_chunks", [])}
+
+        largest_map: Dict[str, LargestEvent] = {}
+        not_chosen: List[Dict[str, Any]] = []
+
+        # ---------------------------------------------------------------------
+        # LN1: Đợt chèn hoặc dán lớn nhất (Spec 04 Section 3: lines >= largest.ln1_min_lines (5))
+        # ---------------------------------------------------------------------
+        ln1_min_lines = self.params.get("largest.ln1_min_lines", 5)
+        cands_ln1 = [
+            ins for ins in insertions
+            if ins.get("src") not in ("typed", "undo", "redo", "from_task")
+            and not ins.get("repaste_of")
+        ]
+        eligible_ln1 = [ins for ins in cands_ln1 if ins.get("lines", 0) >= ln1_min_lines]
+
+        if eligible_ln1:
+            eligible_ln1.sort(key=lambda x: (-x["lines"], x["t"]))
+            best_ln1 = eligible_ln1[0]
+            eid = best_ln1["edit_id"]
+            c_meta = chunk_by_id.get(eid, {})
+            req_min = None
+            if best_ln1["match"].get("response_t_end") is not None:
+                req_min = minute_label(best_ln1["match"]["response_t_end"])
+
+            seg_ids = self._find_segment_ids_for_span(best_ln1["t"], best_ln1["t"])
+            ln1_event = LargestEvent(
+                event_id="LN1",
+                magnitude=best_ln1["lines"],
+                t_start=best_ln1["t"],
+                t_end=best_ln1["t"],
+                segment_ids=seg_ids,
+                sources=[eid],
+                facts={
+                    "minute": minute_label(best_ln1["t"]),
+                    "file": best_ln1["file"],
+                    "lines": best_ln1["lines"],
+                    "chars": best_ln1["chars"],
+                    "src": best_ln1["src"],
+                    "group": best_ln1.get("group", "other"),
+                    "match_level": best_ln1["match"].get("level", "none"),
+                    "response_minute": req_min,
+                    "fate": c_meta.get("fate", "intact"),
+                    "s_end": c_meta.get("s_end", 1.0),
+                    "is_burst": eid in burst_ids,
+                },
+            )
+            largest_map["LN1"] = ln1_event
+
+            for ins in eligible_ln1[1:]:
+                not_chosen.append({
+                    "type": "LN1",
+                    "id": ins.get("edit_id") or ins.get("id"),
+                    "reason": "smaller",
+                    "magnitude": ins["lines"],
+                    "edit_id": ins["edit_id"],
+                })
+        for ins in cands_ln1:
+            if ins.get("lines", 0) < ln1_min_lines:
+                not_chosen.append({
+                    "type": "LN1",
+                    "id": ins.get("edit_id") or ins.get("id"),
+                    "reason": "below_threshold",
+                    "magnitude": ins.get("lines", 0),
+                    "edit_id": ins["edit_id"],
+                })
+
+        # ---------------------------------------------------------------------
+        # LN2: Chuỗi lỗi dài nhất (Spec 04 Section 3: repeated, len(runs) >= 3)
+        # ---------------------------------------------------------------------
+        cands_ln2 = [ch for ch in chains if ch.get("repeated")]
+        eligible_streaks = [st for st in test_streaks if st.get("runs", 0) >= 3]
+
+        best_chain = None
+        best_n_runs = -1
+        is_test_streak = False
+
+        for ch in cands_ln2:
+            n_r = len(ch.get("runs", []))
+            if n_r > best_n_runs:
+                best_n_runs = n_r
+                best_chain = ch
+                is_test_streak = False
+
+        for st in eligible_streaks:
+            if st.get("runs", 0) > best_n_runs:
+                best_n_runs = st["runs"]
+                best_chain = st
+                is_test_streak = True
+
+        if best_chain:
+            if not is_test_streak:
+                ch = best_chain
+                ch_runs = ch.get("runs", [])
+                t_s = ch_runs[0]["t"]
+                t_e = ch.get("ended_at_t") if ch.get("ended_at_t") is not None else ch_runs[-1]["t"]
+                seg_ids = self._find_segment_ids_for_span(t_s, t_e)
+                ln2_event = LargestEvent(
+                    event_id="LN2",
+                    magnitude=len(ch_runs),
+                    t_start=t_s,
+                    t_end=t_e,
+                    segment_ids=seg_ids,
+                    sources=[r["id"] for r in ch_runs],
+                    facts={
+                        "script": ch.get("script", "main.py"),
+                        "error_type": ch.get("error_type", "RuntimeError"),
+                        "signature": ch.get("signature", ""),
+                        "n_runs": len(ch_runs),
+                        "unknown_between": ch.get("unknown_between", 0),
+                        "minute_start": minute_label(t_s),
+                        "minute_last_error": minute_label(ch_runs[-1]["t"]),
+                        "ended_minute": minute_label(ch["ended_at_t"]) if ch.get("ended_at_t") is not None else None,
+                        "ended_by_outcome": ch.get("ended_by_outcome"),
+                        "n_requests_in_span": len(ch.get("requests_in_span", [])),
+                    },
+                )
+            else:
+                st = best_chain
+                t_s = st["start_t"]
+                t_e = st["end_t"]
+                seg_ids = self._find_segment_ids_for_span(t_s, t_e)
+                ln2_event = LargestEvent(
+                    event_id="LN2",
+                    magnitude=st["runs"],
+                    t_start=t_s,
+                    t_end=t_e,
+                    segment_ids=seg_ids,
+                    sources=st.get("sources", []),
+                    facts={
+                        "kind": "test_streak",
+                        "script": "test",
+                        "error_type": "AssertionError",
+                        "signature": f"test_fail:{st.get('test_id')}",
+                        "n_runs": st["runs"],
+                        "unknown_between": 0,
+                        "minute_start": minute_label(t_s),
+                        "minute_last_error": minute_label(t_e),
+                        "ended_minute": minute_label(st["resolved_at_t"]) if st.get("resolved_at_t") is not None else None,
+                        "ended_by_outcome": "no_error_seen" if st.get("resolved_at_t") is not None else None,
+                        "n_requests_in_span": 0,
+                    },
+                )
+            largest_map["LN2"] = ln2_event
+
+        for ch in chains:
+            if not ch.get("repeated"):
+                not_chosen.append({
+                    "type": "LN2",
+                    "reason": "below_threshold",
+                    "magnitude": len(ch.get("runs", [])),
+                    "id": ch.get("id"),
+                })
+            elif best_chain and ch != best_chain:
+                not_chosen.append({
+                    "type": "LN2",
+                    "reason": "smaller",
+                    "magnitude": len(ch.get("runs", [])),
+                    "id": ch.get("id"),
+                })
+
+        # ---------------------------------------------------------------------
+        # LN3: Khoảng không thao tác dài nhất (Spec 04 Section 3: length >= 600000 (10 min))
+        # ---------------------------------------------------------------------
+        ln3_min_ms = self.params.get("largest.ln3_min_ms", 600000)
+        eligible_pauses = [p for p in pauses if p.get("length", 0) >= ln3_min_ms]
+
+        if eligible_pauses:
+            eligible_pauses.sort(key=lambda x: (-x["length"], x["start"]))
+            best_pause = eligible_pauses[0]
+            t_s = best_pause["start"]
+            t_e = best_pause["end"]
+            dur_min = max(int(round(best_pause["length"] / 60000.0)), 1)
+            seg_ids = self._find_segment_ids_for_span(t_s, t_e)
+
+            ln3_event = LargestEvent(
+                event_id="LN3",
+                magnitude=dur_min,
+                t_start=t_s,
+                t_end=t_e,
+                segment_ids=seg_ids,
+                sources=best_pause.get("sources", []),
+                facts={
+                    "minute_start": minute_label(t_s),
+                    "minute_end": minute_label(t_e),
+                    "duration_min": dur_min,
+                    "opener": best_pause.get("opener", "none"),
+                    "follower": best_pause.get("follower", "none"),
+                },
+            )
+            largest_map["LN3"] = ln3_event
+
+            for p in eligible_pauses[1:]:
+                not_chosen.append({
+                    "type": "LN3",
+                    "reason": "smaller",
+                    "magnitude": int(round(p["length"] / 60000.0)),
+                    "id": p.get("id"),
+                })
+        for p in pauses:
+            if p.get("length", 0) < ln3_min_ms:
+                not_chosen.append({
+                    "type": "LN3",
+                    "reason": "below_threshold",
+                    "magnitude": int(round(p["length"] / 60000.0)),
+                    "id": p.get("id"),
+                })
+
+        # ---------------------------------------------------------------------
+        # LN4: Chuỗi chèn, lỗi, hỏi lại hoặc chuỗi yêu cầu kèm lỗi (Spec 04 Section 3)
+        # ---------------------------------------------------------------------
+        if insert_chains:
+            insert_chains_sorted = sorted(insert_chains, key=lambda x: (-x["cycles"], x["start_t"]))
+            best_ic = insert_chains_sorted[0]
+            t_s = best_ic["start_t"]
+            t_e = best_ic["end_t"]
+            seg_ids = self._find_segment_ids_for_span(t_s, t_e)
+            ln4_event = LargestEvent(
+                event_id="LN4",
+                magnitude=best_ic["cycles"],
+                t_start=t_s,
+                t_end=t_e,
+                segment_ids=seg_ids,
+                sources=best_ic.get("sources", best_ic.get("request_ids", [])),
+                facts={
+                    "kind": "insert_error_ask",
+                    "cycles": best_ic["cycles"],
+                    "minute_start": minute_label(t_s),
+                    "minute_end": minute_label(t_e),
+                },
+            )
+            largest_map["LN4"] = ln4_event
+        elif req_chains:
+            req_chains_sorted = sorted(req_chains, key=lambda x: (-x["n_requests"], x["start_t"]))
+            best_rc = req_chains_sorted[0]
+            t_s = best_rc["start_t"]
+            t_e = best_rc["end_t"]
+            seg_ids = self._find_segment_ids_for_span(t_s, t_e)
+            ln4_event = LargestEvent(
+                event_id="LN4",
+                magnitude=best_rc["n_requests"],
+                t_start=t_s,
+                t_end=t_e,
+                segment_ids=seg_ids,
+                sources=best_rc.get("request_ids", []),
+                facts={
+                    "kind": "request_error",
+                    "n_requests": best_rc["n_requests"],
+                    "minute_start": minute_label(t_s),
+                    "minute_end": minute_label(t_e),
+                },
+            )
+            largest_map["LN4"] = ln4_event
+
+        # ---------------------------------------------------------------------
+        # LN5: Cách bắt đầu bài (Spec 04 Section 3: chỉ khi có ít nhất một yêu cầu AI)
+        # ---------------------------------------------------------------------
+        if requests:
+            q1 = requests[0]
+            # Time of first typed edit exceeding context_typed_chars tolerance
+            base_chars = self.params.get("prompt.context_typed_chars", 20)
+            t_type1 = None
+            acc_chars = 0
+            for e in getattr(self.data, "edits", []):
+                if e.get("origin") == "typed" and not e.get("cancelled"):
+                    acc_chars += len(e.get("inserted", ""))
+                    if acc_chars > base_chars:
+                        t_type1 = e["t"]
+                        break
+
+            burst_match = next((b for b in bursts if b.get("request_id") == q1["request_id"]), None)
+            burst_lines = burst_match["lines"] if burst_match else 0
+            inserted_as_burst = bool(burst_match)
+            magnitude = burst_lines if inserted_as_burst else 0
+
+            seg_ids = self._find_segment_ids_for_span(q1["t"], q1.get("t_end", q1["t"]))
+            ln5_event = LargestEvent(
+                event_id="LN5",
+                magnitude=magnitude,
+                t_start=q1["t"],
+                t_end=q1.get("t_end", q1["t"]),
+                segment_ids=seg_ids,
+                sources=[q1["request_id"]] + ([burst_match["id"]] if burst_match else []),
+                facts={
+                    "request_minute": minute_label(q1["t"]),
+                    "first_typing_minute": minute_label(t_type1) if t_type1 is not None else None,
+                    "request_before_typing": (t_type1 is None or q1["t"] < t_type1),
+                    "context": q1.get("context", "start"),
+                    "flag_task": q1.get("flag_task", False),
+                    "response_has_code": q1.get("response_has_code", False),
+                    "inserted_as_burst": inserted_as_burst,
+                    "burst_lines": burst_lines,
+                },
+            )
+            largest_map["LN5"] = ln5_event
+
+        # Return chosen events in canonical keypoint order (Spec 04 Section 3: [LN1, LN2, LN4, LN3, LN5])
+        order = self.params.get("largest.keypoint_order", ["LN1", "LN2", "LN4", "LN3", "LN5"])
+        chosen_events = [largest_map[ln_id] for ln_id in order if ln_id in largest_map]
+        return chosen_events, not_chosen

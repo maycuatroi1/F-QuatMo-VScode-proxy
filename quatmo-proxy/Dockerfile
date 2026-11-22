@@ -20,6 +20,7 @@ COPY src ./src
 # Keep the engine inside this repository's build context for GitHub/Dokploy builds.
 COPY summary_tool/generate_cli.py /opt/summary-tool/generate_cli.py
 COPY summary_tool/engine /opt/summary-tool/engine
+COPY summary_tool/forbidden.txt /opt/summary-tool/forbidden.txt
 RUN PYTHONDONTWRITEBYTECODE=1 python3 /opt/summary-tool/generate_cli.py --help > /dev/null
 
 # Ensure logs directory exists for SQLite database persistence

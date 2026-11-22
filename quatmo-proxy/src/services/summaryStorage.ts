@@ -97,7 +97,7 @@ export class SummaryStorageService {
   private async runEngine(sessionCode: string, studentId?: string, customZipPath?: string, onProgress?: SummaryProgressCallback): Promise<any> {
     if (!/^[A-Za-z0-9_-]+$/.test(sessionCode) || (studentId !== undefined && !/^[A-Za-z0-9_-]+$/.test(studentId))) throw new Error("Invalid summary session or student ID.");
     const binary = this.getResolvedEngineBin();
-    const cliScriptPath = process.env.SUMMARY_CLI_PATH || path.resolve("..", "..", "PhaseSUMMARY", "summary_tool", "generate_cli.py");
+    const cliScriptPath = process.env.SUMMARY_CLI_PATH || path.resolve("summary_tool", "generate_cli.py");
     if (!binary && !fs.existsSync(cliScriptPath)) {
       throw new Error("Summary engine unavailable. Configure SUMMARY_ENGINE_BIN or SUMMARY_CLI_PATH.");
     }
@@ -179,7 +179,7 @@ export class SummaryStorageService {
           const metadataPath = path.join(generatedRoot, "stages", id, "check_report.json");
           reports[id] = {
             student_id: id,
-            analysisRuleVersion: result.analysisRuleVersion,
+            summaryRuleVersion: result.summaryRuleVersion, analysisRuleVersion: result.analysisRuleVersion,
             markdown: await fs.promises.readFile(markdownPath, "utf8"),
             check_report: fs.existsSync(metadataPath) ? JSON.parse(await fs.promises.readFile(metadataPath, "utf8")) : undefined,
           };
@@ -195,7 +195,7 @@ export class SummaryStorageService {
   public async generateStudentSummary(sessionCode: string, studentId: string, customZipPath?: string, persist = true, onProgress?: SummaryProgressCallback): Promise<any> {
     const result = await this.runEngine(sessionCode, studentId, customZipPath, onProgress);
     onProgress?.({ stage: "saving", completed: 1, total: 1 });
-    if (persist) await this.saveStudentSummary(sessionCode, studentId, result.markdown, { check_report: result.check_report, metrics: result.metrics, analysisRuleVersion: result.analysisRuleVersion });
+    if (persist) await this.saveStudentSummary(sessionCode, studentId, result.markdown, { check_report: result.check_report, metrics: result.metrics, summaryRuleVersion: result.summaryRuleVersion, analysisRuleVersion: result.analysisRuleVersion });
     return result;
   }
 
@@ -205,7 +205,7 @@ export class SummaryStorageService {
     onProgress?.({ stage: "saving", completed: total, total });
     if (persist) {
       for (const [studentId, report] of Object.entries<any>(result.reports)) {
-        await this.saveStudentSummary(sessionCode, studentId, report.markdown, { check_report: report.check_report, metrics: report.metrics, analysisRuleVersion: result.analysisRuleVersion });
+        await this.saveStudentSummary(sessionCode, studentId, report.markdown, { check_report: report.check_report, metrics: report.metrics, summaryRuleVersion: result.summaryRuleVersion, analysisRuleVersion: result.analysisRuleVersion });
       }
       await this.saveSessionManifest(sessionCode, result.manifest_content);
     }
